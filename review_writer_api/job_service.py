@@ -1,0 +1,487 @@
+"""Small persisted executor for single-instance Review Writer deployments."""
+
+from __future__ import annotations
+
+import threading
+import uuid
+import logging
+from concurrent.futures import Future, wait as wait_for_futures
+from typing import Any, Protocol
+
+from review_writer_api.daemon_executor import DaemonWorkerPool
+from review_writer_api.errors import (
+    WorkflowConflict,
+    WorkflowError,
+    WorkflowNotFound,
+    WorkflowValidationError,
+)
+from review_writer_api.security import Permission, Principal
+from review_writer_api.job_lease_context import bind_job_lease
+from review_writer_api.workflow_repository import JobRecord, WorkflowRepository
+
+
+LOGGER = logging.getLogger(__name__)
+
+
+def job_payload(job: JobRecord) -> dict[str, Any]:
+    """Present one owned job consistently across polling and stage endpoints."""
+    actions = []
+    if job.status in {"queued", "running", "cancel_requested"}:
+        actions.append("cancel")
+    if job.status in JobService.RETRYABLE_STATUSES:
+        actions.append("retry")
+    return {
+        "id": job.id,
+        "project_id": job.project_id,
+        "scope": job.scope,
+        "status": job.status,
+        "job_type": job.job_type,
+        "result": job.result,
+        "progress_current": job.progress_current,
+        "progress_total": job.progress_total,
+        "cancellation_requested": job.cancellation_requested,
+        "error_code": job.error_code,
+        "error_message": job.error_message,
+        "retry_of_job_id": job.retry_of_job_id,
+        "created_at": job.created_at.isoformat(),
+        "updated_at": job.updated_at.isoformat(),
+        "started_at": job.started_at.isoformat() if job.started_at else None,
+        "finished_at": job.finished_at.isoformat() if job.finished_at else None,
+        "available_actions": actions,
+    }
+
+
+class JobCancellationRequested(Exception):
+    """Internal cooperative cancellation signal; never persisted as an error."""
+
+
+class JobShutdownRequested(Exception):
+    """Internal shutdown signal recorded as interrupted rather than cancelled."""
+
+
+class JobLeaseLost(Exception):
+    """The current executor no longer owns the PostgreSQL fencing lease."""
+
+
+class JobYieldRequested(Exception):
+    """A checkpointed batch gives its worker slot back after one paragraph."""
+
+
+def release_yielded_job(context):
+    released = context.repository.release_job_lease(context.job_id,
+        lease_token=str(context.lease_token or ""), lease_generation=context.lease_generation)
+    if released is None and context.repository.job_cancellation_requested(context.job_id):
+        context.repository.mark_job_cancelled(context.job_id,
+            lease_token=context.lease_token, lease_generation=context.lease_generation)
+
+
+class JobHandler(Protocol):
+    def __call__(
+        self, context: "JobContext", payload: dict[str, Any]
+    ) -> dict[str, Any] | None: ...
+
+
+class JobContext:
+    def __init__(
+        self,
+        repository: WorkflowRepository,
+        job: JobRecord,
+        shutdown_event: threading.Event,
+    ):
+        self.repository = repository
+        self._shutdown_event = shutdown_event
+        self.job_id = job.id
+        self.user_id = job.user_id
+        self.project_id = job.project_id
+        self.scope = job.scope
+        self.job_type = job.job_type
+        self.retry_of_job_id = job.retry_of_job_id
+        self.lease_token = job.lease_token
+        self.lease_generation = job.lease_generation
+        self._lease_lost = threading.Event()
+
+    def mark_lease_lost(self) -> None:
+        self._lease_lost.set()
+
+    def cancellation_requested(self) -> bool:
+        return self.shutting_down() or self.repository.job_cancellation_requested(
+            self.job_id
+        )
+
+    def shutting_down(self) -> bool:
+        return self._shutdown_event.is_set()
+
+    def checkpoint(self) -> None:
+        if self._lease_lost.is_set():
+            raise JobLeaseLost()
+        if self.shutting_down():
+            raise JobShutdownRequested()
+        if self.repository.job_cancellation_requested(self.job_id):
+            raise JobCancellationRequested()
+
+    def report_progress(self, current: int, total: int) -> JobRecord | None:
+        self.checkpoint()
+        return self.repository.update_job_progress(
+            self.job_id,
+            current,
+            total,
+            lease_token=self.lease_token,
+            lease_generation=self.lease_generation,
+        )
+
+    def report_partial_result(self, result: dict[str, Any]) -> JobRecord | None:
+        # Do not checkpoint first: a just-completed item must remain observable
+        # even when cancellation arrives between artifact publication and here.
+        return self.repository.update_job_result(
+            self.job_id,
+            result,
+            lease_token=self.lease_token,
+            lease_generation=self.lease_generation,
+        )
+
+
+class JobService:
+    """Bounded executor whose observable state lives in PostgreSQL."""
+
+    RETRYABLE_STATUSES = frozenset({"failed", "interrupted", "cancelled"})
+
+    def __init__(
+        self,
+        repository: WorkflowRepository,
+        *,
+        max_workers: int = 2,
+        shutdown_grace_seconds: float = 5.0,
+        execution_enabled: bool = True,
+    ):
+        self.repository = repository
+        self.max_workers = max(1, min(int(max_workers), 16))
+        self.shutdown_grace_seconds = max(0.0, float(shutdown_grace_seconds))
+        self.execution_enabled = bool(execution_enabled)
+        self._handlers: dict[str, JobHandler] = {}
+        self._executor: DaemonWorkerPool | None = None
+        self._futures: dict[str, Future] = {}
+        self._lock = threading.RLock()
+        self._started = False
+        self._shutdown_event = threading.Event()
+
+    def register_handler(self, job_type: str, handler: JobHandler) -> None:
+        normalized = str(job_type or "").strip()
+        if not normalized:
+            raise WorkflowValidationError("A job type is required.")
+        if not callable(handler):
+            raise WorkflowValidationError("A job handler must be callable.")
+        with self._lock:
+            existing = self._handlers.get(normalized)
+            if existing is not None and existing is not handler:
+                raise WorkflowConflict(
+                    "A different handler is already registered for this job type."
+                )
+            self._handlers[normalized] = handler
+
+    @property
+    def handlers(self) -> dict[str, JobHandler]:
+        """Return a snapshot used by the independent worker bootstrap."""
+
+        with self._lock:
+            return dict(self._handlers)
+
+    def start(self) -> int:
+        with self._lock:
+            if self._started:
+                return 0
+            self._shutdown_event = threading.Event()
+            if not self.execution_enabled:
+                self._started = True
+                return 0
+            interrupted = self.repository.mark_running_jobs_interrupted()
+            self._executor = DaemonWorkerPool(
+                self.max_workers,
+                thread_name_prefix="review-writer-job",
+            )
+            self._started = True
+            queued = self.repository.list_queued_jobs(set(self._handlers))
+        for job in queued:
+            self._schedule(job)
+        return interrupted
+
+    def shutdown(self, *, wait: bool = True) -> None:
+        with self._lock:
+            executor = self._executor
+            if executor is None:
+                self._started = False
+                self._shutdown_event.set()
+                return
+            self._executor = None
+            self._started = False
+            futures = tuple(self._futures.values())
+            self._shutdown_event.set()
+        for future in futures:
+            future.cancel()
+        if wait and futures:
+            wait_for_futures(futures, timeout=self.shutdown_grace_seconds)
+        executor.shutdown(wait=False, cancel_futures=True)
+        self.repository.mark_running_jobs_interrupted()
+
+    def submit(
+        self,
+        principal: Principal,
+        *,
+        scope: str,
+        project_id: str | None,
+        job_type: str,
+        idempotency_key: str,
+        payload: dict[str, Any] | None,
+        retry_of_job_id: str | None = None,
+        operation_key: str = "",
+    ) -> JobRecord:
+        principal.require(Permission.PROJECT_WRITE)
+        normalized_type = str(job_type or "").strip()
+        with self._lock:
+            if normalized_type not in self._handlers:
+                raise WorkflowValidationError(
+                    "No executable handler is registered for this job type.",
+                    details={"job_type": normalized_type},
+                )
+        retry_source = None
+        if retry_of_job_id:
+            retry_source = self.status(principal, retry_of_job_id)
+            if (
+                retry_source.job_type != normalized_type
+                or retry_source.scope != scope
+                or retry_source.project_id != project_id
+            ):
+                raise WorkflowValidationError(
+                    "Retry source does not belong to the same workflow operation."
+                )
+        self.start()
+        job = self.repository.create_or_get_job(
+            principal.user_id,
+            project_id,
+            scope,
+            normalized_type,
+            idempotency_key,
+            dict(payload or {}),
+            retry_of_job_id=retry_source.id if retry_source else None,
+            operation_key=operation_key,
+        )
+        if job.status == "queued":
+            self._schedule(job)
+        return job
+
+    def status(self, principal: Principal, job_id: str) -> JobRecord:
+        principal.require(Permission.PROJECT_READ)
+        job = self.repository.get_job(principal.user_id, job_id)
+        if job is None:
+            raise WorkflowNotFound("Job not found.")
+        return job
+
+    def request_cancel(self, principal: Principal, job_id: str) -> JobRecord:
+        principal.require(Permission.PROJECT_WRITE)
+        job = self.repository.request_job_cancellation(principal.user_id, job_id)
+        if job is None:
+            raise WorkflowNotFound("Job not found.")
+        return job
+
+    def retry_interrupted(self, principal: Principal, job_id: str) -> JobRecord:
+        principal.require(Permission.PROJECT_WRITE)
+        source = self.status(principal, job_id)
+        if (source.job_type in {"draft.evaluate", "draft.optimize", "draft.rewrite", "draft.accept-rewrite"}
+                and source.payload.get("revision_mode") not in {"dialogue", "dialogue_batch"}):
+            raise WorkflowValidationError("Scored Draft jobs were retired. Open Draft to start paragraph dialogue or batch analysis.")
+        if source.status not in self.RETRYABLE_STATUSES:
+            raise WorkflowConflict(
+                "Only failed, interrupted, or cancelled jobs can be retried.",
+                details={"status": source.status},
+            )
+        with self._lock:
+            if source.job_type not in self._handlers:
+                raise WorkflowValidationError(
+                    "No executable handler is registered for this job type.",
+                    details={"job_type": source.job_type},
+                )
+        self.start()
+        base_scope_key = source.project_id or "_library_"
+        operation_key = ""
+        operation_prefix = f"{base_scope_key}:"
+        if source.idempotency_scope_key.startswith(operation_prefix):
+            operation_key = source.idempotency_scope_key[len(operation_prefix) :]
+        retried = self.repository.create_or_get_job(
+            principal.user_id,
+            source.project_id,
+            source.scope,
+            source.job_type,
+            f"retry:{source.id}:{uuid.uuid4()}",
+            source.payload,
+            retry_of_job_id=source.id,
+            operation_key=operation_key,
+        )
+        self._schedule(retried)
+        return retried
+
+    def _schedule(self, job: JobRecord) -> None:
+        with self._lock:
+            if not self._started or self._executor is None or job.status != "queued":
+                return
+            if job.id in self._futures:
+                return
+            future = self._executor.submit(self._execute, job.id)
+            self._futures[job.id] = future
+            future.add_done_callback(lambda _future: self._forget(job))
+
+    def _forget(self, job: JobRecord) -> None:
+        with self._lock:
+            self._futures.pop(job.id, None)
+        if not self._shutdown_event.is_set():
+            latest = self.repository.get_job(job.user_id, job.id)
+            planning_job = job.job_type in {"matrix.enrich", "planning.blueprint"}
+            if latest and latest.status == "queued" and (not planning_job or not self.repository.planning_job_blocked(latest.id)):
+                self._schedule(latest)
+            elif latest and latest.status != "queued" and planning_job and job.project_id:
+                # Wake dependents in the compatibility executor. Independent
+                # workers already poll runnable jobs; blocked jobs hold no slot.
+                try:
+                    pending = self.repository.list_project_jobs(job.user_id, job.project_id)
+                except WorkflowNotFound:
+                    return  # Project deletion already cancels its queued jobs.
+                for queued in pending:
+                    if (queued.status == "queued" and queued.job_type in {"matrix.enrich", "planning.blueprint"}
+                            and not self.repository.planning_job_blocked(queued.id)):
+                        self._schedule(queued)
+
+    def _execute(self, job_id: str) -> None:
+        claimed = self.repository.claim_job(
+            job_id,
+            owner="api-compatibility-executor",
+            lease_seconds=8 * 60 * 60,
+        )
+        if claimed is None:
+            return
+        with self._lock:
+            handler = self._handlers.get(claimed.job_type)
+        context = JobContext(self.repository, claimed, self._shutdown_event)
+        if handler is None:
+            self._finish_failure(
+                context,
+                error_code="JOB_HANDLER_NOT_REGISTERED",
+                error_message="This job type is not available on the current server.",
+            )
+            return
+
+        try:
+            context.checkpoint()
+            with bind_job_lease(
+                context.job_id, context.lease_token, context.lease_generation
+            ):
+                result = handler(context, dict(claimed.payload or {}))
+            try:
+                completed = self.repository.mark_job_succeeded(
+                    claimed.id,
+                    dict(result or {}),
+                    lease_token=context.lease_token,
+                    lease_generation=context.lease_generation,
+                )
+            except TypeError as exc:
+                # Preserve compatibility with deployment/test wrappers created
+                # against the pre-P0 two-argument callback signature. The
+                # repository still requires a live lease before committing.
+                if "unexpected keyword argument" not in str(exc):
+                    raise
+                completed = self.repository.mark_job_succeeded(
+                    claimed.id, dict(result or {})
+                )
+            if completed is None and context.cancellation_requested():
+                if context.shutting_down():
+                    self.repository.mark_job_interrupted(
+                        claimed.id,
+                        lease_token=context.lease_token,
+                        lease_generation=context.lease_generation,
+                    )
+                else:
+                    self.repository.mark_job_cancelled(
+                        claimed.id,
+                        lease_token=context.lease_token,
+                        lease_generation=context.lease_generation,
+                    )
+        except JobYieldRequested:
+            release_yielded_job(context)
+        except JobShutdownRequested:
+            self.repository.mark_job_interrupted(
+                claimed.id,
+                lease_token=context.lease_token,
+                lease_generation=context.lease_generation,
+            )
+        except JobLeaseLost:
+            LOGGER.warning(
+                "Workflow job lease was lost; stale executor stopped (job_id=%s, generation=%s)",
+                claimed.id,
+                context.lease_generation,
+            )
+        except JobCancellationRequested:
+            self.repository.mark_job_cancelled(
+                claimed.id,
+                lease_token=context.lease_token,
+                lease_generation=context.lease_generation,
+            )
+        except WorkflowError as exc:
+            self._finish_failure(
+                context,
+                error_code=exc.code,
+                error_message=str(exc),
+            )
+        except Exception as exc:
+            # Do not include the exception message or traceback here: provider
+            # SDK errors can contain credentials or response bodies. The type
+            # is enough to distinguish an internal handler bug in server logs.
+            LOGGER.error(
+                "Unhandled workflow job failure (job_id=%s, job_type=%s, exception=%s)",
+                claimed.id,
+                claimed.job_type,
+                type(exc).__name__,
+            )
+            self._finish_failure(
+                context,
+                error_code="JOB_EXECUTION_FAILED",
+                error_message="Job execution failed.",
+            )
+
+    def _finish_failure(
+        self,
+        context: JobContext,
+        *,
+        error_code: str,
+        error_message: str,
+    ) -> None:
+        if context.shutting_down():
+            self.repository.mark_job_interrupted(
+                context.job_id,
+                lease_token=context.lease_token,
+                lease_generation=context.lease_generation,
+            )
+            return
+        if self.repository.job_cancellation_requested(context.job_id):
+            self.repository.mark_job_cancelled(
+                context.job_id,
+                lease_token=context.lease_token,
+                lease_generation=context.lease_generation,
+            )
+            return
+        failed = self.repository.mark_job_failed(
+            context.job_id,
+            error_code=error_code,
+            error_message=error_message,
+            lease_token=context.lease_token,
+            lease_generation=context.lease_generation,
+        )
+        if failed is None:
+            if context.shutting_down():
+                self.repository.mark_job_interrupted(
+                    context.job_id,
+                    lease_token=context.lease_token,
+                    lease_generation=context.lease_generation,
+                )
+            elif self.repository.job_cancellation_requested(context.job_id):
+                self.repository.mark_job_cancelled(
+                    context.job_id,
+                    lease_token=context.lease_token,
+                    lease_generation=context.lease_generation,
+                )

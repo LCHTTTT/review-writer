@@ -1,0 +1,310 @@
+"""Typed request contracts for the native workflow API."""
+
+from __future__ import annotations
+
+from typing import Any, Literal
+
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StrictInt,
+    StrictStr,
+    field_validator,
+    model_validator,
+)
+from review_writer_core.writing_contracts import (
+    CASE_PARAGRAPH_MAX_WORDS,
+    CASE_PARAGRAPH_MIN_WORDS,
+    DRAFT_PASS_THRESHOLD,
+    PARAGRAPH_PASS_THRESHOLD,
+)
+
+
+class WorkflowRequest(BaseModel):
+    """Preserve supported provider options while validating core workflow fields."""
+
+    model_config = ConfigDict(extra="allow")
+
+
+class LiteratureSearchRequest(WorkflowRequest):
+    topic: StrictStr = Field(min_length=3, max_length=10_000)
+
+    @field_validator("topic")
+    @classmethod
+    def normalize_topic(cls, value: str) -> str:
+        normalized = " ".join(value.split())
+        if len(normalized) < 3:
+            raise ValueError("Enter a more specific literature topic.")
+        return normalized
+
+
+class LiteratureDownloadRequest(WorkflowRequest):
+    candidates: list[dict[str, Any]] = Field(min_length=1, max_length=1_000)
+    discovery_revision: StrictInt | None = Field(default=None, ge=0)
+
+
+class BibliographyManualEvidence(BaseModel):
+    evidence_type: Literal[
+        "pdf_page", "first_page", "formal_url", "catalog_record", "other"
+    ]
+    location: StrictStr = Field(min_length=1, max_length=4_000)
+    note: StrictStr = Field(default="", max_length=10_000)
+
+
+class BibliographyResolutionRequest(BaseModel):
+    action: Literal["accept_candidate", "save_manual", "supporting_only", "reject"]
+    candidate_id: StrictStr | None = Field(default=None, max_length=256)
+    fields: dict[str, Any] = Field(default_factory=dict)
+    document_type: Literal[
+        "journal_article",
+        "book_chapter",
+        "thesis",
+        "patent",
+        "supporting_information",
+        "other",
+    ] = "journal_article"
+    parent_paper_id: StrictStr | None = Field(default=None, max_length=96)
+    manual_evidence: BibliographyManualEvidence | None = None
+    reason: StrictStr = Field(default="", max_length=10_000)
+
+
+class DiscoverySearchRequest(WorkflowRequest):
+    topic: StrictStr = Field(min_length=3, max_length=10_000)
+    keywords: StrictStr = Field(default="", max_length=10_000)
+    web_search: StrictBool = False
+
+    @field_validator("topic")
+    @classmethod
+    def normalize_topic(cls, value: str) -> str:
+        normalized = " ".join(value.split())
+        if len(normalized) < 3:
+            raise ValueError("Enter a more specific review topic.")
+        return normalized
+
+
+class DiscoveryReviewSaveRequest(BaseModel):
+    revision: StrictInt = Field(ge=0)
+    results: list[dict[str, Any]]
+    coverage_decision: Literal["keep_local"] | None = None
+
+
+class DiscoverySelectionRequest(BaseModel):
+    selected: StrictBool
+
+
+class DiscoveryTopSelectionRequest(BaseModel):
+    count: StrictInt = Field(ge=1)
+
+
+class DiscoveryConfirmRequest(BaseModel):
+    revision: StrictInt = Field(ge=0)
+
+
+class MatrixRowUpdateRequest(BaseModel):
+    revision: StrictInt = Field(ge=0)
+    main_content: StrictStr | None = Field(default=None, max_length=2_000_000)
+    most_relevant_figure: dict[str, Any] | None = None
+    scientific_facts: list[dict[str, Any]] | None = Field(default=None, max_length=100)
+    mark_complete: StrictBool = False
+
+
+class MatrixLimitedModeRequest(BaseModel):
+    revision: StrictInt = Field(ge=0)
+
+
+class OutlineSaveRequest(BaseModel):
+    revision: StrictInt = Field(ge=0)
+    outline_style: StrictStr = Field(min_length=1, max_length=160)
+    outline_md: StrictStr | None = Field(default=None, max_length=250_000)
+    scope_contract: dict[str, Any] | None = None
+
+
+class OutlineRecommendationRequest(BaseModel):
+    revision: StrictInt = Field(ge=0)
+    outline_md: StrictStr = Field(min_length=1, max_length=250_000)
+
+
+class ReferenceOutlineUploadRequest(BaseModel):
+    revision: StrictInt = Field(ge=0)
+    filename: StrictStr = Field(min_length=1, max_length=255)
+    content_base64: StrictStr = Field(min_length=1, max_length=42_000_000)
+
+
+class BlueprintGenerateRequest(BaseModel):
+    revision: StrictInt = Field(ge=0)
+    # Retain for an explicit migration error; silently ignoring an old client's
+    # repair request would launch an unintended upstream regeneration.
+    draft_quality_artifact_id: StrictStr | None = Field(default=None, min_length=36, max_length=36)
+
+
+class BlueprintConfirmRequest(BaseModel):
+    revision: StrictInt = Field(ge=0)
+    artifact_id: StrictStr | None = Field(default=None, min_length=36, max_length=36)
+
+
+class BlueprintRestoreRequest(BaseModel):
+    revision: StrictInt = Field(ge=0)
+    artifact_id: StrictStr = Field(min_length=36, max_length=36)
+
+
+class SectionsGenerateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class SectionsConfirmRequest(BaseModel):
+    revision: StrictInt = Field(ge=0)
+
+
+class FigureReviewSelectionRequest(BaseModel):
+    revision: StrictInt = Field(ge=0)
+    candidate_index: StrictInt = Field(ge=0)
+    review_note: StrictStr = Field(default="", max_length=10_000)
+    representative_role: Literal[
+        "workflow",
+        "core_transformation",
+        "mechanism_model",
+        "scope_samples",
+        "quantitative_results",
+        "comparison_ablation",
+        "conceptual_overview",
+        "structure_image",
+        "unknown",
+        # Legacy values remain readable for projects created before the
+        # discipline-neutral role model was introduced.
+        "mechanism",
+        "scope",
+        "paper_overview",
+    ] = "unknown"
+
+
+class FigureReviewConfirmRequest(BaseModel):
+    revision: StrictInt = Field(ge=0)
+
+
+class FigureRedrawRequest(BaseModel):
+    figure_ids: list[StrictStr] = Field(default_factory=list, max_length=500)
+    figure_type: StrictStr = Field(default="auto", max_length=64)
+    retry_of_job_id: StrictStr | None = Field(default=None, max_length=64)
+
+
+class FigureConfirmRequest(BaseModel):
+    revision: StrictInt = Field(ge=0)
+
+
+class FigureFullSvgRequest(BaseModel):
+    base_mode: StrictStr = Field(default="source", pattern="^(source|redrawn)$")
+
+
+class FigureManualEditRequest(BaseModel):
+    image_png_data_url: StrictStr = Field(min_length=32, max_length=36_000_000)
+    operations: list[dict[str, Any]] = Field(default_factory=list, max_length=10_000)
+    base_mode: StrictStr = Field(default="source", pattern="^(source|redrawn)$")
+    editable_svg: StrictStr = Field(default="", max_length=26_500_000)
+    full_vector_svg: StrictStr = Field(default="", max_length=26_500_000)
+
+
+class DraftTextSaveRequest(BaseModel):
+    revision: StrictInt = Field(ge=0)
+    text: StrictStr = Field(min_length=1, max_length=10_000_000)
+
+
+class DraftParagraphSaveRequest(BaseModel):
+    revision: StrictInt = Field(ge=0)
+    text: StrictStr = Field(min_length=1, max_length=2_000_000)
+    base_text_sha256: StrictStr = Field(default="", pattern=r"^$|^[a-f0-9]{64}$")
+
+
+class DraftRestoreRequest(BaseModel):
+    revision: StrictInt = Field(ge=0)
+    artifact_id: StrictStr = Field(min_length=36, max_length=36)
+
+
+class DraftEvaluationRequest(BaseModel):
+    goal: float = Field(default=DRAFT_PASS_THRESHOLD, ge=90, le=100)
+    paragraph_goal: float = Field(default=PARAGRAPH_PASS_THRESHOLD, ge=0, le=100)
+    max_iterations: StrictInt = Field(default=2, ge=1, le=10)
+    min_case_words: StrictInt = Field(
+        default=CASE_PARAGRAPH_MIN_WORDS, ge=1, le=10_000
+    )
+    max_case_words: StrictInt = Field(
+        default=CASE_PARAGRAPH_MAX_WORDS, ge=1, le=10_000
+    )
+
+    @model_validator(mode="after")
+    def validate_case_word_range(self):
+        if self.max_case_words < self.min_case_words:
+            raise ValueError("max_case_words must be greater than or equal to min_case_words")
+        return self
+
+
+class DraftOptimizationRequest(DraftEvaluationRequest):
+    auto_apply_safe: StrictBool = True
+
+
+class DraftRewriteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class DraftSectionDialogueRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    action: Literal["discuss", "revise"] = "discuss"
+    message: StrictStr = Field(min_length=1, max_length=12000)
+    base_hashes: dict[StrictStr, StrictStr]
+    paragraph_keys: list[StrictStr] = Field(default_factory=list, max_length=10000)
+    use_saved: StrictBool = False
+
+
+class DraftDialogueRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    message: StrictStr = Field(min_length=1, max_length=12000)
+    base_text_sha256: StrictStr = Field(pattern=r"^[a-f0-9]{64}$")
+    parent_candidate_id: StrictStr = Field(default="", max_length=36)
+    use_saved: StrictBool = False
+    context_keys: list[StrictStr] = Field(default_factory=list, max_length=8)
+    preferences: StrictStr = Field(default="", max_length=4000)
+
+
+class DraftRewriteDecisionRequest(BaseModel):
+    revision: StrictInt = Field(ge=0)
+    selected_paragraph_ids: list[StrictStr] = Field(
+        default_factory=list, max_length=10_000
+    )
+
+
+class DraftApprovalRequest(BaseModel):
+    revision: StrictInt = Field(ge=0)
+    override_low_score: StrictBool = False
+    override_reason: StrictStr = Field(default="", max_length=10_000)
+
+
+class FinalActionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+class FinalPdfRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    language_profile: Literal["en", "zh-CN"] = "en"
+
+
+class FinalOverviewTextRequest(BaseModel):
+    revision: StrictInt = Field(ge=0)
+    title: StrictStr = Field(min_length=1, max_length=500)
+    subtitle: StrictStr = Field(default="", max_length=1_000)
+    labels: list[StrictStr] = Field(default_factory=list, max_length=100)
+
+
+class FinalFrontMatterRequest(BaseModel):
+    revision: StrictInt = Field(ge=0)
+    title: StrictStr = Field(min_length=1, max_length=1_000)
+    authors: list[StrictStr] = Field(default_factory=list, max_length=100)
+    affiliations: list[StrictStr] = Field(default_factory=list, max_length=100)
+    abstract: StrictStr = Field(default="", max_length=20_000)
+    keywords: list[StrictStr] = Field(default_factory=list, max_length=100)
+    omitted_fields: list[
+        Literal["authors", "affiliations", "abstract", "keywords"]
+    ] = Field(default_factory=list, max_length=4)
+
+

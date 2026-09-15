@@ -1,0 +1,1796 @@
+from __future__ import annotations
+
+import base64
+import concurrent.futures
+import json
+import os
+import socket
+from dataclasses import replace
+import tempfile
+import time
+import unittest
+import uuid
+from datetime import timedelta
+from decimal import Decimal
+from pathlib import Path
+from threading import Event
+from unittest.mock import patch
+
+from fastapi.testclient import TestClient
+from review_writer_api.errors import WorkflowConflict
+from sqlalchemy import create_engine, event
+from sqlalchemy import select
+from sqlalchemy.orm import sessionmaker
+
+from review_writer_api.app import create_app
+from review_writer_api.config import ApiSettings, database_url_from_env
+from review_writer_api.database import (
+    Base,
+    MinerUUsageEvent,
+    Project,
+    User,
+    UserCreditAccount,
+    create_session_factory,
+    database_session,
+    utc_now,
+)
+from review_writer_api.domain_services.library import LibraryService
+from review_writer_api.errors import WorkflowValidationError
+from review_writer_api.scientific_runner import ScientificRunFailed
+from review_writer_api.security import Principal, Role
+from review_writer_api.workflow_models import (
+    LibraryArtifact,
+    LibraryDocumentChunk,
+    LibraryDocumentIndex,
+    LibraryPaper,
+    WorkflowJob,
+)
+from review_writer_api.workspaces import HostedWorkspaceManager
+
+
+TEST_KEY = base64.urlsafe_b64encode(bytes(range(32))).decode("ascii").rstrip("=")
+
+
+def fake_pdf(seed: bytes = b"A") -> bytes:
+    return b"%PDF-1.7\n" + seed * 700 + b"\n%%EOF\n"
+
+
+class LibraryV1Tests(unittest.TestCase):
+    def test_display_labels_follow_admission_not_metadata_edits(self) -> None:
+        with TestClient(self.app) as client:
+            first = self.upload(client, "first.pdf", fake_pdf(b"1")).json()["paper_id"]
+            second = self.upload(client, "second.pdf", fake_pdf(b"2")).json()["paper_id"]
+            metadata = client.get(f"/api/v1/library/papers/{first}/metadata").json()
+            metadata["title"] = {"value": "Corrected title"}
+            metadata["journal"] = {"value": ""}
+            saved = client.put(f"/api/v1/library/papers/{first}/metadata", json=metadata, headers={"Origin": "http://testserver"})
+            self.assertEqual(200, saved.status_code, saved.text)
+            matrix = {"rows": [{"paper_id": first, "journal": "Stale journal", "facts": ["kept"]}]}
+            overlaid, _ = self.app.state.planning_service._with_current_bibliography(self.first, matrix)
+            self.assertEqual("", overlaid["rows"][0]["journal"])
+            self.assertEqual(["kept"], overlaid["rows"][0]["facts"])
+            self.assertIn("journal", overlaid["rows"][0]["bibliography_identity"]["missing_fields"])
+            self.assertEqual("Stale journal", matrix["rows"][0]["journal"])
+            rows = client.get("/api/v1/library/papers").json()["items"]
+            self.assertEqual([first, second], [row["paper_id"] for row in rows])
+            self.assertEqual(["P001", "P002"], [row["display_label"] for row in rows])
+            deleted = client.delete(f"/api/v1/library/papers/{first}", headers={"Origin": "http://testserver"})
+            self.assertLess(deleted.status_code, 300)
+            third = self.upload(client, "third.pdf", fake_pdf(b"3")).json()["paper_id"]
+            rows = client.get("/api/v1/library/papers").json()["items"]
+            self.assertEqual([second, third], [row["paper_id"] for row in rows])
+            self.assertEqual(["P001", "P002"], [row["display_label"] for row in rows])
+
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        root = Path(self.temporary.name)
+        database_url = f"sqlite+pysqlite:///{(root / 'library.sqlite3').as_posix()}"
+        self.engine = create_engine(database_url, connect_args={"check_same_thread": False})
+
+        @event.listens_for(self.engine, "connect")
+        def enable_foreign_keys(connection, _record):
+            cursor = connection.cursor()
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.close()
+
+        Base.metadata.create_all(self.engine)
+        self.sessions = sessionmaker(bind=self.engine, expire_on_commit=False)
+        with self.sessions.begin() as session:
+            first = User(email="first@example.com", display_name="First", password_hash="hash")
+            second = User(email="second@example.com", display_name="Second", password_hash="hash")
+            session.add_all([first, second])
+            session.flush()
+            self.first = Principal(str(first.id), frozenset({Role.USER}), first.email)
+            self.second = Principal(str(second.id), frozenset({Role.USER}), second.email)
+        self.current = self.first
+        self.settings = ApiSettings(
+            review_root=root,
+            deployment_mode="hosted",
+            database_url=database_url,
+            public_origin="http://testserver",
+            credential_encryption_key=TEST_KEY,
+            hosted_workspace_root=root / "users",
+        )
+        self.parse_calls = 0
+
+        def precise_ingest(user_root: Path, filename: str, staged_pdf: Path):
+            self.parse_calls += 1
+            if filename == "fails.pdf":
+                raise RuntimeError(
+                    "MinerU precise parsing failed; the PDF was not admitted to Library. "
+                    "Missing MinerU API token."
+                )
+            paper_id = f"P{self.parse_calls:03d}"
+            library = user_root / "review-library"
+            uploads = library / "uploads"
+            markdown = library / "markdown"
+            metadata_dir = library / "metadata" / "papers"
+            uploads.mkdir(parents=True, exist_ok=True)
+            markdown.mkdir(parents=True, exist_ok=True)
+            metadata_dir.mkdir(parents=True, exist_ok=True)
+            pdf_path = uploads / f"{paper_id}.pdf"
+            pdf_path.write_bytes(staged_pdf.read_bytes())
+            md_path = markdown / f"{paper_id}.md"
+            md_path.write_text(f"# Copper catalysis {paper_id}\n\nallene keyword", encoding="utf-8")
+            extracted_dir = user_root / ".upload-staging" / f"{paper_id}-extracted"
+            extracted_dir.mkdir(parents=True, exist_ok=True)
+            source_image = extracted_dir / "images" / "scheme.png"
+            source_image.parent.mkdir(parents=True, exist_ok=True)
+            source_image.write_bytes(b"image-bytes")
+            long_image_relative = "parts/part-001/images/" + "a" * 64 + ".jpg"
+            blocks = [
+                {
+                    "type": "image",
+                    "img_path": "images/scheme.png",
+                    "image_caption": ["Scheme 1"],
+                }
+            ]
+            if filename == "asset.pdf":
+                long_source_image = extracted_dir / Path(
+                    *long_image_relative.split("/")
+                )
+                long_source_image.parent.mkdir(parents=True, exist_ok=True)
+                long_source_image.write_bytes(b"long-image-bytes")
+                blocks.append(
+                    {
+                        "type": "image",
+                        "img_path": long_image_relative,
+                        "image_caption": ["Scheme 2"],
+                    }
+                )
+            content_list = extracted_dir / f"{paper_id}_content_list.json"
+            content_list.write_text(
+                json.dumps(blocks),
+                encoding="utf-8",
+            )
+            metadata = {
+                "paper_id": paper_id,
+                "title": {"value": f"Copper catalysis {paper_id}"},
+                "authors": {"value": ["Ada Lovelace"]},
+                "keywords": {"value": ["allene"]},
+                "structured_tags": {"value": {"reaction_type": "allenation"}},
+                "source_paths": {
+                    "pdf": str(pdf_path),
+                    "markdown": str(md_path),
+                    "content_list": str(content_list),
+                    "extracted_dir": str(extracted_dir),
+                },
+            }
+            meta_path = metadata_dir / f"{paper_id}.metadata.json"
+            meta_path.write_text(json.dumps(metadata), encoding="utf-8")
+            return {
+                "status": "uploaded",
+                "paper_id": paper_id,
+                "title": f"Copper catalysis {paper_id}",
+                "metadata_path": str(meta_path),
+                "pdf_path": str(pdf_path),
+                "markdown_path": str(md_path),
+                "mineru_ready": True,
+                "page_count": 3,
+                "provider_request_id": f"batch-{paper_id}",
+            }
+
+        def search_provider(_context, payload):
+            return {
+                "candidates": [
+                    {
+                        "candidate_id": "crossref:1",
+                        "title": payload["topic"],
+                        "source": "crossref",
+                    }
+                ]
+            }
+
+        def download_provider(_context, payload):
+            root = (
+                self.settings.hosted_workspace_root
+                / _context.user_id
+                / ".review-writer"
+                / "job-staging"
+                / _context.job_id
+                / "library-workspace"
+                / "review-library"
+            )
+            pdf_path = root / "downloads" / "P900.pdf"
+            markdown_path = root / "downloads" / "P900.md"
+            metadata_path = root / "metadata" / "papers" / "P900.metadata.json"
+            pdf_path.parent.mkdir(parents=True, exist_ok=True)
+            markdown_path.parent.mkdir(parents=True, exist_ok=True)
+            metadata_path.parent.mkdir(parents=True, exist_ok=True)
+            pdf_path.write_bytes(fake_pdf(b"9"))
+            markdown_path.write_text("# Downloaded native paper\n", encoding="utf-8")
+            metadata_path.write_text(
+                json.dumps(
+                    {
+                        "paper_id": "P900",
+                        "title": {"value": "Downloaded native paper"},
+                        "authors": {"value": ["Grace Hopper"]},
+                        "keywords": {"value": ["native catalog"]},
+                        "structured_tags": {"value": {"reaction_type": "download"}},
+                        "source_paths": {
+                            "pdf": str(pdf_path),
+                            "markdown": str(markdown_path),
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            return {
+                "added_count": len(payload["candidates"]),
+                "already_present_count": 0,
+                "failed_count": 0,
+                "results": [
+                    {
+                        "status": "downloaded",
+                        "paper_id": "P900",
+                        "path": str(pdf_path),
+                        "metadata_path": str(metadata_path),
+                    }
+                ],
+            }
+
+        self.audit_started = Event()
+        self.audit_release = Event()
+        self.audit_release.set()
+        self.addCleanup(self.audit_release.set)
+
+        def bibliography_audit(context, payload):
+            # Exercise the real job and persistence paths without PDF subprocesses,
+            # network lookups, or model calls. Individual audit tests cover extraction.
+            self.audit_started.set()
+            if not self.audit_release.wait(5):
+                raise AssertionError("The test did not release the bibliography audit.")
+            context.checkpoint()
+            return {"paper_id": payload["paper_id"], "status": "needs_review",
+                    "manual_review_status": "not_reviewed", "resolved_by": "automatic"}
+
+        self.app = create_app(
+            self.settings,
+            principal_provider=lambda: self.current,
+            session_factory_override=self.sessions,
+            native_workflow_overrides={
+                "library.precise_ingest": precise_ingest,
+                "library.search": search_provider,
+                "library.download": download_provider,
+                "library.bibliography-audit": bibliography_audit,
+            },
+        )
+
+    def tearDown(self) -> None:
+        Base.metadata.drop_all(self.engine)
+        self.engine.dispose()
+        self.temporary.cleanup()
+
+    def wait_job(self, client: TestClient, job_id: str) -> dict:
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            payload = client.get(f"/api/v1/jobs/{job_id}").json()
+            if payload["status"] in {"succeeded", "failed", "cancelled", "interrupted"}:
+                return payload
+            time.sleep(0.02)
+        self.fail("Job did not finish.")
+
+    def upload(self, client: TestClient, filename: str, body: bytes):
+        response = client.post(
+            f"/api/v1/library/papers?filename={filename}",
+            content=body,
+            headers={"Content-Type": "application/pdf", "Origin": "http://testserver"},
+        )
+        if response.status_code == 201 and self.audit_release.is_set():
+            job_id = response.json().get("bibliography_audit_job_id")
+            if job_id:
+                completed = self.wait_job(client, job_id)
+                self.assertEqual("succeeded", completed["status"], completed)
+        return response
+
+    def test_upload_admits_only_precisely_parsed_pdf(self) -> None:
+        with TestClient(self.app) as client:
+            admitted = self.upload(client, "copper.pdf", fake_pdf())
+            rejected = self.upload(client, "fails.pdf", fake_pdf(b"B"))
+            papers = client.get("/api/v1/library/papers").json()
+
+        self.assertEqual(201, admitted.status_code)
+        self.assertTrue(admitted.json()["mineru_ready"])
+        self.assertEqual(502, rejected.status_code)
+        self.assertEqual("MINERU_PRECISE_PARSE_FAILED", rejected.json()["error"]["code"])
+        self.assertEqual(1, admitted.json()["library_count"])
+        self.assertEqual({}, papers["items"][0]["structured_tags"])
+        self.assertFalse(papers["items"][0]["structured_tags_verified"])
+
+    def test_bibliography_resolution_updates_metadata_and_survives_audit_job(self) -> None:
+        self.audit_release.clear()
+        with TestClient(self.app) as client:
+            admitted = self.upload(client, "resolved.pdf", fake_pdf(b"R"))
+            self.assertEqual(201, admitted.status_code, admitted.text)
+            body = admitted.json()
+            paper_id = body["paper_id"]
+            self.assertTrue(self.audit_started.wait(3), "Background audit did not start.")
+            resolved = client.post(
+                f"/api/v1/library/papers/{paper_id}/bibliography-resolution",
+                json={
+                    "action": "save_manual",
+                    "document_type": "journal_article",
+                    "fields": {
+                        "title": "Manually verified title",
+                        "authors": ["A. Author"],
+                        "journal": "Verified Journal",
+                        "year": 2024,
+                        "doi": "10.1000/resolved",
+                    },
+                    "manual_evidence": {
+                        "evidence_type": "first_page",
+                        "location": "PDF page 1",
+                        "note": "Verified from the publisher header.",
+                    },
+                },
+            )
+            self.audit_release.set()
+            self.assertEqual(200, resolved.status_code, resolved.text)
+            audit_job_id = str(body.get("bibliography_audit_job_id") or "")
+            self.assertTrue(audit_job_id)
+            completed = self.wait_job(client, audit_job_id)
+            self.assertEqual("succeeded", completed["status"], completed)
+            audit = client.get(
+                f"/api/v1/library/papers/{paper_id}/bibliography-audit"
+            ).json()
+            metadata = client.get(
+                f"/api/v1/library/papers/{paper_id}/metadata"
+            ).json()
+
+        self.assertEqual("resolved", audit["audit"]["manual_review_status"])
+        self.assertEqual("human", audit["audit"]["resolved_by"])
+        self.assertEqual("Manually verified title", metadata["title"]["value"])
+        self.assertTrue(metadata["title"]["human_checked"])
+        self.assertEqual("10.1000/resolved", metadata["doi"]["value"])
+
+    def test_supporting_only_resolution_without_evidence_is_rejected(self) -> None:
+        with TestClient(self.app) as client:
+            admitted = self.upload(client, "supporting.pdf", fake_pdf(b"S"))
+            paper_id = admitted.json()["paper_id"]
+            rejected = client.post(
+                f"/api/v1/library/papers/{paper_id}/bibliography-resolution",
+                json={
+                    "action": "supporting_only",
+                    "document_type": "other",
+                    "fields": {},
+                },
+            )
+
+        self.assertEqual(422, rejected.status_code, rejected.text)
+        self.assertIn("manual bibliography resolution", rejected.text.lower())
+
+    def test_cancel_remaining_is_scoped_durable_and_preserves_running_upload(self) -> None:
+        self.app.state.job_service.execution_enabled = False
+        batch_id = str(uuid.uuid4())
+        other_batch = str(uuid.uuid4())
+        repository = self.app.state.workflow_repository
+        with TestClient(self.app) as client:
+            def submit(batch, name):
+                return client.post("/api/v1/library/upload-jobs", params={"filename": name, "batch_id": batch},
+                    content=fake_pdf(), headers={"Content-Type": "application/pdf", "Origin": "http://testserver"})
+
+            queued = submit(batch_id, "queued.pdf").json()
+            running = submit(batch_id, "running.pdf").json()
+            other = submit(other_batch, "other.pdf").json()
+            repository.claim_job(running["id"])
+            self.current = self.second
+            foreign = submit(batch_id, "foreign.pdf").json()
+            self.current = self.first
+            response = client.post(f"/api/v1/library/upload-batches/{batch_id}/cancel-remaining", headers={"Origin": "http://testserver"})
+            self.assertEqual(200, response.status_code, response.text)
+            self.assertEqual(1, response.json()["cancelled_count"])
+            self.assertEqual("cancelled", repository.get_job(self.first.user_id, queued["id"]).status)
+            self.assertEqual("running", repository.get_job(self.first.user_id, running["id"]).status)
+            self.assertFalse(repository.get_job(self.first.user_id, running["id"]).cancellation_requested)
+            self.assertEqual("queued", repository.get_job(self.first.user_id, other["id"]).status)
+            self.assertEqual("queued", repository.get_job(self.second.user_id, foreign["id"]).status)
+            self.assertEqual(409, submit(batch_id, "late.pdf").status_code)
+            repeated = client.post(f"/api/v1/library/upload-batches/{batch_id}/cancel-remaining", headers={"Origin": "http://testserver"})
+            self.assertEqual(200, repeated.status_code)
+            empty_batch = str(uuid.uuid4())
+            self.assertEqual(200, client.post(f"/api/v1/library/upload-batches/{empty_batch}/cancel-remaining", headers={"Origin": "http://testserver"}).status_code)
+            self.assertEqual(409, submit(empty_batch, "first-late.pdf").status_code)
+            recent = client.get("/api/v1/library/upload-jobs/recent").json()
+            self.assertEqual(1, next(row for row in recent["batch_summaries"] if row["batch_id"] == batch_id)["cancelled"])
+        staging = self.settings.hosted_workspace_root / self.first.user_id / "review-library" / ".upload-staging"
+        self.assertEqual(2, len(list(staging.glob("*.pdf.part"))))
+        self.assertEqual(0, self.parse_calls)
+
+    def test_batch_cancellation_races_upload_admission_without_leaving_queued_work(self) -> None:
+        repository = self.app.state.workflow_repository
+        for _ in range(8):
+            batch_id = str(uuid.uuid4())
+            def enqueue():
+                try:
+                    return repository.create_or_get_job(self.first.user_id, None, "library", "library.upload",
+                        str(uuid.uuid4()), {"batch_id": batch_id}, operation_key=batch_id)
+                except WorkflowConflict:
+                    return None
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                future = pool.submit(enqueue)
+                cancellation = pool.submit(repository.cancel_remaining_uploads, self.first.user_id, batch_id)
+                job = future.result(timeout=5)
+                cancellation.result(timeout=5)
+            if job:
+                self.assertEqual("cancelled", repository.get_job(self.first.user_id, job.id).status)
+
+    def test_upload_job_persists_status_and_links_mineru_usage(self) -> None:
+        batch_id = str(uuid.uuid4())
+        with TestClient(self.app) as client:
+            submitted = client.post(
+                "/api/v1/library/upload-jobs",
+                params={"filename": "persistent.pdf", "batch_id": batch_id},
+                content=fake_pdf(b"P"),
+                headers={
+                    "Content-Type": "application/pdf",
+                    "Origin": "http://testserver",
+                    "Idempotency-Key": str(uuid.uuid4()),
+                },
+            )
+            self.assertEqual(202, submitted.status_code, submitted.text)
+            submitted_job = submitted.json()
+            self.assertEqual("persistent.pdf", submitted_job["filename"])
+            self.assertEqual(batch_id, submitted_job["batch_id"])
+            completed = self.wait_job(client, submitted_job["id"])
+            self.assertEqual("succeeded", completed["status"])
+            recent = client.get("/api/v1/library/upload-jobs/recent?limit=10")
+            audit_route = client.get(
+                f"/api/v1/library/papers/{completed['result']['paper_id']}/bibliography-audit"
+            )
+
+        self.assertEqual(200, recent.status_code)
+        self.assertEqual(submitted_job["id"], recent.json()["items"][0]["id"])
+        self.assertEqual("persistent.pdf", recent.json()["items"][0]["filename"])
+        self.assertEqual(200, audit_route.status_code)
+        self.assertEqual("bibliography_verification", audit_route.json()["task_kind"])
+        self.assertFalse(audit_route.json()["adds_candidate_papers"])
+        self.assertEqual(
+            {
+                "batch_id": batch_id,
+                "total": 1,
+                "queued": 0,
+                "running": 0,
+                "cancel_requested": 0,
+                "succeeded": 1,
+                "failed": 0,
+                "cancelled": 0,
+                "interrupted": 0,
+            },
+            {
+                key: recent.json()["batch_summaries"][0][key]
+                for key in (
+                    "batch_id",
+                    "total",
+                    "queued",
+                    "running",
+                    "cancel_requested",
+                    "succeeded",
+                    "failed",
+                    "cancelled",
+                    "interrupted",
+                )
+            },
+        )
+        with self.sessions() as session:
+            usage = session.scalar(select(MinerUUsageEvent))
+            audit_jobs = session.scalars(
+                select(WorkflowJob).where(
+                    WorkflowJob.job_type == "library.bibliography-audit"
+                )
+            ).all()
+        self.assertIsNotNone(usage)
+        self.assertEqual(1, len(audit_jobs))
+        self.assertEqual(
+            "bibliography_verification", audit_jobs[0].payload_json["task_kind"]
+        )
+        self.assertFalse(audit_jobs[0].payload_json["adds_candidate_papers"])
+        self.assertEqual("fallback", audit_jobs[0].payload_json["network_mode"])
+        self.assertTrue(audit_jobs[0].payload_json["markdown_relative_path"])
+        self.assertEqual(uuid.UUID(submitted_job["id"]), usage.job_id)
+        staging = (
+            self.settings.hosted_workspace_root
+            / self.first.user_id
+            / "review-library"
+            / ".upload-staging"
+        )
+        self.assertEqual([], list(staging.glob("*.pdf.part")))
+
+    def test_upload_builds_rebuildable_fulltext_index_and_hybrid_search_uses_it(self) -> None:
+        with TestClient(self.app) as client:
+            admitted = self.upload(client, "indexed.pdf", fake_pdf(b"I"))
+            self.assertEqual(201, admitted.status_code, admitted.text)
+            index_job_id = admitted.json()["index_job_id"]
+            self.assertTrue(index_job_id)
+            completed = self.wait_job(client, index_job_id)
+            self.assertEqual("succeeded", completed["status"], completed)
+
+            detail = client.get(
+                f"/api/v1/library/papers/{admitted.json()['paper_id']}/index-status"
+            )
+            fulltext = client.get(
+                "/api/v1/library/papers",
+                params={"q": "allene keyword", "mode": "fulltext"},
+            )
+            hybrid = client.get(
+                "/api/v1/library/papers",
+                params={"q": "allene keyword", "mode": "hybrid"},
+            )
+
+        self.assertEqual(200, detail.status_code)
+        self.assertEqual("ready", detail.json()["fulltext"])
+        self.assertGreater(detail.json()["chunk_count"], 0)
+        self.assertEqual(1, fulltext.json()["count"])
+        self.assertEqual("lexical", fulltext.json()["retrieval_mode"])
+        self.assertEqual(1, hybrid.json()["count"])
+        self.assertEqual("lexical_only", hybrid.json()["retrieval_mode"])
+        self.assertEqual("ready", hybrid.json()["items"][0]["index_status"]["fulltext"])
+        self.assertIn("allene keyword", hybrid.json()["items"][0]["search_match"]["content"])
+        with self.sessions() as session:
+            self.assertEqual(1, session.query(LibraryDocumentIndex).count())
+            self.assertGreater(session.query(LibraryDocumentChunk).count(), 0)
+
+        relevance = self.app.state.library_index_service.retrieve_paper_relevance(
+            self.first,
+            [
+                {
+                    "query_id": "topic_core",
+                    "kind": "topic_core",
+                    "label": "Core topic",
+                    "query": "allene keyword",
+                }
+            ],
+            [admitted.json()["paper_id"]],
+        )
+        paper_id = admitted.json()["paper_id"]
+        self.assertIn(paper_id, relevance["papers"])
+        self.assertIn(
+            "fulltext_lexical",
+            relevance["papers"][paper_id]["retrieval_channels"],
+        )
+        self.assertEqual("disabled", relevance["semantic_status"])
+
+        partition_cannot_admit = self.app.state.library_index_service.retrieve_paper_relevance(
+            self.first,
+            [
+                {
+                    "query_id": "partition_01",
+                    "kind": "topic_partition",
+                    "label": "Allene partition",
+                    "query": "allene keyword",
+                },
+                {
+                    "query_id": "topic_core",
+                    "kind": "topic_core",
+                    "label": "Core topic",
+                    "query": "definitely_missing_topic_token",
+                },
+            ],
+            [paper_id],
+        )
+        self.assertNotIn(paper_id, partition_cannot_admit["papers"])
+
+        partition_annotated = self.app.state.library_index_service.retrieve_paper_relevance(
+            self.first,
+            [
+                {
+                    "query_id": "partition_01",
+                    "kind": "topic_partition",
+                    "label": "Allene partition",
+                    "query": "allene keyword",
+                },
+                {
+                    "query_id": "topic_core",
+                    "kind": "topic_core",
+                    "label": "Core topic",
+                    "query": "allene keyword",
+                },
+            ],
+            [paper_id],
+        )
+        self.assertEqual(
+            relevance["papers"][paper_id]["rrf_score"],
+            partition_annotated["papers"][paper_id]["rrf_score"],
+        )
+        self.assertEqual(
+            ["partition_01"],
+            partition_annotated["papers"][paper_id]["matched_partitions"],
+        )
+
+    def test_screening_lexical_candidates_keep_per_paper_coverage(self) -> None:
+        with TestClient(self.app) as client:
+            first = self.upload(client, "coverage-first.pdf", fake_pdf(b"C"))
+            second = self.upload(client, "coverage-second.pdf", fake_pdf(b"D"))
+            self.assertEqual(201, first.status_code, first.text)
+            self.assertEqual(201, second.status_code, second.text)
+            self.assertEqual(
+                "succeeded",
+                self.wait_job(client, first.json()["index_job_id"])["status"],
+            )
+            self.assertEqual(
+                "succeeded",
+                self.wait_job(client, second.json()["index_job_id"])["status"],
+            )
+
+        first_paper_id = first.json()["paper_id"]
+        second_paper_id = second.json()["paper_id"]
+        with self.sessions.begin() as session:
+            first_index = session.scalar(
+                select(LibraryDocumentIndex).where(
+                    LibraryDocumentIndex.paper_id == first_paper_id,
+                    LibraryDocumentIndex.is_current.is_(True),
+                )
+            )
+            self.assertIsNotNone(first_index)
+            session.add_all(
+                [
+                    LibraryDocumentChunk(
+                        index_id=first_index.id,
+                        user_id=uuid.UUID(self.first.user_id),
+                        paper_id=first_paper_id,
+                        chunk_id=f"000-coverage-{index}",
+                        ordinal=100 + index,
+                        content="allene keyword",
+                        normalized_content="allene keyword",
+                        block_start=0,
+                        block_end=0,
+                    )
+                    for index in range(2)
+                ]
+            )
+
+        chunks = self.app.state.library_index_service._screening_lexical_chunks(
+            self.first,
+            "allene keyword",
+            allowed_papers=[first_paper_id, second_paper_id],
+            limit=2,
+            per_paper_limit=1,
+        )
+        self.assertEqual(
+            {first_paper_id, second_paper_id},
+            {str(item["paper_id"]) for item in chunks},
+        )
+
+    def test_semantic_backfill_plan_is_user_scoped_bounded_and_detects_model_drift(self) -> None:
+        class EmbeddingProfile:
+            @staticmethod
+            def embedding_profile() -> dict[str, object]:
+                return {
+                    "profile": "retrieval_embedding",
+                    "enabled": True,
+                    "model": "embedding-current",
+                    "dimension": 3,
+                }
+
+        with TestClient(self.app) as client:
+            admitted = self.upload(client, "semantic-history.pdf", fake_pdf(b"S"))
+            self.wait_job(client, admitted.json()["index_job_id"])
+        paper_id = admitted.json()["paper_id"]
+        service = self.app.state.library_index_service
+        service.vector_enabled = True
+        service.embedding_profile_provider = EmbeddingProfile()
+
+        plan = service.semantic_backfill_plan(self.first, limit=1)
+
+        self.assertEqual("pending", plan["status"])
+        self.assertEqual([paper_id], plan["paper_ids"])
+        self.assertEqual(1, plan["pending_count"])
+        self.assertEqual(0, plan["ready_count"])
+        self.assertEqual(0, service.semantic_backfill_plan(self.second)["total_count"])
+        marked = service.mark_semantic_backfill_queued(
+            self.first,
+            [paper_id],
+            profile="retrieval_embedding",
+            model="embedding-current",
+            dimension=3,
+        )
+        self.assertEqual(1, marked)
+        with self.sessions.begin() as session:
+            index = session.scalar(
+                select(LibraryDocumentIndex).where(
+                    LibraryDocumentIndex.user_id == uuid.UUID(self.first.user_id),
+                    LibraryDocumentIndex.paper_id == paper_id,
+                    LibraryDocumentIndex.is_current.is_(True),
+                )
+            )
+            self.assertIsNotNone(index)
+            self.assertEqual("queued", index.semantic_status)
+            index.semantic_status = "ready"
+            index.embedding_profile = "retrieval_embedding"
+            index.embedding_model_snapshot = "embedding-obsolete"
+            index.embedding_dimension = 3
+        self.assertEqual(
+            "pending", service.semantic_backfill_plan(self.first)["status"]
+        )
+        with self.sessions.begin() as session:
+            index = session.scalar(
+                select(LibraryDocumentIndex).where(
+                    LibraryDocumentIndex.user_id == uuid.UUID(self.first.user_id),
+                    LibraryDocumentIndex.paper_id == paper_id,
+                    LibraryDocumentIndex.is_current.is_(True),
+                )
+            )
+            index.embedding_model_snapshot = "embedding-current"
+        complete = service.semantic_backfill_plan(self.first)
+        self.assertEqual("complete", complete["status"])
+        self.assertEqual(1, complete["ready_count"])
+
+        with self.sessions.begin() as session:
+            index = session.scalar(
+                select(LibraryDocumentIndex).where(
+                    LibraryDocumentIndex.user_id == uuid.UUID(self.first.user_id),
+                    LibraryDocumentIndex.paper_id == paper_id,
+                    LibraryDocumentIndex.is_current.is_(True),
+                )
+            )
+            blocked_at = utc_now()
+            index.semantic_status = "failed"
+            index.semantic_error_code = "INSUFFICIENT_CREDIT"
+            index.updated_at = blocked_at
+            account = session.get(
+                UserCreditAccount, uuid.UUID(self.first.user_id)
+            )
+            if account is None:
+                account = UserCreditAccount(
+                    user_id=uuid.UUID(self.first.user_id),
+                    balance_usd=Decimal("0"),
+                )
+                session.add(account)
+            account.updated_at = blocked_at - timedelta(minutes=1)
+        blocked = service.semantic_backfill_plan(self.first)
+        self.assertEqual("blocked_credit", blocked["status"])
+        self.assertEqual([], blocked["paper_ids"])
+        with self.sessions.begin() as session:
+            account = session.get(
+                UserCreditAccount, uuid.UUID(self.first.user_id)
+            )
+            account.balance_usd = Decimal("1")
+            account.updated_at = utc_now() + timedelta(seconds=1)
+        resumed = service.semantic_backfill_plan(self.first)
+        self.assertEqual("pending", resumed["status"])
+        self.assertEqual([paper_id], resumed["paper_ids"])
+
+    def test_library_query_automatically_submits_semantic_backfill_batch(self) -> None:
+        class EmbeddingProfile:
+            @staticmethod
+            def embedding_profile() -> dict[str, object]:
+                return {
+                    "profile": "retrieval_embedding",
+                    "enabled": True,
+                    "model": "embedding-current",
+                    "dimension": 3,
+                }
+
+        with TestClient(self.app) as client:
+            admitted = self.upload(client, "semantic-auto.pdf", fake_pdf(b"V"))
+            self.wait_job(client, admitted.json()["index_job_id"])
+            service = self.app.state.library_index_service
+            service.vector_enabled = True
+            service.embedding_profile_provider = EmbeddingProfile()
+            listing = client.get("/api/v1/library/papers")
+
+        self.assertEqual(200, listing.status_code, listing.text)
+        backfill = listing.json()["semantic_backfill"]
+        self.assertTrue(backfill["enabled"])
+        self.assertEqual(
+            "library.semantic-backfill", backfill["current_job"]["job_type"]
+        )
+        self.assertIn(backfill["status"], {"queued", "running", "succeeded"})
+
+    def test_semantic_embedding_credit_failure_is_sanitized_and_not_retryable_until_balance_changes(self) -> None:
+        class InsufficientCreditGateway:
+            @staticmethod
+            def embedding_profile() -> dict[str, object]:
+                return {
+                    "profile": "retrieval_embedding",
+                    "enabled": True,
+                    "model": "embedding-current",
+                    "dimension": 3,
+                }
+
+            @staticmethod
+            def embed_for_active_job(*_args, **_kwargs):
+                raise RuntimeError(
+                    'HTTP 402: {"code":"INSUFFICIENT_CREDIT","message":"余额不足"}'
+                )
+
+        with TestClient(self.app) as client:
+            admitted = self.upload(client, "semantic-credit.pdf", fake_pdf(b"C"))
+            self.wait_job(client, admitted.json()["index_job_id"])
+        paper_id = admitted.json()["paper_id"]
+        service = self.app.state.library_index_service
+        service.vector_enabled = True
+        service.embedding_gateway = InsufficientCreditGateway()
+        service.embedding_profile_provider = service.embedding_gateway
+
+        result = service.build_embeddings(self.first, paper_id)
+
+        self.assertEqual("failed", result["status"])
+        self.assertEqual("INSUFFICIENT_CREDIT", result["error_code"])
+        self.assertNotIn("HTTP 402", result["error"])
+        status_payload = service.status(self.first, paper_id)
+        self.assertEqual("INSUFFICIENT_CREDIT", status_payload["semantic_error_code"])
+        self.assertNotIn("HTTP 402", status_payload["semantic_error_message"])
+        self.assertEqual(
+            "blocked_credit", service.semantic_backfill_plan(self.first)["status"]
+        )
+
+    def test_metadata_update_does_not_rebuild_document_chunks(self) -> None:
+        with TestClient(self.app) as client:
+            admitted = self.upload(client, "metadata-only.pdf", fake_pdf(b"M"))
+            self.wait_job(client, admitted.json()["index_job_id"])
+            paper_id = admitted.json()["paper_id"]
+            before = client.get(
+                f"/api/v1/library/papers/{paper_id}/index-status"
+            ).json()
+            metadata = client.get(
+                f"/api/v1/library/papers/{paper_id}/metadata"
+            ).json()
+            metadata["title"] = {"value": "Edited catalog title"}
+            saved = client.put(
+                f"/api/v1/library/papers/{paper_id}/metadata", json=metadata
+            )
+            after = client.get(
+                f"/api/v1/library/papers/{paper_id}/index-status"
+            ).json()
+
+        self.assertEqual(200, saved.status_code, saved.text)
+        self.assertEqual(before["index_id"], after["index_id"])
+        self.assertEqual(before["source_lineage_hash"], after["source_lineage_hash"])
+        self.assertEqual("ready", after["fulltext"])
+
+    def test_index_status_detects_chunker_upgrade_and_retrieval_rejects_other_user_scope(self) -> None:
+        with TestClient(self.app) as client:
+            admitted = self.upload(client, "lineage.pdf", fake_pdf(b"L"))
+            self.wait_job(client, admitted.json()["index_job_id"])
+            paper_id = admitted.json()["paper_id"]
+            with self.sessions.begin() as session:
+                index = session.query(LibraryDocumentIndex).filter_by(
+                    user_id=uuid.UUID(self.first.user_id), paper_id=paper_id
+                ).one()
+                index.chunker_version = "obsolete-chunker"
+            status_payload = client.get(
+                f"/api/v1/library/papers/{paper_id}/index-status"
+            ).json()
+
+        self.assertEqual("rebuild_required", status_payload["fulltext"])
+        with self.assertRaises(WorkflowValidationError):
+            self.app.state.library_index_service.retrieve(
+                self.second,
+                "allene keyword",
+                allowed_papers=[paper_id],
+            )
+
+    def test_upload_persists_mineru_content_and_images_before_staging_cleanup(self) -> None:
+        with TestClient(self.app) as client:
+            admitted = self.upload(client, "figures.pdf", fake_pdf(b"F"))
+        self.assertEqual(201, admitted.status_code, admitted.text)
+        paper = self.app.state.library_service.get(
+            self.first, admitted.json()["paper_id"]
+        )
+        paths = paper.metadata["source_paths"]
+        content_list = Path(paths["content_list"])
+        extracted = Path(paths["extracted_dir"])
+        self.assertTrue(content_list.is_file())
+        self.assertTrue((extracted / "images" / "scheme.png").is_file())
+        self.assertIn("mineru", paper.artifact_ids)
+        self.assertIn("review-library/.artifacts/", content_list.as_posix())
+
+    def test_duplicate_upload_is_idempotent(self) -> None:
+        content = fake_pdf()
+        with TestClient(self.app) as client:
+            first = self.upload(client, "first.pdf", content)
+            duplicate = self.upload(client, "renamed.pdf", content)
+
+        self.assertEqual(201, first.status_code)
+        self.assertEqual(200, duplicate.status_code)
+        self.assertEqual("duplicate_file", duplicate.json()["status"])
+        self.assertEqual(first.json()["paper_id"], duplicate.json()["paper_id"])
+        self.assertEqual(1, self.parse_calls)
+
+    def test_generated_paper_id_is_compact_for_windows_artifact_paths(self) -> None:
+        paper_id = self.app.state.library_service._new_paper_id()
+
+        self.assertRegex(paper_id, r"^P[0-9]{19}$")
+        user_root = self.settings.hosted_workspace_root / self.first.user_id
+        representative = (
+            user_root
+            / "review-library"
+            / ".artifacts"
+            / paper_id
+            / str(uuid.uuid4())
+            / "extracted"
+            / f"{uuid.uuid4()}_content_list_v2.json"
+        )
+        self.assertLess(len(str(representative)), 260)
+
+    def test_native_upload_runner_receives_secrets_only_in_task_environment(self) -> None:
+        captured: dict = {}
+
+        class RecordingRunner:
+            def run(_self, command, **kwargs):
+                captured["command"] = tuple(command)
+                captured.update(kwargs)
+                root = Path(command[command.index("--review-root") + 1])
+                staged = Path(command[command.index("--input") + 1])
+                output = Path(command[command.index("--output") + 1])
+                paper_id = "P777"
+                pdf = root / "review-library" / "uploads" / f"{paper_id}.pdf"
+                markdown = root / "review-library" / "markdown" / f"{paper_id}.md"
+                metadata = (
+                    root
+                    / "review-library"
+                    / "metadata"
+                    / "papers"
+                    / f"{paper_id}.metadata.json"
+                )
+                for parent in (pdf.parent, markdown.parent, metadata.parent):
+                    parent.mkdir(parents=True, exist_ok=True)
+                pdf.write_bytes(staged.read_bytes())
+                markdown.write_text("# Native runner output\n", encoding="utf-8")
+                metadata.write_text(
+                    json.dumps(
+                        {
+                            "paper_id": paper_id,
+                            "title": {"value": "Native runner paper"},
+                            "source_paths": {
+                                "pdf": str(pdf),
+                                "markdown": str(markdown),
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                output.write_text(
+                    json.dumps(
+                        {
+                            "status": "uploaded",
+                            "paper_id": paper_id,
+                            "metadata_path": str(metadata),
+                            "pdf_path": str(pdf),
+                            "markdown_path": str(markdown),
+                            "mineru_ready": True,
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+        service = self.app.state.library_service
+        service.precise_ingest = None
+        service.scientific_runner = RecordingRunner()
+        service.runtime_environment = lambda _principal: {
+            "MINERU_API_TOKEN": "task-secret",
+            "MINERU_BASE_URL": "https://mineru.example.test",
+        }
+        with TestClient(self.app) as client:
+            response = self.upload(client, "native.pdf", fake_pdf(b"N"))
+
+        self.assertEqual(201, response.status_code, response.text)
+        self.assertRegex(response.json()["paper_id"], r"^P[0-9]+$")
+        self.assertNotEqual("P777", response.json()["paper_id"])
+        self.assertEqual(
+            {"pdf", "markdown", "metadata"},
+            set(response.json()["artifact_ids"]),
+        )
+        self.assertNotIn("task-secret", " ".join(captured["command"]))
+        self.assertEqual(
+            {"MINERU_API_TOKEN": "task-secret"}, captured["secret_env"]
+        )
+        self.assertEqual(
+            "https://mineru.example.test", captured["env"]["MINERU_BASE_URL"]
+        )
+        self.assertTrue(callable(captured["cancel_requested"]))
+        parse_root = Path(
+            captured["command"][captured["command"].index("--review-root") + 1]
+        )
+        expected_parent = (
+            self.settings.hosted_workspace_root / self.first.user_id / ".parse"
+        )
+        self.assertEqual(expected_parent.resolve(), parse_root.parent.resolve())
+        self.assertTrue(parse_root.name.startswith("p-"))
+        self.assertLess(len(str(parse_root)), len(str(expected_parent)) + 16)
+        self.assertFalse(parse_root.exists())
+
+    def test_library_uses_only_server_mineru_credential(self) -> None:
+        provider_service = self.app.state.provider_settings_service
+        provider_service.settings = replace(
+            provider_service.settings,
+            mineru_api_token="mineru-secret",
+            text_provider_base_url="https://blocked.example/v1",
+            text_provider_api_key="text-secret",
+        )
+        environment = self.app.state.library_service.runtime_environment(self.first)
+
+        self.assertEqual({"MINERU_API_TOKEN": "mineru-secret"}, environment)
+
+    def test_native_runner_failure_preserves_mineru_upload_error_contract(self) -> None:
+        class FailingRunner:
+            def run(self, _command, **_kwargs):
+                raise ScientificRunFailed(
+                    "Scientific task failed.",
+                    attempts=1,
+                    retryable=False,
+                    details={
+                        "returncode": 1,
+                        "category": "unknown",
+                        "provider_call_completed": True,
+                        "stderr": (
+                            "Traceback (most recent call last):\n"
+                            "RuntimeError: MinerU precise parsing failed; "
+                            "[failed] paper.pdf: unsupported encrypted document\n"
+                        ),
+                    },
+                )
+
+        service = self.app.state.library_service
+        service.precise_ingest = None
+        service.scientific_runner = FailingRunner()
+        with TestClient(self.app) as client:
+            response = self.upload(client, "native-failure.pdf", fake_pdf(b"F"))
+
+        self.assertEqual(502, response.status_code)
+        self.assertEqual(
+            "MINERU_PRECISE_PARSE_FAILED", response.json()["error"]["code"]
+        )
+        message = response.json()["error"]["message"]
+        self.assertIn("unsupported encrypted document", message)
+        self.assertNotIn("Traceback", message)
+        self.assertEqual(
+            "unknown", response.json()["error"]["details"]["category"]
+        )
+
+    def test_batch_upload_reports_real_outcomes(self) -> None:
+        with TestClient(self.app) as client:
+            responses = [
+                self.upload(client, "one.pdf", fake_pdf(b"1")),
+                self.upload(client, "one-copy.pdf", fake_pdf(b"1")),
+                self.upload(client, "fails.pdf", fake_pdf(b"2")),
+            ]
+        outcomes = [response.json()["status"] for response in responses]
+        self.assertEqual(["uploaded", "duplicate_file", "failed"], outcomes)
+
+    def test_mineru_pages_and_duplicate_cache_hit_are_metered_once(self) -> None:
+        self.app.state.library_service.mineru_price_usd_per_page = Decimal("0.01000000")
+        with TestClient(self.app) as client:
+            first = self.upload(client, "metered.pdf", fake_pdf(b"M"))
+            duplicate = self.upload(client, "metered-copy.pdf", fake_pdf(b"M"))
+
+        self.assertEqual(201, first.status_code, first.text)
+        self.assertEqual("duplicate_file", duplicate.json()["status"])
+        self.assertEqual(1, self.parse_calls)
+        with self.sessions() as session:
+            rows = session.scalars(select(MinerUUsageEvent)).all()
+        self.assertEqual(1, len(rows))
+        self.assertEqual("succeeded", rows[0].status)
+        self.assertEqual(3, rows[0].page_count)
+        self.assertEqual(3, rows[0].billable_pages)
+        self.assertEqual(1, rows[0].cache_hit_count)
+        self.assertEqual("batch-P001", rows[0].provider_request_id)
+        self.assertEqual("0.03000000", format(rows[0].provider_cost_usd, "f"))
+
+    def test_search_uses_bibliographic_fields_and_only_verified_tags(self) -> None:
+        with TestClient(self.app) as client:
+            uploaded = self.upload(client, "copper.pdf", fake_pdf()).json()
+            for query in ("Copper", "Lovelace", "allene"):
+                response = client.get("/api/v1/library/papers", params={"q": query})
+                self.assertEqual(1, response.json()["count"], query)
+            ignored = client.get("/api/v1/library/papers", params={"q": "allenation"})
+            metadata = client.get(
+                f"/api/v1/library/papers/{uploaded['paper_id']}/metadata"
+            ).json()
+            metadata["structured_tags"]["human_checked"] = True
+            saved = client.put(
+                f"/api/v1/library/papers/{uploaded['paper_id']}/metadata",
+                json=metadata,
+            )
+            verified = client.get(
+                "/api/v1/library/papers", params={"q": "allenation"}
+            )
+
+        self.assertEqual(0, ignored.json()["count"])
+        self.assertEqual(200, saved.status_code, saved.text)
+        self.assertEqual(1, verified.json()["count"])
+
+    def test_metadata_markdown_and_pdf_are_user_isolated(self) -> None:
+        with TestClient(self.app) as client:
+            paper = self.upload(client, "copper.pdf", fake_pdf()).json()
+            paper_id = paper["paper_id"]
+            pdf_artifact_id = paper["artifact_ids"]["pdf"]
+            self.assertEqual(200, client.get(f"/api/v1/library/papers/{paper_id}/metadata").status_code)
+            self.assertIn("allene", client.get(f"/api/v1/library/papers/{paper_id}/markdown").text)
+            ranged = client.get(
+                f"/api/v1/library/papers/{paper_id}/pdf",
+                headers={"Range": "bytes=0-9"},
+            )
+            self.assertEqual(206, ranged.status_code)
+            self.assertEqual(fake_pdf()[:10], ranged.content)
+            self.assertEqual(
+                fake_pdf(),
+                client.get(f"/api/v1/artifacts/{pdf_artifact_id}/content").content,
+            )
+
+            self.current = self.second
+            for suffix in ("metadata", "markdown", "pdf"):
+                self.assertEqual(
+                    404,
+                    client.get(f"/api/v1/library/papers/{paper_id}/{suffix}").status_code,
+                )
+            self.assertEqual(
+                404,
+                client.get(f"/api/v1/artifacts/{pdf_artifact_id}/content").status_code,
+            )
+
+    def test_mineru_assets_are_served_by_versioned_user_scoped_route(self) -> None:
+        long_image_relative = "parts/part-001/images/" + "a" * 64 + ".jpg"
+        with TestClient(self.app) as client:
+            paper = self.upload(client, "asset.pdf", fake_pdf()).json()
+            paper_id = paper["paper_id"]
+            asset = client.get(
+                f"/api/v1/library/papers/{paper_id}/asset",
+                params={"path": "images/scheme.png"},
+            )
+            traversal = client.get(
+                f"/api/v1/library/papers/{paper_id}/asset",
+                params={"path": "../paper.pdf"},
+            )
+            non_image = client.get(
+                f"/api/v1/library/papers/{paper_id}/asset",
+                params={"path": f"{paper_id}_content_list.json"},
+            )
+            long_image = client.get(
+                f"/api/v1/library/papers/{paper_id}/asset",
+                params={"path": long_image_relative},
+            )
+            self.current = self.second
+            isolated = client.get(
+                f"/api/v1/library/papers/{paper_id}/asset",
+                params={"path": "images/scheme.png"},
+            )
+        self.assertEqual(200, asset.status_code, asset.text)
+        self.assertEqual(b"image-bytes", asset.content)
+        self.assertEqual(404, traversal.status_code, traversal.text)
+        self.assertEqual(404, non_image.status_code, non_image.text)
+        self.assertEqual(200, long_image.status_code, long_image.text)
+        self.assertEqual(b"long-image-bytes", long_image.content)
+        self.assertEqual(404, isolated.status_code, isolated.text)
+
+    def test_mineru_asset_rejects_lexical_extracted_directory_symlink(self) -> None:
+        with TestClient(self.app) as client:
+            paper = self.upload(client, "symlink-asset.pdf", fake_pdf()).json()
+            paper_id = paper["paper_id"]
+            record = self.app.state.library_service.get(self.first, paper_id)
+            extracted = Path(record.metadata["source_paths"]["extracted_dir"])
+            original_is_symlink = Path.is_symlink
+
+            def reports_extracted_symlink(path: Path) -> bool:
+                return path == extracted or original_is_symlink(path)
+
+            with patch.object(Path, "is_symlink", reports_extracted_symlink):
+                response = client.get(
+                    f"/api/v1/library/papers/{paper_id}/asset",
+                    params={"path": "images/scheme.png"},
+                )
+        self.assertEqual(404, response.status_code, response.text)
+
+    def test_metadata_edit_publishes_a_new_immutable_metadata_artifact(self) -> None:
+        with TestClient(self.app) as client:
+            uploaded = self.upload(client, "versioned.pdf", fake_pdf(b"V")).json()
+            paper_id = uploaded["paper_id"]
+            before = self.app.state.library_service.get(self.first, paper_id)
+            metadata = client.get(
+                f"/api/v1/library/papers/{paper_id}/metadata"
+            ).json()
+            metadata["title"] = {"value": "Human-reviewed title"}
+            saved = client.put(
+                f"/api/v1/library/papers/{paper_id}/metadata",
+                json=metadata,
+                headers={"Origin": "http://testserver"},
+            )
+            after = self.app.state.library_service.get(self.first, paper_id)
+
+        self.assertEqual(200, saved.status_code, saved.text)
+        self.assertEqual(
+            before.artifact_ids["pdf"], after.artifact_ids["pdf"]
+        )
+        self.assertNotEqual(
+            before.artifact_ids["metadata"], after.artifact_ids["metadata"]
+        )
+        root = self.settings.hosted_workspace_root / self.first.user_id
+        for record in (before, after):
+            metadata_path = root / Path(
+                *record.metadata["_artifact_paths"]["metadata"].split("/")
+            )
+            self.assertTrue(metadata_path.is_file())
+        self.assertEqual("Human-reviewed title", after.title)
+
+    def test_literature_search_and_download_jobs_are_user_scoped_and_persist_results(self) -> None:
+        with TestClient(self.app) as client:
+            search = client.post(
+                "/api/v1/library/search-jobs",
+                json={"topic": "allenation", "limit": 10},
+                headers={"Origin": "http://testserver", "Idempotency-Key": "search-1"},
+            )
+            self.assertEqual(202, search.status_code)
+            search_job = self.wait_job(client, search.json()["id"])
+            self.assertEqual("succeeded", search_job["status"])
+            self.assertEqual("crossref:1", search_job["result"]["candidates"][0]["candidate_id"])
+
+            download = client.post(
+                "/api/v1/library/download-jobs",
+                json={"candidates": search_job["result"]["candidates"]},
+                headers={"Origin": "http://testserver", "Idempotency-Key": "download-1"},
+            )
+            download_job = self.wait_job(client, download.json()["id"])
+            self.assertEqual(1, download_job["result"]["added_count"])
+            final_paper_id = download_job["result"]["results"][0]["paper_id"]
+            self.assertNotEqual("P900", final_paper_id)
+            catalog = client.get("/api/v1/library/papers").json()
+            self.assertEqual(
+                [final_paper_id], [paper["paper_id"] for paper in catalog["items"]]
+            )
+            self.assertEqual("Downloaded native paper", catalog["items"][0]["title"])
+            self.assertIn(
+                "Downloaded native paper",
+                client.get(
+                    f"/api/v1/library/papers/{final_paper_id}/markdown"
+                ).text,
+            )
+            self.assertEqual(
+                fake_pdf(b"9"),
+                client.get(f"/api/v1/library/papers/{final_paper_id}/pdf").content,
+            )
+            artifact_id = download_job["result"]["results"][0]["artifact_ids"]["pdf"]
+            self.assertEqual(
+                fake_pdf(b"9"),
+                client.get(f"/api/v1/artifacts/{artifact_id}/content").content,
+            )
+
+            duplicate = client.post(
+                "/api/v1/library/download-jobs",
+                json={"candidates": search_job["result"]["candidates"]},
+                headers={
+                    "Origin": "http://testserver",
+                    "Idempotency-Key": "download-duplicate",
+                },
+            )
+            duplicate_job = self.wait_job(client, duplicate.json()["id"])
+            self.assertEqual(0, duplicate_job["result"]["added_count"])
+            self.assertEqual(1, duplicate_job["result"]["already_present_count"])
+            self.assertEqual(
+                final_paper_id,
+                duplicate_job["result"]["results"][0]["paper_id"],
+            )
+
+            self.current = self.second
+            self.assertEqual(404, client.get(f"/api/v1/jobs/{search_job['id']}").status_code)
+
+    def test_literature_acquisition_candidates_are_scoped_per_project(self) -> None:
+        with self.sessions.begin() as session:
+            first_project = Project(
+                user_id=uuid.UUID(self.first.user_id),
+                slug="first-acquisition-project",
+                topic="First review topic",
+            )
+            second_project = Project(
+                user_id=uuid.UUID(self.first.user_id),
+                slug="second-acquisition-project",
+                topic="A different review topic",
+            )
+            session.add_all([first_project, second_project])
+            session.flush()
+            first_project_id = str(first_project.id)
+            second_project_id = str(second_project.id)
+
+        with TestClient(self.app) as client:
+            first = client.post(
+                f"/api/v1/library/search-jobs?project_id={first_project_id}",
+                json={"topic": "allenation", "limit": 10},
+                headers={"Origin": "http://testserver", "Idempotency-Key": "project-search-1"},
+            )
+            self.assertEqual(202, first.status_code, first.text)
+            first_job = self.wait_job(client, first.json()["id"])
+            self.assertEqual("succeeded", first_job["status"])
+
+            first_current = client.get(
+                f"/api/v1/library/search-jobs/current?project_id={first_project_id}"
+            ).json()
+            second_current = client.get(
+                f"/api/v1/library/search-jobs/current?project_id={second_project_id}"
+            ).json()
+
+        self.assertEqual(first_job["id"], first_current["job"]["id"])
+        self.assertIsNone(second_current["job"])
+
+    def test_library_job_payloads_reject_wrong_json_types(self) -> None:
+        with TestClient(self.app) as client:
+            invalid_topic = client.post(
+                "/api/v1/library/search-jobs",
+                json={"topic": ["not", "a", "string"]},
+                headers={"Origin": "http://testserver"},
+            )
+            invalid_candidates = client.post(
+                "/api/v1/library/download-jobs",
+                json={"candidates": ["not-a-candidate-object"]},
+                headers={"Origin": "http://testserver"},
+            )
+        self.assertEqual(422, invalid_topic.status_code)
+        self.assertEqual(422, invalid_candidates.status_code)
+
+    def test_delete_moves_owned_paper_to_trash(self) -> None:
+        with TestClient(self.app) as client:
+            paper = self.upload(client, "copper.pdf", fake_pdf()).json()
+            stored = self.app.state.library_service.get(
+                self.first, paper["paper_id"]
+            )
+            extracted_dir = Path(stored.metadata["source_paths"]["extracted_dir"])
+            artifact_ids = {
+                uuid.UUID(artifact_id) for artifact_id in stored.artifact_ids.values()
+            }
+            metadata = (
+                self.settings.hosted_workspace_root
+                / self.first.user_id
+                / "review-library"
+                / "metadata"
+                / "papers"
+                / f"{paper['paper_id']}.metadata.json"
+            )
+            response = client.delete(
+                f"/api/v1/library/papers/{paper['paper_id']}",
+                headers={"Origin": "http://testserver"},
+            )
+            listing = client.get("/api/v1/library/papers").json()
+        self.assertEqual(204, response.status_code)
+        self.assertEqual(0, listing["count"])
+        trash = self.settings.hosted_workspace_root / self.first.user_id / ".trash" / "library"
+        trash_entry = next(trash.iterdir())
+        self.assertEqual(5, len(list(trash_entry.iterdir())))
+        self.assertFalse(extracted_dir.exists())
+        self.assertTrue((trash_entry / "mineru-artifact" / "extracted").is_dir())
+        self.assertFalse(metadata.exists())
+        with self.sessions() as session:
+            self.assertEqual(
+                {"trashed"},
+                {
+                    artifact.availability
+                    for artifact in session.query(LibraryArtifact)
+                    if artifact.id in artifact_ids
+                },
+            )
+
+    def test_deleted_pdf_can_be_uploaded_again_and_restores_the_catalog_row(self) -> None:
+        content = fake_pdf(b"restore")
+        with TestClient(self.app) as client:
+            first = self.upload(client, "first.pdf", content).json()
+            deleted = client.delete(
+                f"/api/v1/library/papers/{first['paper_id']}",
+                headers={"Origin": "http://testserver"},
+            )
+            restored = self.upload(client, "restored.pdf", content)
+            listing = client.get("/api/v1/library/papers").json()
+
+        self.assertEqual(204, deleted.status_code)
+        self.assertEqual(201, restored.status_code, restored.text)
+        self.assertEqual("restored", restored.json()["status"])
+        self.assertEqual(first["paper_id"], restored.json()["paper_id"])
+        self.assertEqual(1, listing["count"])
+        self.assertNotEqual(
+            first["artifact_ids"]["pdf"], restored.json()["artifact_ids"]["pdf"]
+        )
+
+    def test_delete_handles_migrated_metadata_artifact_and_compatibility_path_alias(self) -> None:
+        with TestClient(self.app) as client:
+            paper = self.upload(client, "legacy.pdf", fake_pdf(b"legacy")).json()
+            root = self.settings.hosted_workspace_root / self.first.user_id
+            compatibility = (
+                root
+                / "review-library"
+                / "metadata"
+                / "papers"
+                / f"{paper['paper_id']}.metadata.json"
+            )
+            with database_session(self.sessions) as session:
+                catalog = session.query(LibraryPaper).filter_by(
+                    user_id=uuid.UUID(self.first.user_id),
+                    paper_id=paper["paper_id"],
+                ).one()
+                metadata = dict(catalog.metadata_json)
+                artifact_paths = dict(metadata["_artifact_paths"])
+                artifact_paths["metadata"] = compatibility.relative_to(root).as_posix()
+                metadata["_artifact_paths"] = artifact_paths
+                catalog.metadata_json = metadata
+                artifact = session.get(
+                    LibraryArtifact, uuid.UUID(paper["artifact_ids"]["metadata"])
+                )
+                artifact.relative_path = compatibility.relative_to(root).as_posix()
+
+            deleted = client.delete(
+                f"/api/v1/library/papers/{paper['paper_id']}",
+                headers={"Origin": "http://testserver"},
+            )
+
+        self.assertEqual(204, deleted.status_code, deleted.text)
+
+    def test_download_reconciliation_rejects_the_entire_manifest_before_catalog_write(self) -> None:
+        root = self.settings.hosted_workspace_root / self.first.user_id / "review-library"
+        pdf = root / "downloads" / "P901.pdf"
+        markdown = root / "downloads" / "P901.md"
+        metadata = root / "metadata" / "papers" / "P901.metadata.json"
+        pdf.parent.mkdir(parents=True, exist_ok=True); markdown.parent.mkdir(parents=True, exist_ok=True); metadata.parent.mkdir(parents=True, exist_ok=True)
+        pdf.write_bytes(fake_pdf(b"x")); markdown.write_text("# Valid", encoding="utf-8")
+        metadata.write_text(json.dumps({"paper_id": "P901", "title": {"value": "Valid"}, "source_paths": {"pdf": str(pdf), "markdown": str(markdown)}}), encoding="utf-8")
+        with self.assertRaises(Exception):
+            self.app.state.library_service.reconcile_download_result(
+                self.first,
+                {"results": [{"status": "downloaded", "paper_id": "P901", "path": str(pdf), "metadata_path": str(metadata)}, {"status": "downloaded", "paper_id": "P902", "path": str(root / "missing.pdf"), "metadata_path": str(metadata)}]},
+            )
+        self.assertEqual(0, self.app.state.library_service.count(self.first))
+
+    def test_download_retry_recovers_files_already_registered_by_acquisition(self) -> None:
+        root = self.settings.hosted_workspace_root / self.first.user_id / "review-library"
+        pdf = root / "downloads" / "P903.pdf"
+        markdown = root / "downloads" / "P903.md"
+        metadata = root / "metadata" / "papers" / "P903.metadata.json"
+        for parent in (pdf.parent, markdown.parent, metadata.parent):
+            parent.mkdir(parents=True, exist_ok=True)
+        pdf.write_bytes(fake_pdf(b"R"))
+        markdown.write_text("# Recovered retry\n", encoding="utf-8")
+        metadata.write_text(
+            json.dumps(
+                {
+                    "paper_id": "P903",
+                    "title": {"value": "Recovered retry"},
+                    "source_paths": {
+                        "pdf": str(pdf),
+                        "markdown": str(markdown),
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        records = self.app.state.library_service.reconcile_download_result(
+            self.first,
+            {
+                "results": [
+                    {"status": "already_in_library", "paper_id": "P903"}
+                ]
+            },
+        )
+
+        self.assertEqual(["P903"], [record.paper_id for record in records])
+        self.assertEqual(1, self.app.state.library_service.count(self.first))
+
+
+@unittest.skipUnless(
+    os.environ.get("REVIEW_WRITER_RUN_POSTGRES_TESTS") == "1",
+    "Set REVIEW_WRITER_RUN_POSTGRES_TESTS=1 for PostgreSQL Library tests.",
+)
+class PostgreSQLLibraryConcurrencyTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.sessions, self.engine = create_session_factory(database_url_from_env())
+        with database_session(self.sessions) as session:
+            user = User(
+                email=f"library-concurrency-{uuid.uuid4().hex}@example.com",
+                display_name="Library concurrency",
+                password_hash="hash",
+            )
+            session.add(user)
+            session.flush()
+            self.principal = Principal(
+                str(user.id), frozenset({Role.USER}), user.email
+            )
+        self.workspace_manager = HostedWorkspaceManager(
+            Path(self.temporary.name) / "users"
+        )
+        self.service = LibraryService(self.sessions, self.workspace_manager)
+
+    def tearDown(self) -> None:
+        with database_session(self.sessions) as session:
+            user = session.get(User, uuid.UUID(self.principal.user_id))
+            if user is not None:
+                session.delete(user)
+        self.engine.dispose()
+        self.temporary.cleanup()
+
+    def _output(self, container: Path, seed: bytes) -> tuple[dict, str]:
+        paper_id = "P001"
+        container.mkdir(parents=True, exist_ok=False)
+        pdf = container / f"{paper_id}.pdf"
+        markdown = container / f"{paper_id}.md"
+        metadata_path = container / f"{paper_id}.metadata.json"
+        pdf.write_bytes(fake_pdf(seed))
+        markdown.write_text(f"# Concurrent {seed.decode()}\n", encoding="utf-8")
+        metadata = {
+            "paper_id": paper_id,
+            "title": {"value": f"Concurrent {seed.decode()}"},
+            "source_paths": {"pdf": str(pdf), "markdown": str(markdown)},
+        }
+        metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+        return {
+            "status": "uploaded",
+            "paper_id": paper_id,
+            "metadata_path": str(metadata_path),
+            "pdf_path": str(pdf),
+            "markdown_path": str(markdown),
+            "mineru_ready": True,
+        }, self.service._digest(pdf)
+
+    def test_two_isolated_uploads_never_share_a_paper_identity_or_artifact(self) -> None:
+        root = self.workspace_manager.user_root(self.principal.user_id)
+        outputs = [
+            self._output(
+                root
+                / "review-library"
+                / ".upload-staging"
+                / uuid.uuid4().hex
+                / "parse-workspace",
+                seed,
+            )
+            for seed in (b"A", b"B")
+        ]
+
+        def admit(item):
+            result, digest = item
+            return self.service._record_parsed_result(
+                self.principal, "concurrent.pdf", digest, result
+            )[0]
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            records = list(executor.map(admit, outputs))
+
+        self.assertEqual(2, len({record.paper_id for record in records}))
+        self.assertEqual(2, len({record.artifact_ids["pdf"] for record in records}))
+        for record in records:
+            self.assertIn("review-library/.artifacts/", record.pdf_relative_path)
+            self.assertEqual(
+                record.content_sha256,
+                self.service._digest(
+                    self.workspace_manager.user_root(self.principal.user_id)
+                    / Path(*record.pdf_relative_path.split("/"))
+                ),
+            )
+
+    def test_upload_and_download_outputs_cannot_claim_the_same_paper_identity(self) -> None:
+        root = self.workspace_manager.user_root(self.principal.user_id)
+        upload, upload_digest = self._output(
+            root
+            / "review-library"
+            / ".upload-staging"
+            / uuid.uuid4().hex
+            / "parse-workspace",
+            b"U",
+        )
+        download, _download_digest = self._output(
+            root
+            / ".review-writer"
+            / "job-staging"
+            / uuid.uuid4().hex
+            / "library-workspace",
+            b"D",
+        )
+        download_result = {
+            "results": [
+                {
+                    "status": "downloaded",
+                    "paper_id": "P001",
+                    "path": download["pdf_path"],
+                    "metadata_path": download["metadata_path"],
+                }
+            ]
+        }
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            upload_future = executor.submit(
+                self.service._record_parsed_result,
+                self.principal,
+                "upload.pdf",
+                upload_digest,
+                upload,
+            )
+            download_future = executor.submit(
+                self.service.reconcile_download_result,
+                self.principal,
+                download_result,
+            )
+            uploaded = upload_future.result(timeout=15)[0]
+            downloaded = download_future.result(timeout=15)[0]
+
+        self.assertNotEqual(uploaded.paper_id, downloaded.paper_id)
+        self.assertNotEqual(
+            uploaded.artifact_ids["pdf"], downloaded.artifact_ids["pdf"]
+        )
+
+    def test_soft_deleted_digest_is_restored_with_new_artifact_versions(self) -> None:
+        root = self.workspace_manager.user_root(self.principal.user_id)
+        first_output, digest = self._output(
+            root
+            / "review-library"
+            / ".upload-staging"
+            / uuid.uuid4().hex
+            / "parse-workspace",
+            b"R",
+        )
+        first, first_outcome = self.service._record_parsed_result(
+            self.principal, "first.pdf", digest, first_output
+        )
+        self.service.delete(self.principal, first.paper_id)
+        restored_output, restored_digest = self._output(
+            root
+            / "review-library"
+            / ".upload-staging"
+            / uuid.uuid4().hex
+            / "parse-workspace",
+            b"R",
+        )
+        restored, restored_outcome = self.service._record_parsed_result(
+            self.principal, "restored.pdf", restored_digest, restored_output
+        )
+
+        self.assertEqual("uploaded", first_outcome)
+        self.assertEqual("restored", restored_outcome)
+        self.assertEqual(first.paper_id, restored.paper_id)
+        self.assertNotEqual(
+            first.artifact_ids["pdf"], restored.artifact_ids["pdf"]
+        )
+        self.assertEqual(1, self.service.count(self.principal))
+        with database_session(self.sessions) as session:
+            artifacts = list(
+                session.query(LibraryArtifact).filter(
+                    LibraryArtifact.user_id == uuid.UUID(self.principal.user_id),
+                    LibraryArtifact.kind == "pdf",
+                )
+            )
+        self.assertEqual(
+            {"trashed", "available"},
+            {artifact.availability for artifact in artifacts},
+        )
+
+    def test_delete_locks_catalog_before_same_digest_upload_can_decide(self) -> None:
+        root = self.workspace_manager.user_root(self.principal.user_id)
+        first_output, digest = self._output(
+            root
+            / "review-library"
+            / ".upload-staging"
+            / uuid.uuid4().hex
+            / "parse-workspace",
+            b"L",
+        )
+        first = self.service._record_parsed_result(
+            self.principal, "first.pdf", digest, first_output
+        )[0]
+        replacement, replacement_digest = self._output(
+            root
+            / "review-library"
+            / ".upload-staging"
+            / uuid.uuid4().hex
+            / "parse-workspace",
+            b"L",
+        )
+        entered_delete = Event()
+        release_delete = Event()
+        original_safe_path = self.service._safe_stored_path
+
+        def pause_inside_delete(user_root, relative_path):
+            path = original_safe_path(user_root, relative_path)
+            if not entered_delete.is_set():
+                entered_delete.set()
+                release_delete.wait(timeout=5)
+            return path
+
+        self.service._safe_stored_path = pause_inside_delete
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            delete_future = executor.submit(
+                self.service.delete, self.principal, first.paper_id
+            )
+            self.assertTrue(entered_delete.wait(timeout=5))
+            restore_future = executor.submit(
+                self.service._record_parsed_result,
+                self.principal,
+                "replacement.pdf",
+                replacement_digest,
+                replacement,
+            )
+            try:
+                time.sleep(0.15)
+                self.assertFalse(
+                    restore_future.done(),
+                    "same-digest upload decided while delete was moving current files",
+                )
+            finally:
+                release_delete.set()
+            delete_future.result(timeout=10)
+            restored, outcome = restore_future.result(timeout=10)
+
+        self.assertEqual("restored", outcome)
+        self.assertEqual(first.paper_id, restored.paper_id)
+        self.assertTrue(self.service.file(self.principal, restored.paper_id, "pdf").is_file())
+
+    def test_delete_locks_catalog_before_same_digest_download_can_reconcile(self) -> None:
+        root = self.workspace_manager.user_root(self.principal.user_id)
+        first_output, digest = self._output(
+            root
+            / "review-library"
+            / ".upload-staging"
+            / uuid.uuid4().hex
+            / "parse-workspace",
+            b"Q",
+        )
+        first = self.service._record_parsed_result(
+            self.principal, "first.pdf", digest, first_output
+        )[0]
+        replacement, _replacement_digest = self._output(
+            root
+            / ".review-writer"
+            / "job-staging"
+            / uuid.uuid4().hex
+            / "library-workspace",
+            b"Q",
+        )
+        result = {
+            "results": [
+                {
+                    "status": "downloaded",
+                    "paper_id": "P001",
+                    "path": replacement["pdf_path"],
+                    "metadata_path": replacement["metadata_path"],
+                }
+            ]
+        }
+        entered_delete = Event()
+        release_delete = Event()
+        original_safe_path = self.service._safe_stored_path
+
+        def pause_inside_delete(user_root, relative_path):
+            path = original_safe_path(user_root, relative_path)
+            if not entered_delete.is_set():
+                entered_delete.set()
+                release_delete.wait(timeout=5)
+            return path
+
+        self.service._safe_stored_path = pause_inside_delete
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+            delete_future = executor.submit(
+                self.service.delete, self.principal, first.paper_id
+            )
+            self.assertTrue(entered_delete.wait(timeout=5))
+            restore_future = executor.submit(
+                self.service.reconcile_download_result, self.principal, result
+            )
+            try:
+                time.sleep(0.15)
+                self.assertFalse(
+                    restore_future.done(),
+                    "download reconciliation decided while delete was moving current files",
+                )
+            finally:
+                release_delete.set()
+            delete_future.result(timeout=10)
+            restored = restore_future.result(timeout=10)[0]
+
+        self.assertEqual(first.paper_id, restored.paper_id)
+        self.assertEqual("restored", result["results"][0]["catalog_outcome"])
+        self.assertTrue(self.service.file(self.principal, restored.paper_id, "pdf").is_file())
+
+
+if __name__ == "__main__":
+    unittest.main()

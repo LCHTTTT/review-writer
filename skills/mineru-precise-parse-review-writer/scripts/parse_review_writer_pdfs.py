@@ -1,0 +1,699 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import sys
+import time
+import unicodedata
+import zipfile
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Dict, Iterable, List
+
+import requests
+
+
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+
+
+MINERU_BASE_URL = "https://mineru.net"
+SKILL_ROOT = Path(__file__).resolve().parents[1]
+
+
+def default_review_root() -> Path:
+    if SKILL_ROOT.parent.name == "skills":
+        return SKILL_ROOT.parent.parent
+    return SKILL_ROOT.parent
+
+
+REVIEW_ROOT = default_review_root()
+DEFAULT_INPUT_DIR = REVIEW_ROOT / "Progargylic"
+DEFAULT_OUTPUT_DIR = REVIEW_ROOT / "mineru-outputs"
+DEFAULT_TIMEOUT_MINUTES = 30
+DEFAULT_POLL_INTERVAL_SECONDS = 5
+DEFAULT_BATCH_SIZE = 20
+SUCCESS_STATES = {"done", "success", "finished", "completed"}
+FAILURE_STATES = {"failed", "error"}
+TERMINAL_STATES = SUCCESS_STATES | FAILURE_STATES
+
+
+class MinerUHTTPError(RuntimeError):
+    def __init__(self, message: str, *, status_code: int):
+        super().__init__(message)
+        self.status_code = int(status_code)
+
+
+@dataclass
+class ParseJob:
+    index: int
+    pdf_path: Path
+    source_root: Path
+    slug: str
+    data_id: str
+
+    @property
+    def file_name(self) -> str:
+        return self.pdf_path.name
+
+    @property
+    def relative_pdf_path(self) -> str:
+        return str(self.pdf_path.relative_to(self.source_root))
+
+
+def now_utc() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def ensure_parent(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def write_json(path: Path, payload: Dict[str, Any]) -> None:
+    ensure_parent(path)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Parse local PDFs into Markdown via the MinerU precise parsing batch API."
+    )
+    parser.add_argument(
+        "--input-dir",
+        type=Path,
+        default=DEFAULT_INPUT_DIR,
+        help=f"Directory containing local PDF files. Default: {DEFAULT_INPUT_DIR}",
+    )
+    parser.add_argument(
+        "--pdf",
+        type=Path,
+        help="Optional single PDF path. When set, only this file is parsed.",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_OUTPUT_DIR,
+        help=f"Output directory. Default: {DEFAULT_OUTPUT_DIR}",
+    )
+    parser.add_argument(
+        "--manifest-path",
+        type=Path,
+        help=(
+            "Optional path for this run's manifest. Default: "
+            "<output-dir>/manifest.json. Useful for independent single-PDF upload jobs."
+        ),
+    )
+    parser.add_argument(
+        "--token",
+        help="MinerU API token. If omitted, MINERU_API_TOKEN is used.",
+    )
+    parser.add_argument(
+        "--language",
+        default="en",
+        help="MinerU language hint. Default: en",
+    )
+    parser.add_argument(
+        "--model-version",
+        default="vlm",
+        help="MinerU model version. Default: vlm",
+    )
+    parser.add_argument(
+        "--batch-size",
+        type=int,
+        default=DEFAULT_BATCH_SIZE,
+        help=f"Number of PDFs per batch request. Default: {DEFAULT_BATCH_SIZE}",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help="Optional maximum number of PDFs to process. Default: 0 (all PDFs).",
+    )
+    parser.add_argument(
+        "--poll-interval",
+        type=int,
+        default=DEFAULT_POLL_INTERVAL_SECONDS,
+        help=f"Polling interval in seconds. Default: {DEFAULT_POLL_INTERVAL_SECONDS}",
+    )
+    parser.add_argument(
+        "--timeout-minutes",
+        type=int,
+        default=DEFAULT_TIMEOUT_MINUTES,
+        help=f"Maximum wait time per batch. Default: {DEFAULT_TIMEOUT_MINUTES}",
+    )
+    parser.add_argument(
+        "--upload-retries",
+        type=int,
+        default=5,
+        help="Retries for transient object-storage upload failures. Default: 5.",
+    )
+    parser.add_argument(
+        "--upload-retry-delay",
+        type=float,
+        default=3.0,
+        help="Initial delay in seconds between upload retries. Default: 3.",
+    )
+    parser.add_argument(
+        "--disable-formula",
+        action="store_true",
+        help="Disable MinerU formula parsing.",
+    )
+    parser.add_argument(
+        "--disable-table",
+        action="store_true",
+        help="Disable MinerU table parsing.",
+    )
+    parser.add_argument(
+        "--ocr",
+        action="store_true",
+        help="Force OCR mode for uploaded PDFs.",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Reprocess files even if Markdown already exists in the output directory.",
+    )
+    return parser.parse_args()
+
+
+def resolve_token(args: argparse.Namespace) -> str:
+    token = (args.token or "").strip()
+    if token:
+        return token
+    token = os.environ.get("MINERU_API_TOKEN", "").strip()
+    if token:
+        return token
+    raise SystemExit(
+        "Missing MinerU API token. Pass --token, set MINERU_API_TOKEN, "
+        "or save it from the dashboard Settings page."
+    )
+
+
+def slugify_text(value: str) -> str:
+    normalized = unicodedata.normalize("NFKD", value)
+    ascii_text = normalized.encode("ascii", "ignore").decode("ascii")
+    cleaned = re.sub(r"[^A-Za-z0-9._/-]+", "-", ascii_text).strip("-._/")
+    cleaned = cleaned.replace("/", "__")
+    cleaned = re.sub(r"-{2,}", "-", cleaned)
+    return cleaned.lower() or "document"
+
+
+def chunked(items: List[ParseJob], size: int) -> Iterable[List[ParseJob]]:
+    for start in range(0, len(items), size):
+        yield items[start : start + size]
+
+
+def should_skip_path(path: Path, input_dir: Path, output_dir: Path) -> bool:
+    resolved = path.resolve()
+    blocked_roots = [SKILL_ROOT.resolve(), output_dir.resolve()]
+    for root in blocked_roots:
+        if resolved == root or root in resolved.parents:
+            return True
+    return False
+
+
+def discover_jobs(input_dir: Path, output_dir: Path, limit: int, force: bool) -> List[ParseJob]:
+    pdfs = [
+        path
+        for path in sorted(input_dir.rglob("*.pdf"))
+        if path.is_file() and not should_skip_path(path, input_dir, output_dir)
+    ]
+    if limit > 0:
+        pdfs = pdfs[:limit]
+    jobs: List[ParseJob] = []
+    seen: Dict[str, int] = {}
+    for index, pdf_path in enumerate(pdfs, start=1):
+        relative_stem = str(pdf_path.relative_to(input_dir).with_suffix(""))
+        base_slug = slugify_text(relative_stem)
+        seen[base_slug] = seen.get(base_slug, 0) + 1
+        slug = base_slug if seen[base_slug] == 1 else f"{base_slug}-{seen[base_slug]:02d}"
+        data_id = f"{index:03d}-{slug}"[:96]
+        markdown_path = output_dir / "markdown" / f"{slug}.md"
+        if markdown_path.is_file() and not force:
+            print(f"[skip] {pdf_path.relative_to(input_dir)} -> existing {markdown_path.name}")
+            continue
+        jobs.append(
+            ParseJob(
+                index=index,
+                pdf_path=pdf_path,
+                source_root=input_dir,
+                slug=slug,
+                data_id=data_id,
+            )
+        )
+    return jobs
+
+
+def discover_single_job(pdf_path: Path, input_dir: Path, output_dir: Path, force: bool) -> List[ParseJob]:
+    resolved_pdf = pdf_path.resolve()
+    if not resolved_pdf.is_file():
+        raise SystemExit(f"PDF does not exist: {resolved_pdf}")
+    if resolved_pdf.suffix.lower() != ".pdf":
+        raise SystemExit(f"Path is not a PDF: {resolved_pdf}")
+
+    if should_skip_path(resolved_pdf, input_dir, output_dir):
+        raise SystemExit(f"Refusing to parse a blocked path: {resolved_pdf}")
+
+    try:
+        relative_stem = str(resolved_pdf.relative_to(input_dir).with_suffix(""))
+    except ValueError:
+        relative_stem = resolved_pdf.stem
+
+    slug = slugify_text(relative_stem)
+    markdown_path = output_dir / "markdown" / f"{slug}.md"
+    if markdown_path.is_file() and not force:
+        print(f"[skip] {resolved_pdf} -> existing {markdown_path.name}")
+        return []
+
+    return [
+        ParseJob(
+            index=1,
+            pdf_path=resolved_pdf,
+            source_root=input_dir,
+            slug=slug,
+            data_id=f"001-{slug}"[:96],
+        )
+    ]
+
+
+def mineru_headers(token: str) -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+    }
+
+
+def raise_for_mineru_http_error(response: requests.Response, operation: str) -> None:
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    if 200 <= status_code < 300:
+        return
+
+    payload: Dict[str, Any] = {}
+    try:
+        parsed = response.json()
+        if isinstance(parsed, dict):
+            payload = parsed
+    except (TypeError, ValueError, requests.RequestException):
+        pass
+
+    code = payload.get("code", payload.get("Code"))
+    message = payload.get("msg", payload.get("message", payload.get("Message")))
+    if not message and payload.get("detail") is not None:
+        detail = payload["detail"]
+        message = detail if isinstance(detail, str) else json.dumps(detail, ensure_ascii=False)
+    trace_id = payload.get(
+        "trace_id",
+        payload.get("request_id", payload.get("RequestId")),
+    )
+    details: List[str] = []
+    if code not in (None, ""):
+        details.append(f"code={code}")
+    if message:
+        details.append(re.sub(r"\s+", " ", str(message)).strip()[:800])
+    if trace_id:
+        details.append(f"trace_id={str(trace_id).strip()[:160]}")
+    if not details:
+        raw = re.sub(r"\s+", " ", str(getattr(response, "text", "") or "")).strip()
+        if raw:
+            details.append(raw[:800])
+
+    suffix = f": {'; '.join(details)}" if details else ""
+    raise MinerUHTTPError(
+        f"MinerU HTTP {status_code} while {operation}{suffix}",
+        status_code=status_code,
+    )
+
+
+def api_post_json(session: requests.Session, token: str, path: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    response = session.post(
+        f"{MINERU_BASE_URL}{path}",
+        headers=mineru_headers(token),
+        json=payload,
+        timeout=60,
+    )
+    raise_for_mineru_http_error(response, f"requesting {path}")
+    data = response.json()
+    if data.get("code") != 0:
+        raise RuntimeError(f"MinerU API error for {path}: {data.get('msg') or data}")
+    return data
+
+
+def api_get_json(session: requests.Session, token: str, path: str) -> Dict[str, Any]:
+    response = session.get(
+        f"{MINERU_BASE_URL}{path}",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=60,
+    )
+    raise_for_mineru_http_error(response, f"requesting {path}")
+    data = response.json()
+    if data.get("code") != 0:
+        raise RuntimeError(f"MinerU API error for {path}: {data.get('msg') or data}")
+    return data
+
+
+def request_upload_batch(
+    session: requests.Session,
+    token: str,
+    jobs: List[ParseJob],
+    args: argparse.Namespace,
+) -> Dict[str, Any]:
+    payload = {
+        "enable_formula": not args.disable_formula,
+        "enable_table": not args.disable_table,
+        "language": args.language,
+        "model_version": args.model_version,
+        "files": [
+            {
+                "name": job.file_name,
+                "is_ocr": args.ocr,
+                "data_id": job.data_id,
+            }
+            for job in jobs
+        ],
+    }
+    result = api_post_json(session, token, "/api/v4/file-urls/batch", payload)
+    data = result.get("data") or {}
+    upload_urls = data.get("file_urls") or []
+    if len(upload_urls) != len(jobs):
+        raise RuntimeError(
+            f"MinerU returned {len(upload_urls)} upload URLs for {len(jobs)} jobs."
+        )
+    data["request_payload"] = payload
+    return data
+
+
+def upload_batch_files(
+    jobs: List[ParseJob], upload_urls: List[str], retries: int, retry_delay: float
+) -> None:
+    for job, upload_url in zip(jobs, upload_urls):
+        attempts = max(1, retries + 1)
+        for attempt in range(attempts):
+            try:
+                with job.pdf_path.open("rb") as handle:
+                    response = requests.put(upload_url, data=handle, timeout=300)
+                raise_for_mineru_http_error(
+                    response,
+                    f"uploading {job.relative_pdf_path}",
+                )
+                print(f"[upload] {job.relative_pdf_path}")
+                break
+            except (requests.RequestException, MinerUHTTPError) as exc:
+                if isinstance(exc, MinerUHTTPError) and exc.status_code not in {
+                    429,
+                    502,
+                    503,
+                    504,
+                }:
+                    raise
+                if attempt + 1 >= attempts:
+                    raise
+                delay = max(0.1, retry_delay) * (2 ** attempt)
+                print(
+                    f"[upload retry] {job.relative_pdf_path}: {type(exc).__name__}; "
+                    f"retrying in {delay:g}s ({attempt + 1}/{retries})"
+                )
+                time.sleep(delay)
+
+
+def poll_batch_results(
+    session: requests.Session,
+    token: str,
+    batch_id: str,
+    jobs: List[ParseJob],
+    poll_interval: int,
+    timeout_minutes: int,
+) -> Dict[str, Dict[str, Any]]:
+    deadline = time.time() + timeout_minutes * 60
+    last_states: Dict[str, str] = {}
+    final_results: Dict[str, Dict[str, Any]] = {}
+    tracked_ids = {job.data_id for job in jobs}
+
+    while time.time() < deadline:
+        payload = api_get_json(session, token, f"/api/v4/extract-results/batch/{batch_id}")
+        items = ((payload.get("data") or {}).get("extract_result")) or []
+        for item in items:
+            data_id = item.get("data_id")
+            if data_id not in tracked_ids:
+                continue
+            state = str(item.get("state") or "").strip()
+            final_results[data_id] = item
+            if last_states.get(data_id) != state:
+                print(f"[poll] {data_id}: {state}")
+                last_states[data_id] = state
+        if len(final_results) == len(tracked_ids):
+            active = [
+                item for item in final_results.values()
+                if str(item.get("state") or "").lower() not in TERMINAL_STATES
+            ]
+            if not active:
+                return final_results
+        time.sleep(max(1, poll_interval))
+    raise TimeoutError(f"Timed out waiting for MinerU batch {batch_id}.")
+
+
+def prepare_target(path: Path, force: bool) -> None:
+    if path.exists() and force:
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+    if path.suffix:
+        ensure_parent(path)
+    else:
+        path.mkdir(parents=True, exist_ok=True)
+
+
+def download_binary(url: str, dest: Path) -> None:
+    ensure_parent(dest)
+    with requests.get(url, stream=True, timeout=300) as response:
+        raise_for_mineru_http_error(response, "downloading parsed output")
+        with dest.open("wb") as handle:
+            for chunk in response.iter_content(chunk_size=1024 * 1024):
+                if chunk:
+                    handle.write(chunk)
+
+
+def rewrite_image_paths(markdown: str, slug: str) -> str:
+    text = markdown
+    text = text.replace("(images/", f"(../extracted/{slug}/images/")
+    text = text.replace('src="images/', f'src="../extracted/{slug}/images/')
+    text = text.replace("src='images/", f"src='../extracted/{slug}/images/")
+    return text
+
+
+def materialize_markdown(output_dir: Path, job: ParseJob, zip_url: str, force: bool) -> Dict[str, Any]:
+    raw_zip = output_dir / "raw_zips" / f"{job.slug}.zip"
+    extracted_dir = output_dir / "extracted" / job.slug
+    markdown_path = output_dir / "markdown" / f"{job.slug}.md"
+
+    prepare_target(raw_zip, force)
+    prepare_target(extracted_dir, force)
+
+    download_binary(zip_url, raw_zip)
+    with zipfile.ZipFile(raw_zip) as archive:
+        archive.extractall(extracted_dir)
+
+    full_md = extracted_dir / "full.md"
+    if not full_md.is_file():
+        candidates = sorted(extracted_dir.rglob("*.md"))
+        if not candidates:
+            raise RuntimeError(f"No Markdown file found in extracted result for {job.file_name}.")
+        full_md = candidates[0]
+
+    rewritten = rewrite_image_paths(full_md.read_text(encoding="utf-8"), job.slug)
+    ensure_parent(markdown_path)
+    markdown_path.write_text(rewritten, encoding="utf-8")
+
+    return {
+        "pdf_name": job.file_name,
+        "relative_pdf_path": job.relative_pdf_path,
+        "slug": job.slug,
+        "data_id": job.data_id,
+        "raw_zip": str(raw_zip),
+        "extracted_dir": str(extracted_dir),
+        "full_md": str(full_md),
+        "markdown_copy": str(markdown_path),
+    }
+
+
+def summarize_batch_states(results: Dict[str, Dict[str, Any]]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for item in results.values():
+        state = str(item.get("state") or "unknown")
+        counts[state] = counts.get(state, 0) + 1
+    return counts
+
+
+def provider_error_message(result: Dict[str, Any]) -> str:
+    for key in ("err_msg", "error_message", "message", "msg", "reason"):
+        value = result.get(key)
+        if isinstance(value, str) and value.strip():
+            return re.sub(r"\s+", " ", value).strip()
+    nested = result.get("error")
+    if isinstance(nested, dict):
+        return provider_error_message(nested)
+    if isinstance(nested, str) and nested.strip():
+        return re.sub(r"\s+", " ", nested).strip()
+    return ""
+
+
+def emit_failed_job_diagnostics(manifest: Dict[str, Any]) -> None:
+    for record in manifest.get("failed") or []:
+        if not isinstance(record, dict):
+            continue
+        filename = re.sub(r"\s+", " ", str(record.get("pdf_name") or "PDF")).strip()
+        reason = re.sub(
+            r"\s+",
+            " ",
+            str(record.get("err_msg") or record.get("state") or "unknown failure"),
+        ).strip()
+        print(f"[failed] {filename[:240]}: {reason[:1200]}", file=sys.stderr)
+
+
+def run_batch(
+    session: requests.Session,
+    token: str,
+    jobs: List[ParseJob],
+    args: argparse.Namespace,
+    output_dir: Path,
+    manifest: Dict[str, Any],
+) -> None:
+    upload_batch = request_upload_batch(session, token, jobs, args)
+    batch_id = str(upload_batch.get("batch_id") or "").strip()
+    if not batch_id:
+        raise RuntimeError("MinerU did not return a batch_id.")
+    print(f"[batch] {batch_id} ({len(jobs)} files)")
+
+    upload_batch_files(
+        jobs,
+        list(upload_batch.get("file_urls") or []),
+        retries=args.upload_retries,
+        retry_delay=args.upload_retry_delay,
+    )
+    results = poll_batch_results(
+        session=session,
+        token=token,
+        batch_id=batch_id,
+        jobs=jobs,
+        poll_interval=args.poll_interval,
+        timeout_minutes=args.timeout_minutes,
+    )
+
+    batch_record = {
+        "batch_id": batch_id,
+        "created_at": now_utc(),
+        "jobs": [],
+        "state_counts": summarize_batch_states(results),
+    }
+    manifest["batches"].append(batch_record)
+
+    for job in jobs:
+        result = results.get(job.data_id) or {}
+        state = str(result.get("state") or "unknown").lower()
+        job_record: Dict[str, Any] = {
+            "pdf_name": job.file_name,
+            "relative_pdf_path": job.relative_pdf_path,
+            "slug": job.slug,
+            "data_id": job.data_id,
+            "state": state,
+            "err_msg": provider_error_message(result),
+        }
+        if state in SUCCESS_STATES:
+            zip_url = str(result.get("full_zip_url") or "").strip()
+            if not zip_url:
+                job_record["state"] = "failed"
+                job_record["err_msg"] = "MinerU returned done without full_zip_url."
+                manifest["failed"].append(job_record)
+                batch_record["jobs"].append(job_record)
+                continue
+            output_record = materialize_markdown(output_dir, job, zip_url, force=args.force)
+            job_record.update(output_record)
+            manifest["completed"].append(job_record)
+        else:
+            manifest["failed"].append(job_record)
+        batch_record["jobs"].append(job_record)
+
+
+def main() -> int:
+    args = parse_args()
+    input_dir = args.input_dir.resolve()
+    output_dir = args.output_dir.resolve()
+    manifest_path = (
+        args.manifest_path.resolve()
+        if args.manifest_path
+        else output_dir / "manifest.json"
+    )
+    token = resolve_token(args)
+
+    if not input_dir.is_dir():
+        raise SystemExit(f"Input directory does not exist: {input_dir}")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if args.pdf:
+        jobs = discover_single_job(args.pdf, input_dir, output_dir, args.force)
+    else:
+        jobs = discover_jobs(input_dir, output_dir, args.limit, args.force)
+    if not jobs:
+        print("No PDFs need processing.")
+        return 0
+
+    manifest: Dict[str, Any] = {
+        "tool": "mineru-precise-parse-review-writer",
+        "skill_root": str(SKILL_ROOT),
+        "input_dir": str(input_dir),
+        "output_dir": str(output_dir),
+        "created_at": now_utc(),
+        "settings": {
+            "language": args.language,
+            "model_version": args.model_version,
+            "enable_formula": not args.disable_formula,
+            "enable_table": not args.disable_table,
+            "ocr": args.ocr,
+            "batch_size": args.batch_size,
+            "poll_interval": args.poll_interval,
+            "timeout_minutes": args.timeout_minutes,
+            "upload_retries": args.upload_retries,
+            "upload_retry_delay": args.upload_retry_delay,
+        },
+        "queued": len(jobs),
+        "batches": [],
+        "completed": [],
+        "failed": [],
+    }
+
+    session = requests.Session()
+    try:
+        for batch_jobs in chunked(jobs, max(1, args.batch_size)):
+            run_batch(session, token, batch_jobs, args, output_dir, manifest)
+    finally:
+        session.close()
+
+    manifest["finished_at"] = now_utc()
+    manifest["completed_count"] = len(manifest["completed"])
+    manifest["failed_count"] = len(manifest["failed"])
+    write_json(manifest_path, manifest)
+    if manifest["failed_count"]:
+        emit_failed_job_diagnostics(manifest)
+
+    print(
+        json.dumps(
+            {
+                "output_dir": str(output_dir),
+                "completed_count": manifest["completed_count"],
+                "failed_count": manifest["failed_count"],
+                "manifest_path": str(manifest_path),
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+    )
+    return 0 if not manifest["failed"] else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

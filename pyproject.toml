@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "review-writer"
+version = "0.1.0"
+description = "Human-reviewed scientific literature workflow and hosted API"
+readme = "README.md"
+requires-python = ">=3.11"
+dynamic = ["dependencies"]
+
+[project.scripts]
+review-writer-api = "review_writer_api.__main__:main"
+review-writer-migrate-workflow = "review_writer_api.migrate_workflow:main"
+review-writer-worker = "review_writer_api.worker_main:main"
+review-writer-model-gateway = "review_writer_api.gateway_main:main"
+
+[tool.setuptools.packages.find]
+include = ["review_writer_core*", "review_writer_api*"]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+
+[tool.unittest]
+start-directory = "view"
+pattern = "*_checks.py"

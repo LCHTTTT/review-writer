@@ -1,0 +1,138 @@
+---
+name: review-draft-merge-polish
+description: Merge separately drafted section files into one coherent first review draft and polish transitions, terminology, and figure placement.
+---
+
+# Review Draft Merge Polish
+
+Goal: merge section files into one complete review draft.
+
+## Current Web integration
+
+The native Draft service owns assembly, immutable versions, citation mapping,
+and paragraph/figure anchors. Use its API for a Web project rather than changing
+workspace files to advance a stage. The file contracts below support standalone
+tools and interchange snapshots; the legacy orchestrator's filesystem checks
+are not additional Web approval conditions.
+
+New sections use `source_passages/1`: preserve their checked claim-to-source
+bindings without requiring pre-generated scientific fact cards. Retain pending
+or limited-evidence outcomes visibly and do not turn editorial fallback notices
+into scientific assertions. Scientific text edits must use the host's binding
+invalidation and evaluation flow rather than silently retaining stale support.
+Draft evaluation and optional optimization are provided by
+`review-first-draft-feedback-loop`; merging does not automatically run the old
+fact-card extraction/repair chain.
+
+## Inputs
+
+```text
+review-projects/<project_id>/01_matrix_outline/selected_outline.md
+review-projects/<project_id>/01_matrix_outline/literature_matrix.json
+review-projects/<project_id>/02_section_drafting/sections/*.md
+review-projects/<project_id>/02_section_drafting/figure_candidates.json
+review-projects/<project_id>/02_section_drafting/section_drafting_report.md
+```
+
+If available, also use:
+
+```text
+review-projects/<project_id>/03_figure_redraw/redrawn_figure_manifest.json
+```
+
+## Merge Rules
+
+```text
+Keep the selected outline order.
+Merge all section files.
+Polish transitions and terminology.
+Preserve paper-to-paragraph evidence links and the reviewed figure asset pool.
+Only the current insertion plan creates figure-to-paragraph manuscript links.
+Do not delete caveats or no_figure_reason notes silently.
+Do not invent new papers, claims, or figures.
+```
+
+## Hard Output Requirements
+
+`first_draft.md` must satisfy all of:
+
+```text
+at least one ![](...) figure or scheme image,
+  resolved against 04_first_draft/ (use redrawn images when available,
+  or source-figure placeholders during early development; never zero figures
+  unless 03_figure_redraw/skip_reason.md exists);
+inline citation callouts using the `[n]` style for every claim that
+  references a paper;
+a final References section. Heading must be one of
+  References / Reference List / Bibliography / Cited Literature / 参考文献.
+  Items numbered 1., 2., ... or [1], [2], ... and the numbering must align
+  with the inline `[n]` callouts.
+```
+
+The orchestrator status script will mark this stage incomplete with
+`draft_has_no_figures`, `draft_has_no_citation_callouts`, or
+`missing_references_section` whenever any of these are violated.
+
+## Outputs
+
+Write under:
+
+```text
+review-projects/<project_id>/04_first_draft/
+```
+
+Required files:
+
+```text
+first_draft.md
+merge_report.md
+remaining_issues.md
+citations.json
+```
+
+`citations.json` aggregates every paragraph's `cited_paper_ids` into a single
+ordered list per `[n]` slot. It is consumed by the final audit to cross-check
+inline `[n]` callouts and the References section against `literature_matrix.json`.
+
+Figure insertion is paragraph-anchored but asset selection is paper-level.
+Read `insertion_plan` from the current figure manifest and insert only decisions
+whose `include` value is true, right after their `target_paragraph_id`. Figures
+without a safe current target remain in the reviewed pool rather than blocking
+the draft. Never infer placement from paper order. For legacy manifests without
+an insertion plan, use the recorded target conservatively.
+
+## Figure Numbering and Paragraph References
+
+Native assembly derives short captions through `review_writer_core.figure_caption`
+and keeps provenance separate from publication text. It rejects stale generic
+display captions, appends source credit separately, and adds a natural
+parenthetical figure reference to the relevant paragraph when needed. It does
+not append a generic "provides visual context" sentence or require fixed verbs
+such as "shows". Missing descriptions remain pending in the figure UI; the
+manuscript retains the image number/source credit without fabricated content.
+
+After inserting visual assets, number them from the order in which they occur
+in `first_draft.md`, never from redraw-manifest order, source-paper numbering,
+or the temporary copied-file name. Use conventional independent sequences:
+
+```text
+Scheme 1, Scheme 2, ...
+Figure 1, Figure 2, ...
+Table 1, Table 2, ...
+```
+
+The insertion script records a stable, invisible figure-to-paragraph anchor and
+rewrites the Markdown alt label and publication caption to that sequence. If
+the anchor paragraph refers to that selected source visual (for example,
+`Scheme 1` or `Fig. 1`), update the reference to the new published label in
+that paragraph too. Do **not** apply a document-wide `Scheme 1` replacement:
+each cited paper may have its own source `Scheme 1`, so global replacement can
+corrupt unrelated references. Write the resulting mapping and reference-update
+counts to `04_first_draft/figure_numbering_report.json` and include it in
+`figure_insertion_report.json`. Before Final Audit, rerun the same pass against
+`05_final_audit/final_draft.md` so the published manuscript is the definitive
+numbered version.
+
+`first_draft.md` must be a continuous review manuscript, not a list of section notes.
+
+Stop after this stage for human check.

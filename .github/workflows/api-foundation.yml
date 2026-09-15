@@ -1,0 +1,76 @@
+name: API foundation
+
+on:
+  push:
+    branches: [dy, dy-launch]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: review_writer
+          POSTGRES_PASSWORD: ci-review-writer-password
+          POSTGRES_DB: review_writer_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U review_writer -d review_writer_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      REVIEW_WRITER_DATABASE_URL: postgresql+psycopg://review_writer:ci-review-writer-password@127.0.0.1:5432/review_writer_test
+      REVIEW_WRITER_RUN_POSTGRES_TESTS: "1"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Test and build React frontend
+        working-directory: frontend
+        run: |
+          npm ci
+          npm test
+          npm run build
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt "pytest>=8,<10"
+      - name: Compile application modules
+        run: python -m compileall -q review_writer_api review_writer_core view
+      - name: Run database migration
+        run: alembic upgrade head
+      - name: Run maintained dashboard checks
+        working-directory: view
+        run: python -m unittest discover -s . -p "*_checks.py"
+      - name: Run dashboard integration tests
+        run: python -m unittest discover -s view/tests -p "test_*.py"
+      - name: Run scientific contracts and native API tests
+        shell: bash
+        run: |
+          set -o pipefail
+          status=0
+          python -m pytest -q --tb=short --import-mode=importlib tests review_writer_api/tests 2>&1 | tee native-api-tests.log || status=$?
+          if [ "$status" -ne 0 ]; then
+            {
+              echo "## Scientific and API test failure"
+              echo '```text'
+              tail -n 120 native-api-tests.log
+              echo '```'
+            } >> "$GITHUB_STEP_SUMMARY"
+            message=$(tail -n 80 native-api-tests.log | sed ':a;N;$!ba;s/%/%25/g;s/\r/%0D/g;s/\n/%0A/g')
+            echo "::error title=Scientific and API tests failed::$message"
+          fi
+          exit "$status"

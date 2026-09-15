@@ -1,0 +1,541 @@
+"""PostgreSQL-native workflow state, artifact, job, and migration models."""
+
+from __future__ import annotations
+
+import uuid
+from datetime import datetime
+from typing import Any
+
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    JSON,
+    String,
+    Text,
+    UniqueConstraint,
+    Uuid,
+)
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+
+from review_writer_api.database import Base, TimestampMixin, new_uuid, utc_now
+
+
+class LibraryUploadBatchCancellation(Base):
+    """Durable, user-scoped fence for files arriving after batch cancellation."""
+
+    __tablename__ = "library_upload_batch_cancellations"
+    user_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    batch_id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True)
+    cancelled_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class SystemErrorEvent(Base):
+    """Bounded request failure metadata; never request bodies or credentials."""
+    __tablename__ = "system_error_events"
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=new_uuid)
+    user_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    project_id: Mapped[uuid.UUID | None] = mapped_column(Uuid, ForeignKey("projects.id", ondelete="SET NULL"))
+    request_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    method: Mapped[str] = mapped_column(String(12), nullable=False)
+    route: Mapped[str] = mapped_column(String(240), nullable=False)
+    status_code: Mapped[int] = mapped_column(Integer, nullable=False)
+    error_code: Mapped[str] = mapped_column(String(96), nullable=False)
+    location: Mapped[str] = mapped_column(String(240), default="", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False, index=True)
+
+
+class LibraryVectorStore(Base):
+    """One fenced SQLite publication stream per authenticated user."""
+    __tablename__ = "library_vector_stores"
+    user_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True)
+    heads_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    generation: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    lease_token: Mapped[uuid.UUID | None] = mapped_column(Uuid)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class LibraryVectorVersion(Base, TimestampMixin):
+    __tablename__ = "library_vector_versions"
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=new_uuid)
+    user_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True)
+    profile_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    model: Mapped[str] = mapped_column(String(255), nullable=False)
+    dimension: Mapped[int] = mapped_column(Integer, nullable=False)
+    object_key: Mapped[str] = mapped_column(Text, nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    row_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    parent_id: Mapped[uuid.UUID | None] = mapped_column(Uuid)
+
+
+class LibraryVectorJobPin(Base):
+    __tablename__ = "library_vector_job_pins"
+    job_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("workflow_jobs.id", ondelete="CASCADE"), primary_key=True)
+    profile_key: Mapped[str] = mapped_column(String(64), primary_key=True)
+    version_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("library_vector_versions.id", ondelete="CASCADE"), nullable=False)
+
+
+class LibraryVectorReadLease(Base):
+    __tablename__ = "library_vector_read_leases"
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=new_uuid)
+    version_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("library_vector_versions.id", ondelete="CASCADE"), nullable=False, index=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class WorkflowSystemState(Base):
+    __tablename__ = "workflow_system_state"
+
+    key: Mapped[str] = mapped_column(String(96), primary_key=True)
+    value_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
+class LibraryPaper(Base):
+    """User-owned searchable catalog for admitted, precisely parsed PDFs."""
+
+    __tablename__ = "library_papers"
+    __table_args__ = (
+        UniqueConstraint("user_id", "paper_id", name="uq_library_paper_user_paper_id"),
+        UniqueConstraint("user_id", "content_sha256", name="uq_library_paper_user_content"),
+        Index("ix_library_papers_user_updated", "user_id", "updated_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=new_uuid)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    paper_id: Mapped[str] = mapped_column(String(96), nullable=False)
+    content_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    original_filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    title: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    authors_json: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    keywords_json: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    tags_json: Mapped[Any] = mapped_column(JSON, default=dict, nullable=False)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    bibliography_audit_row: Mapped["LibraryBibliographyAudit | None"] = relationship(
+        back_populates="paper",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+        uselist=False,
+    )
+    pdf_relative_path: Mapped[str] = mapped_column(String(2048), nullable=False)
+    markdown_relative_path: Mapped[str] = mapped_column(String(2048), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="active", nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+    deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class LibraryBibliographyAudit(Base):
+    """Mutable provider verification state, deliberately separate from canonical metadata."""
+
+    __tablename__ = "library_bibliography_audits"
+    __table_args__ = (
+        UniqueConstraint("library_paper_id", name="uq_library_bibliography_audit_paper"),
+        Index("ix_library_bibliography_audits_user_paper", "user_id", "paper_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=new_uuid)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    library_paper_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("library_papers.id", ondelete="CASCADE"), nullable=False
+    )
+    paper_id: Mapped[str] = mapped_column(String(96), nullable=False)
+    audit_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+    paper: Mapped[LibraryPaper] = relationship(back_populates="bibliography_audit_row")
+
+
+class LibraryArtifact(Base):
+    """Immutable user-owned Library file version addressable by artifact ID."""
+
+    __tablename__ = "library_artifacts"
+    __table_args__ = (
+        Index("ix_library_artifacts_user_paper_kind", "user_id", "paper_id", "kind"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=new_uuid)
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    paper_id: Mapped[str] = mapped_column(String(96), nullable=False)
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    relative_path: Mapped[str] = mapped_column(String(2048), nullable=False)
+    content_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    mtime_ns: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    availability: Mapped[str] = mapped_column(
+        String(32), default="available", nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, nullable=False
+    )
+
+
+class LibraryDocumentIndex(Base, TimestampMixin):
+    """Rebuildable full-text index version for one immutable Library document."""
+
+    __tablename__ = "library_document_indexes"
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "paper_id",
+            "source_lineage_hash",
+            "chunker_version",
+            name="uq_library_document_index_lineage",
+        ),
+        Index(
+            "ix_library_document_indexes_user_paper_current",
+            "user_id",
+            "paper_id",
+            "is_current",
+        ),
+        Index("ix_library_document_indexes_status", "status", "updated_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=new_uuid)
+    library_paper_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("library_papers.id", ondelete="CASCADE"), nullable=False
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    paper_id: Mapped[str] = mapped_column(String(96), nullable=False)
+    source_lineage_json: Mapped[dict[str, Any]] = mapped_column(
+        JSON, default=dict, nullable=False
+    )
+    source_lineage_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    chunker_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="queued", nullable=False)
+    is_current: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    chunk_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    semantic_status: Mapped[str] = mapped_column(
+        String(32), default="not_indexed", nullable=False
+    )
+    embedding_profile: Mapped[str] = mapped_column(
+        String(64), default="retrieval_embedding", nullable=False
+    )
+    embedding_model_snapshot: Mapped[str] = mapped_column(
+        String(255), default="", nullable=False
+    )
+    embedding_dimension: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    embedding_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    semantic_error_code: Mapped[str] = mapped_column(
+        String(96), default="", nullable=False
+    )
+    semantic_error_message: Mapped[str] = mapped_column(
+        Text, default="", nullable=False
+    )
+    error_code: Mapped[str] = mapped_column(String(96), default="", nullable=False)
+    error_message: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class LibraryDocumentChunk(Base):
+    """One layout-aware lexical retrieval unit derived from MinerU output."""
+
+    __tablename__ = "library_document_chunks"
+    __table_args__ = (
+        UniqueConstraint("index_id", "chunk_id", name="uq_library_document_chunk_id"),
+        UniqueConstraint("index_id", "ordinal", name="uq_library_document_chunk_ordinal"),
+        Index("ix_library_document_chunks_user_paper", "user_id", "paper_id"),
+        Index("ix_library_document_chunks_index_ordinal", "index_id", "ordinal"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=new_uuid)
+    index_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid,
+        ForeignKey("library_document_indexes.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    paper_id: Mapped[str] = mapped_column(String(96), nullable=False)
+    chunk_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False)
+    content_sha256: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    normalized_content: Mapped[str] = mapped_column(Text, nullable=False)
+    content_type: Mapped[str] = mapped_column(String(64), default="text", nullable=False)
+    section_path_json: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    page_start: Mapped[int | None] = mapped_column(Integer)
+    page_end: Mapped[int | None] = mapped_column(Integer)
+    block_start: Mapped[int] = mapped_column(Integer, nullable=False)
+    block_end: Mapped[int] = mapped_column(Integer, nullable=False)
+    asset_refs_json: Mapped[list[Any]] = mapped_column(JSON, default=list, nullable=False)
+    is_reference: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    previous_chunk_id: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    next_chunk_id: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+
+
+class WorkflowStageRun(Base):
+    __tablename__ = "workflow_stage_runs"
+    __table_args__ = (
+        Index("ix_workflow_stage_runs_project_stage_started", "project_id", "stage_id", "started_at"),
+        UniqueConstraint("legacy_id", name="uq_workflow_stage_runs_legacy_id"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=new_uuid)
+    legacy_id: Mapped[str | None] = mapped_column(String(255))
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    stage_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    requested_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("users.id", ondelete="SET NULL"), index=True
+    )
+    status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
+    attempt: Mapped[int] = mapped_column(Integer, default=1, nullable=False)
+    input_fingerprint: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    output_fingerprint: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    input_snapshot: Mapped[Any] = mapped_column(JSON, default=dict, nullable=False)
+    output_snapshot: Mapped[Any] = mapped_column(JSON, default=dict, nullable=False)
+    progress_current: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    progress_total: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    error_code: Mapped[str] = mapped_column(String(96), default="", nullable=False)
+    error_message: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class WorkflowStageState(Base, TimestampMixin):
+    __tablename__ = "workflow_stage_states"
+    __table_args__ = (
+        UniqueConstraint("project_id", "stage_id", name="uq_workflow_stage_state_project_stage"),
+        Index("ix_workflow_stage_states_project_status", "project_id", "status"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=new_uuid)
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    stage_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    current_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("workflow_stage_runs.id", ondelete="SET NULL")
+    )
+    input_fingerprint: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    output_fingerprint: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    error_code: Mapped[str] = mapped_column(String(96), default="", nullable=False)
+    error_message: Mapped[str] = mapped_column(Text, default="", nullable=False)
+
+
+class WorkflowArtifact(Base):
+    __tablename__ = "workflow_artifacts"
+    __table_args__ = (
+        UniqueConstraint("legacy_id", name="uq_workflow_artifacts_legacy_id"),
+        UniqueConstraint(
+            "project_id",
+            "logical_name",
+            "content_sha256",
+            "lineage_sha256",
+            name="uq_workflow_artifact_project_logical_content_lineage",
+        ),
+        Index("ix_workflow_artifacts_project_type", "project_id", "artifact_type"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=new_uuid)
+    legacy_id: Mapped[str | None] = mapped_column(String(255))
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    logical_name: Mapped[str] = mapped_column(String(1024), nullable=False)
+    artifact_type: Mapped[str] = mapped_column(String(96), nullable=False)
+    relative_path: Mapped[str] = mapped_column(String(2048), nullable=False)
+    content_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    lineage_sha256: Mapped[str] = mapped_column(
+        String(64), default="", nullable=False
+    )
+    size_bytes: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    mtime_ns: Mapped[int] = mapped_column(BigInteger, default=0, nullable=False)
+    availability: Mapped[str] = mapped_column(String(32), default="available", nullable=False)
+    producer_stage: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    producer_run_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("workflow_stage_runs.id", ondelete="SET NULL")
+    )
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class WorkflowCurrentArtifact(Base):
+    __tablename__ = "workflow_current_artifacts"
+
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), primary_key=True
+    )
+    logical_name: Mapped[str] = mapped_column(String(1024), primary_key=True)
+    artifact_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("workflow_artifacts.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
+class WorkflowArtifactDependency(Base):
+    __tablename__ = "workflow_artifact_dependencies"
+
+    output_artifact_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("workflow_artifacts.id", ondelete="CASCADE"), primary_key=True
+    )
+    input_artifact_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("workflow_artifacts.id", ondelete="CASCADE"), primary_key=True
+    )
+    dependency_role: Mapped[str] = mapped_column(String(96), primary_key=True, default="input")
+
+
+class WorkflowJob(Base):
+    __tablename__ = "workflow_jobs"
+    __table_args__ = (
+        UniqueConstraint("legacy_id", name="uq_workflow_jobs_legacy_id"),
+        UniqueConstraint(
+            "user_id",
+            "idempotency_scope_key",
+            "job_type",
+            "idempotency_key",
+            name="uq_workflow_job_scoped_idempotency",
+        ),
+        Index("ix_workflow_jobs_user_status_created", "user_id", "status", "created_at"),
+        Index("ix_workflow_jobs_project_type", "project_id", "job_type"),
+        Index(
+            "ix_workflow_jobs_claim",
+            "queue_name",
+            "status",
+            "lease_expires_at",
+            "created_at",
+        ),
+        Index(
+            "ix_workflow_jobs_user_queue_active",
+            "user_id",
+            "queue_name",
+            "status",
+            "lease_expires_at",
+        ),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=new_uuid)
+    legacy_id: Mapped[str | None] = mapped_column(String(255))
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    scope: Mapped[str] = mapped_column(String(64), nullable=False)
+    job_type: Mapped[str] = mapped_column(String(96), nullable=False)
+    queue_name: Mapped[str] = mapped_column(
+        String(32), default="scientific", nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(32), default="queued", nullable=False)
+    idempotency_scope_key: Mapped[str] = mapped_column(
+        String(255), default="_library_", nullable=False
+    )
+    idempotency_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    payload_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    result_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    progress_current: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    progress_total: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    cancellation_requested: Mapped[bool] = mapped_column(Boolean, default=False, nullable=False)
+    error_code: Mapped[str] = mapped_column(String(96), default="", nullable=False)
+    error_message: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    retry_of_job_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("workflow_jobs.id", ondelete="SET NULL")
+    )
+    lease_owner: Mapped[str] = mapped_column(String(128), default="", nullable=False)
+    lease_token: Mapped[uuid.UUID | None] = mapped_column(Uuid)
+    lease_generation: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_heartbeat_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class DraftParagraphTask(Base):
+    __tablename__ = "draft_paragraph_tasks"
+    project_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("projects.id", ondelete="CASCADE"), primary_key=True)
+    paragraph_key: Mapped[str] = mapped_column(String(36), primary_key=True)
+    job_id: Mapped[uuid.UUID] = mapped_column(Uuid, ForeignKey("workflow_jobs.id", ondelete="CASCADE"), nullable=False)
+
+
+class WorkflowCurrentJob(Base):
+    __tablename__ = "workflow_current_jobs"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
+    )
+    scope_key: Mapped[str] = mapped_column(String(255), primary_key=True)
+    job_type: Mapped[str] = mapped_column(String(96), primary_key=True)
+    project_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), index=True
+    )
+    job_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("workflow_jobs.id", ondelete="CASCADE"), nullable=False, unique=True
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utc_now, onupdate=utc_now, nullable=False
+    )
+
+
+class WorkflowApproval(Base):
+    __tablename__ = "workflow_approvals"
+    __table_args__ = (
+        Index("ix_workflow_approvals_project_stage_created", "project_id", "stage_id", "created_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=new_uuid)
+    project_id: Mapped[uuid.UUID] = mapped_column(
+        Uuid, ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    stage_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    subject_type: Mapped[str] = mapped_column(String(96), nullable=False)
+    subject_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    decision: Mapped[str] = mapped_column(String(32), nullable=False)
+    decided_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        Uuid, ForeignKey("users.id", ondelete="SET NULL"), index=True
+    )
+    details_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+
+
+class WorkflowMigration(Base):
+    __tablename__ = "workflow_migrations"
+    __table_args__ = (
+        UniqueConstraint("source_kind", "source_identity", name="uq_workflow_migration_source"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(Uuid, primary_key=True, default=new_uuid)
+    source_kind: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_identity: Mapped[str] = mapped_column(String(2048), nullable=False)
+    source_sha256: Mapped[str] = mapped_column(String(64), default="", nullable=False)
+    status: Mapped[str] = mapped_column(String(32), default="pending", nullable=False)
+    report_json: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
+    error_message: Mapped[str] = mapped_column(Text, default="", nullable=False)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, nullable=False)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

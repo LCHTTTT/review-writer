@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import sys
+from pathlib import Path
+from typing import Any
+
+
+_BOOTSTRAP_ROOT = next(
+    (parent for parent in Path(__file__).resolve().parents if (parent / "review_writer_core").is_dir()),
+    None,
+)
+if _BOOTSTRAP_ROOT is None:
+    raise RuntimeError("Could not locate the Review Writer workspace")
+if str(_BOOTSTRAP_ROOT) not in sys.path:
+    sys.path.insert(0, str(_BOOTSTRAP_ROOT))
+
+from review_writer_core.text_safety import incompatible_character_count  # noqa: E402
+from review_writer_core.markdown_images import (  # noqa: E402
+    malformed_markdown_image_lines,
+    parse_markdown_image,
+)
+
+
+PLACEHOLDER_RE = re.compile(
+    r"\b(TODO|TBD|citation needed|verify|verification needed|check this|fixme|待核查|需要核查|未确认)\b",
+    re.I,
+)
+REF_CALLOUT_RE = re.compile(r"\[(\d+(?:\s*[-,]\s*\d+)*)\]")
+# Accept the canonical `[n] Reference` form, legacy empty-author output such
+# as `[n]. Reference`, and conventional `n. Reference` lists.  Two capture
+# groups keep the actual reference number available for every accepted form.
+REF_ITEM_RE = re.compile(r"^\s*(?:\[(\d+)\]\s*\.?|(\d+)\.)\s+\S", re.M)
+HEADING_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$", re.M)
+
+
+def read_text(path: Path) -> str:
+    return path.read_text(encoding="utf-8", errors="ignore")
+
+
+def expand_ref_callouts(text: str) -> set[int]:
+    refs: set[int] = set()
+    for match in REF_CALLOUT_RE.finditer(text):
+        raw = match.group(1)
+        for part in re.split(r"\s*,\s*", raw):
+            if "-" in part:
+                left, right = [p.strip() for p in part.split("-", 1)]
+                if left.isdigit() and right.isdigit():
+                    refs.update(range(int(left), int(right) + 1))
+            elif part.strip().isdigit():
+                refs.add(int(part.strip()))
+    return refs
+
+
+def reference_item_number(match: re.Match[str]) -> int | None:
+    raw = match.group(1) or match.group(2)
+    return int(raw) if raw else None
+
+
+REFERENCES_HEADING_RE = re.compile(
+    r"^\s*#{1,6}\s*(references|reference list|bibliography|cited literature|参考文献)\s*$",
+    re.I | re.M,
+)
+
+
+def detect_references_section(text: str) -> dict[str, Any]:
+    match = REFERENCES_HEADING_RE.search(text or "")
+    if not match:
+        return {"present": False, "start_line": None, "item_count": 0}
+    tail = text[match.end():]
+    items = list(REF_ITEM_RE.finditer(tail))
+    return {
+        "present": True,
+        "start_line": text[: match.start()].count("\n") + 1,
+        "item_count": len(items),
+    }
+
+
+def scan_draft(project: Path) -> dict[str, Any]:
+    final_path = project / "05_final_audit" / "final_draft.md"
+    first_path = project / "04_first_draft" / "first_draft.md"
+    draft = final_path if final_path.exists() else first_path
+    text = read_text(draft) if draft.exists() else ""
+    invalid_control_character_count = incompatible_character_count(text)
+    target = "final_draft" if draft == final_path and final_path.exists() else "first_draft"
+    headings = [{"level": len(m.group(1)), "title": m.group(2).strip()} for m in HEADING_RE.finditer(text)]
+    duplicate_headings = sorted(
+        {h["title"] for h in headings if [x["title"] for x in headings].count(h["title"]) > 1}
+    )
+    placeholder_hits = [
+        {"line": idx, "text": line.strip()}
+        for idx, line in enumerate(text.splitlines(), start=1)
+        if PLACEHOLDER_RE.search(line)
+    ]
+    called_refs = sorted(expand_ref_callouts(text))
+    listed_refs = sorted(
+        {
+            number
+            for match in REF_ITEM_RE.finditer(text)
+            if (number := reference_item_number(match)) is not None
+        }
+    )
+    missing_listed_refs = [r for r in called_refs if listed_refs and r not in listed_refs]
+    uncalled_listed_refs = [r for r in listed_refs if r not in called_refs]
+    image_paths = [
+        image.source
+        for line in text.splitlines()
+        if (image := parse_markdown_image(line)) is not None
+    ]
+    malformed_images = malformed_markdown_image_lines(text)
+    broken_images = []
+    for raw in image_paths:
+        if re.match(r"^[a-z]+://", raw):
+            continue
+        candidate = (draft.parent / raw).resolve()
+        if not candidate.exists():
+            broken_images.append(raw)
+    figure_insert_report_candidates = [
+        project / "05_final_audit" / "figure_insertion_report.json",
+        project / "04_first_draft" / "figure_insertion_report.json",
+    ]
+    figure_insert_report = next((p for p in figure_insert_report_candidates if p.exists()), figure_insert_report_candidates[-1])
+    source_placeholder_mode = False
+    if figure_insert_report.exists():
+        try:
+            report = json.loads(figure_insert_report.read_text(encoding="utf-8"))
+            source_placeholder_mode = report.get("mode") == "source_candidates"
+        except Exception:
+            source_placeholder_mode = False
+    empty_heading_titles = [h for h in headings if not h["title"].strip("# ").strip()]
+    heading_jumps = []
+    prev = 0
+    for h in headings:
+        level = h["level"]
+        if prev and level > prev + 1:
+            heading_jumps.append({"from": prev, "to": level, "title": h["title"]})
+        prev = level
+    references_section = detect_references_section(text)
+    references_tail = text[REFERENCES_HEADING_RE.search(text).end() :] if REFERENCES_HEADING_RE.search(text) else ""
+    reference_sup_markup_present = bool(re.search(r"</?sup\b", references_tail, re.I))
+    citations_path = project / "04_first_draft" / "citations.json"
+    citations_payload = None
+    if citations_path.exists():
+        try:
+            citations_payload = json.loads(citations_path.read_text(encoding="utf-8"))
+        except Exception:
+            citations_payload = None
+    matrix_path = project / "01_matrix_outline" / "literature_matrix.json"
+    matrix_paper_ids: set[str] = set()
+    if matrix_path.exists():
+        try:
+            matrix = json.loads(matrix_path.read_text(encoding="utf-8"))
+            rows = matrix.get("rows") if isinstance(matrix, dict) else matrix
+            if isinstance(rows, list):
+                for row in rows:
+                    if isinstance(row, dict) and row.get("paper_id"):
+                        matrix_paper_ids.add(str(row["paper_id"]))
+        except Exception:
+            matrix_paper_ids = set()
+    unknown_cited_papers: list[str] = []
+    if isinstance(citations_payload, dict):
+        entries = citations_payload.get("entries") or citations_payload.get("citations") or []
+        for entry in entries if isinstance(entries, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            paper_ids = entry.get("cited_paper_ids") or entry.get("paper_ids") or []
+            if entry.get("paper_id"):
+                paper_ids = [entry.get("paper_id"), *paper_ids]
+            for pid in paper_ids:
+                if pid and matrix_paper_ids and str(pid) not in matrix_paper_ids:
+                    unknown_cited_papers.append(str(pid))
+    unknown_cited_papers = sorted(set(unknown_cited_papers))
+    skip_reason_path = project / "03_figure_redraw" / "skip_reason.md"
+    figures_skipped_with_reason = skip_reason_path.exists() and bool(read_text(skip_reason_path).strip())
+
+    issues: list[str] = []
+    blocking_issues: list[str] = []
+    if not draft.exists():
+        issues.append("missing_first_draft")
+        blocking_issues.append("missing_draft")
+    if placeholder_hits:
+        issues.append("placeholder_or_verification_notes_present")
+        blocking_issues.append("placeholder_or_verification_notes_present")
+    if invalid_control_character_count:
+        issues.append("xml_incompatible_control_characters_present")
+        blocking_issues.append("xml_incompatible_control_characters_present")
+    if duplicate_headings:
+        issues.append("duplicate_headings")
+    if empty_heading_titles:
+        issues.append("empty_headings")
+    if heading_jumps:
+        issues.append("heading_level_jumps")
+    if missing_listed_refs:
+        issues.append("reference_callouts_missing_from_reference_list")
+        blocking_issues.append("reference_callouts_missing_from_reference_list")
+    if broken_images:
+        issues.append("broken_markdown_image_paths")
+        blocking_issues.append("broken_markdown_image_paths")
+    if malformed_images:
+        issues.append("malformed_markdown_image")
+        blocking_issues.append("malformed_markdown_image")
+    if source_placeholder_mode:
+        issues.append("source_figure_placeholders_need_redraw_or_permission_check")
+        blocking_issues.append("source_figure_placeholders_need_redraw_or_permission_check")
+    # Hard requirement: a final review must have at least one figure unless the user has
+    # explicitly opted out via 03_figure_redraw/skip_reason.md.
+    if not image_paths and not figures_skipped_with_reason:
+        issues.append("draft_has_no_figures")
+        blocking_issues.append("draft_has_no_figures")
+    # Hard requirement: a final review must cite literature in a recognizable way.
+    if unknown_cited_papers:
+        issues.append("citations_reference_unknown_papers")
+    if not called_refs:
+        issues.append("draft_has_no_citation_callouts")
+        blocking_issues.append("draft_has_no_citation_callouts")
+    if not references_section["present"]:
+        issues.append("missing_references_section")
+        blocking_issues.append("missing_references_section")
+    elif references_section["item_count"] == 0:
+        issues.append("empty_references_section")
+        blocking_issues.append("empty_references_section")
+    if reference_sup_markup_present:
+        issues.append("html_superscript_markup_present_in_references")
+        blocking_issues.append("html_superscript_markup_present_in_references")
+    return {
+        "project_dir": str(project),
+        "draft_path": str(draft),
+        "draft_exists": draft.exists(),
+        "word_like_count": len(re.findall(r"\b[A-Za-z][A-Za-z-]*\b", text)),
+        "heading_count": len(headings),
+        "headings": headings,
+        "duplicate_headings": duplicate_headings,
+        "heading_jumps": heading_jumps,
+        "placeholder_hits": placeholder_hits,
+        "invalid_control_character_count": invalid_control_character_count,
+        "reference_callouts": called_refs,
+        "reference_list_items": listed_refs,
+        "missing_listed_refs": missing_listed_refs,
+        "uncalled_listed_refs": uncalled_listed_refs,
+        "image_paths": image_paths,
+        "broken_images": broken_images,
+        "malformed_markdown_images": malformed_images,
+        "source_placeholder_mode": source_placeholder_mode,
+        "references_section": references_section,
+        "reference_sup_markup_present": reference_sup_markup_present,
+        "figures_skipped_with_reason": figures_skipped_with_reason,
+        "citations_payload_present": isinstance(citations_payload, dict),
+        "unknown_cited_papers": unknown_cited_papers,
+        "target_draft": target,
+        "issues": issues,
+        "blocking_issues": blocking_issues,
+    }
+
+
+def write_reports(out_dir: Path, scan: dict[str, Any]) -> None:
+    out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / "format_scan.json").write_text(
+        json.dumps(scan, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    lines = [
+        "# Format Scan",
+        "",
+        f"- Draft exists: {scan['draft_exists']}",
+        f"- Word-like count: {scan['word_like_count']}",
+        f"- Heading count: {scan['heading_count']}",
+        f"- Target draft: {scan.get('target_draft', 'first_draft')}",
+        f"- Issues: {', '.join(scan['issues']) if scan['issues'] else 'none'}",
+        f"- Blocking issues: {', '.join(scan['blocking_issues']) if scan['blocking_issues'] else 'none'}",
+        f"- References section present: {scan.get('references_section', {}).get('present')}",
+        f"- References section item count: {scan.get('references_section', {}).get('item_count')}",
+        f"- Figures explicitly skipped (with reason): {scan.get('figures_skipped_with_reason')}",
+        "",
+        "## Placeholder Hits",
+        "",
+    ]
+    if scan["placeholder_hits"]:
+        for hit in scan["placeholder_hits"]:
+            lines.append(f"- Line {hit['line']}: {hit['text']}")
+    else:
+        lines.append("None.")
+    lines += ["", "## Reference Check", ""]
+    lines.append(f"- Referenced callouts: {scan['reference_callouts']}")
+    lines.append(f"- Listed references: {scan['reference_list_items']}")
+    lines.append(f"- Missing listed refs: {scan['missing_listed_refs']}")
+    lines.append(f"- Uncalled listed refs: {scan['uncalled_listed_refs']}")
+    lines += ["", "## Heading Check", ""]
+    lines.append(f"- Duplicate headings: {scan['duplicate_headings']}")
+    lines.append(f"- Heading jumps: {scan['heading_jumps']}")
+    lines += ["", "## Image Check", ""]
+    lines.append(f"- Image paths: {scan['image_paths']}")
+    lines.append(f"- Broken images: {scan['broken_images']}")
+    lines.append(f"- Source figure placeholder mode: {scan['source_placeholder_mode']}")
+    (out_dir / "format_scan.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run deterministic final format scan for a review project.")
+    parser.add_argument("--review-root", default=".")
+    parser.add_argument("--project-id", required=True)
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    project = Path(args.review_root).resolve() / "review-projects" / args.project_id
+    out_dir = project / "05_final_audit"
+    scan = scan_draft(project)
+    write_reports(out_dir, scan)
+    print(f"Wrote final audit scan to {out_dir}")
+    print(f"Issues: {len(scan['issues'])}")
+    if scan["blocking_issues"]:
+        print("BLOCKING ISSUES:")
+        for issue in scan["blocking_issues"]:
+            print(f"- {issue}")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
