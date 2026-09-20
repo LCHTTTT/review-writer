@@ -567,6 +567,47 @@ class ModelGatewayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, summary["request_count"])
         self.assertEqual(8, summary["total_tokens"])
 
+    async def test_embedding_runtime_price_is_settled_to_user_balance(self) -> None:
+        billing = BillingService(self.sessions)
+        billing.adjust(
+            actor_user_id=self.user_id,
+            target_user_id=self.user_id,
+            amount_usd="1",
+            reason="Embedding billing test credit",
+            idempotency_key="embedding-billing-credit",
+        )
+        self.service.billing_service = billing
+        runtime = replace(
+            self.service._embedding_runtime(),
+            input_usd_per_million=Decimal("0.50"),
+        )
+        provider_result = {
+            "id": "emb_billed",
+            "model": "embedding-test-model",
+            "data": [{"index": 0, "embedding": [0.1, 0.2, 0.3]}],
+            "usage": {"prompt_tokens": 1000, "total_tokens": 1000},
+        }
+        with mock.patch.object(
+            self.service, "_embedding_runtime", return_value=runtime
+        ), mock.patch.object(
+            self.service,
+            "_provider_embedding_call",
+            new=mock.AsyncMock(return_value=provider_result),
+        ):
+            result = await self.service.complete_embeddings(
+                self.embedding_token(),
+                request_key="billed-embedding-runtime-price",
+                stage="matrix.enrich.embedding",
+                inputs=["semantic retrieval"],
+            )
+
+        self.assertEqual("0.00050000", result["cost_usd"])
+        self.assertEqual(
+            "0.99950000", billing.account_summary(self.user_id)["balance_usd"]
+        )
+        transactions = billing.transactions(self.user_id)
+        self.assertEqual("retrieval_embedding", transactions[0]["details"]["profile"])
+
     async def test_embedding_provider_requests_configured_dimension(self) -> None:
         captured: dict[str, object] = {}
 

@@ -35,6 +35,14 @@ function job(overrides: Partial<Job> = {}): Job {
 }
 
 describe("SectionJobProgress", () => {
+  it("shows each concurrent chapter's actual model phase", () => {
+    render(<SectionJobProgress job={job({ result: { section_progress: { active_sections: [
+      { section_id: "S01", heading: "Introduction", phase: "drafting" },
+      { section_id: "S02", heading: "Methods", phase: "reviewing" },
+    ] } } })} />);
+    expect(screen.getByText("正在处理 2 个章节")).toBeInTheDocument();
+    expect(screen.getByText(/Introduction · 正在生成正文；Methods · 正在核对来源/)).toBeInTheDocument();
+  });
   it("previews retained prose after a sibling failed without treating it as published", () => {
     const failed = job({ status: "failed", result: {
       section_progress: { completed_sections: [{ section_id: "S01", heading: "Introduction" }],

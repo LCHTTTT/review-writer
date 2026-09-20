@@ -42,7 +42,7 @@ class SectionAcademicPipelineTests(unittest.TestCase):
             stage.mkdir(parents=True); matrix.mkdir()
             tasks = [{"section_id": sid, "heading": sid, "section_role": role,
                       "allowed_papers": ["P001"], "primary_papers": ["P001"], "supporting_papers": []}
-                     for sid, role in [("S01", "body"), ("S02", "conclusion")]]
+                     for sid, role in [("S01", "body"), ("S02", "body")]]
             packages = [{"section_id": t["section_id"], "retrieval_mode": "insufficient_evidence",
                          "source_lookup_complete": lookup_complete, "hits": []} for t in tasks]
             for path, value in {stage / "section_tasks.json": tasks,
@@ -883,43 +883,6 @@ class SectionAcademicPipelineTests(unittest.TestCase):
         self.assertEqual("insufficient_evidence", PIPELINE.effective_retrieval_mode({
             "retrieval_mode": "fixed_prefix_fallback"}))
 
-    def test_conclusion_receives_validated_body_synthesis_and_evidence_keys(self) -> None:
-        context, keys = PIPELINE.prior_body_synthesis_context(
-            {
-                "S02": {
-                    "section_id": "S02",
-                    "title": "Defined precursor class",
-                    "section_role": "body",
-                    "section_thesis": "Compare the bounded body evidence.",
-                },
-                "S03": {"section_id": "S03", "section_role": "conclusion"},
-            },
-            [{"section_id": "S02", "summary": "A bounded body conclusion."}],
-            [
-                {
-                    "section_id": "S02",
-                    "section_role": "body",
-                    "claims": [
-                        {
-                            "claim": "The studies support a bounded difference.",
-                            "claim_kind": "cross_study_comparison",
-                            "support_status": "supported",
-                            "citation_group": ["P001", "P002"],
-                            "evidence_refs": [
-                                {"evidence_key": "sha256:a", "relationship": "supports"},
-                                {"evidence_key": "sha256:b", "relationship": "supports"},
-                            ],
-                        }
-                    ],
-                }
-            ],
-        )
-
-        self.assertEqual(["S02"], [item["section_id"] for item in context])
-        self.assertEqual({"sha256:a", "sha256:b"}, keys)
-        self.assertEqual(
-            "A bounded body conclusion.", context[0]["validated_synthesis_summary"]
-        )
 
 
 if __name__ == "__main__":

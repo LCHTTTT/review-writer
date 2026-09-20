@@ -45,11 +45,11 @@ def test_declared_citations_and_empty_prose_do_not_count_as_validated_coverage()
     assert missing_primary_papers(["a"], [{**paragraph, "text": ""}], require_evidence=True) == ["a"]
 
 
-def test_retry_preserves_good_sections_but_invalidates_incomplete_body_and_dependent_conclusion():
+def test_retry_preserves_good_sections_but_invalidates_incomplete_body_and_explicit_dependents():
     tasks = [{"section_id": "intro", "section_role": "introduction"},
              {"section_id": "body", "primary_papers": ["paper-a", "paper-b"]},
              {"section_id": "other", "primary_papers": ["paper-a"]},
-             {"section_id": "end", "section_role": "conclusion"}]
+             {"section_id": "end", "section_role": "body", "depends_on_sections": ["body"]}]
     entries = {t["section_id"]: checkpoint_entry() for t in tasks}
     before = deepcopy(entries)
     kept, rejected = reusable_section_entries(entries, tasks, {"body": {"retrieval_mode": "lexical"}})
@@ -59,9 +59,9 @@ def test_retry_preserves_good_sections_but_invalidates_incomplete_body_and_depen
     assert entries == before
 
 
-def test_complete_checkpoint_is_reused_without_discarding_conclusion():
+def test_complete_checkpoint_reuses_explicit_dependent_chapter():
     tasks = [{"section_id": "body", "primary_papers": ["paper-a"]},
-             {"section_id": "end", "section_role": "conclusion"}]
+             {"section_id": "end", "section_role": "body", "depends_on_sections": ["body"]}]
     entries = {t["section_id"]: checkpoint_entry() for t in tasks}
     assert reusable_section_entries(entries, tasks, {}) == (entries, {})
 

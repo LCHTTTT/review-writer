@@ -18,6 +18,7 @@ type SectionProgressResult = {
   phase?: string;
   current_section_id?: string;
   current_heading?: string;
+  active_sections?: Array<{ section_id: string; heading: string; phase: string }>;
   completed_sections?: CompletedSection[];
   failed_sections?: FailedSection[];
   evidence_hit_count?: number;
@@ -69,12 +70,17 @@ export function SectionJobProgress({ job }: { job: Job }) {
   if (job.status === "running") {
     if (failed.length && total > 0 && current >= total) {
       title = text("本轮处理结束，部分章节待修复", "Pass finished; some sections need repair");
-      detail = text(`已保留 ${completed.length}/${total} 章；下次继续未完成章节及依赖它们的总结。`, `${completed.length}/${total} sections retained; resume unfinished sections and their dependent conclusion.`);
+      detail = text(`已保留 ${completed.length}/${total} 章；下次继续未完成章节。`, `${completed.length}/${total} sections retained; resume unfinished sections.`);
     } else if (total > 0 && current >= total) {
       title = completed.some(section => section.generation_mode === "pending_evidence")
         ? text("章节处理完成，部分章节暂不生成", "Sections processed; some have no prose")
         : text("章节正文已全部生成", "All section prose generated");
       detail = text("正在整理章节报告和图像候选。", "Finalizing the report and figure candidates.");
+    } else if (live.active_sections?.length) {
+      title = text(`正在处理 ${live.active_sections.length} 个章节`, `Processing ${live.active_sections.length} sections`);
+      detail = live.active_sections.map(section => `${section.heading} · ${section.phase === "reviewing"
+        ? text("正在核对来源", "Checking sources") : section.phase === "drafting"
+          ? text("正在生成正文", "Writing prose") : text("准备中", "Preparing")}`).join("；");
     } else if (live.current_heading) {
       const phaseTitle: Record<string, string> = {
         planning_claims: text(`正在规划论证：${live.current_heading}`, `Planning claims: ${live.current_heading}`),

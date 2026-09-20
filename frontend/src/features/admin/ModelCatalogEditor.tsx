@@ -6,27 +6,28 @@ import type { ModelCatalog, ModelTier, AdminProviderTestResult } from "../../api
 import { ErrorState } from "../../components/ErrorState";
 import { useUiText } from "../../i18n/useUiText";
 
+import { useLocalizedMessage } from "../../i18n/useLocalizedMessage";
 export function ModelCatalogEditor({ active = true }: { active?: boolean }) {
   const { text } = useUiText();
   const client = useQueryClient();
   const query = useQuery({ ...adminModelCatalogQuery, enabled: active });
   const connections = useQuery({ ...textConnectionsQuery, enabled: active });
   const [draft, setDraft] = useState<ModelCatalog | null>(null);
-  const [message, setMessage] = useState("");
+  const [message, setMessage] = useLocalizedMessage();
   const catalog = draft || query.data;
   const save = useMutation({
     mutationFn: () => apiRequest<ModelCatalog>("/api/v1/admin/model-catalog", { method: "PUT", ...jsonBody(draft) }),
     onSuccess: async data => {
       client.setQueryData(adminModelCatalogQuery.queryKey, data);
       setDraft(null);
-      setMessage(text("模型目录已保存。已提交的任务保持原模型和价格。", "Catalog saved. Submitted jobs retain their model and prices."));
+      setMessage(["模型目录已保存。已提交的任务保持原模型和价格。", "Catalog saved. Submitted jobs retain their model and prices."]);
       await client.invalidateQueries({ queryKey: queryKeys.adminProviderAudit });
       await client.invalidateQueries({ queryKey: queryKeys.modelCatalog });
     },
   });
   const test = useMutation({
     mutationFn: (id: string) => apiRequest<AdminProviderTestResult>(`/api/v1/admin/provider-settings/text/test?model_id=${encodeURIComponent(id)}`, { method: "POST" }),
-    onSuccess: data => setMessage(data.ok ? text("模型调用及 JSON 输出测试通过。", "Model call and JSON output test passed.") : data.message),
+    onSuccess: data => setMessage(data.ok ? ["模型调用及 JSON 输出测试通过。", "Model call and JSON output test passed."] : data.message),
   });
   const update = (index: number, change: Partial<ModelTier>) => {
     if (catalog) setDraft({ ...catalog, items: catalog.items.map((item, i) => i === index ? { ...item, ...change } : item) });

@@ -230,7 +230,9 @@ describe("default argument planning and candidate confirmation", () => {
     renderPlanning();
     fireEvent.click(await screen.findByRole("button", { name: "大纲选择与上传" }));
     fireEvent.click(screen.getAllByRole("button", { name: "使用此结构" })[0]);
-    expect(await screen.findByRole("alert")).toHaveTextContent("Workflow stage changed since it was loaded.");
+    expect(await screen.findByRole("alert")).toHaveTextContent("内容或版本已更新，请刷新后重试。");
+    fireEvent.click(screen.getByRole("button", { name: "技术详情" }));
+    expect(screen.getByRole("alert")).toHaveTextContent("Workflow stage changed since it was loaded.");
     expect(screen.getByRole("alert")).toHaveTextContent("请重新点击需要的大纲");
     expect(requests).toHaveLength(1);
     expect(screen.getByRole("textbox", { name: "章节标题" })).toHaveValue("Evidence theme");
@@ -245,7 +247,9 @@ describe("default argument planning and candidate confirmation", () => {
     renderPlanning();
     fireEvent.click(await screen.findByRole("button", { name: "大纲选择与上传" }));
     fireEvent.click(screen.getAllByRole("button", { name: "使用此结构" })[0]);
-    expect(await screen.findByRole("alert")).toHaveTextContent("The outline could not be loaded.");
+    expect(await screen.findByRole("alert")).toHaveTextContent("无法载入该大纲，请检查内容后重试。");
+    fireEvent.click(screen.getByRole("button", { name: "技术详情" }));
+    expect(screen.getByRole("alert")).toHaveTextContent("The outline could not be loaded.");
     expect(screen.getByRole("textbox", { name: "章节标题" })).toHaveValue("Evidence theme");
     expect(screen.getAllByRole("button", { name: "使用此结构" })[0]).toBeEnabled();
   });

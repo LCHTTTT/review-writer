@@ -273,6 +273,9 @@ class ServerProviderCredential(Base, TimestampMixin):
     secret_hint: Mapped[str] = mapped_column(String(32), default="", nullable=False)
     encryption_key_version: Mapped[str] = mapped_column(String(64), nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
+    input_usd_per_million: Mapped[Decimal | None] = mapped_column(
+        Numeric(18, 8), nullable=True
+    )
 
 
 class ServerProviderAuditEvent(Base):

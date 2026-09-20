@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -33,10 +34,13 @@ class SectionJobHandlers:
                 total = max(0, int(status.get("total") or 0))
                 if total:
                     current = min(current, total)
-                fingerprint = json.dumps(status, ensure_ascii=False, sort_keys=True)
+                checkpoint_revision = None
+                if checkpoint_file is not None and checkpoint_file.is_file():
+                    info = checkpoint_file.stat()
+                    checkpoint_revision = (info.st_mtime_ns, info.st_size)
+                fingerprint = json.dumps([status, checkpoint_revision], ensure_ascii=False, sort_keys=True)
                 if fingerprint == previous:
                     return
-                previous = fingerprint
                 if hasattr(context, "report_progress"):
                     context.report_progress(current, total)
                 if hasattr(context, "report_partial_result"):
@@ -48,6 +52,7 @@ class SectionJobHandlers:
                         if isinstance(checkpoint, dict):
                             result["section_checkpoint"] = checkpoint
                     context.report_partial_result(result)
+                previous = fingerprint
             except Exception:
                 # Progress reporting is observational and must never invalidate
                 # a scientifically valid result that is ready to publish.
@@ -122,6 +127,7 @@ class SectionJobHandlers:
             encoding="utf-8",
         )
         normal, secrets = self._text_gateway_environment(context)
+        normal["REVIEW_SECTION_AUDIT_MODE"] = os.environ.get("REVIEW_SECTION_AUDIT_MODE", "full")
         relative_stage = Path("section-workspace") / "review-projects" / project_id / "02_section_drafting"
         progress_file = section_stage / "generation_progress.json"
         checkpoint_file = section_stage / "section_checkpoints.json"

@@ -62,6 +62,7 @@ export type ProviderSettings = {
   api_key_configured: boolean;
   api_key_hint: string;
   enabled: boolean;
+  input_usd_per_million?: string;
   source: "database" | "environment" | "server" | string;
   updated_at: string | null;
 };

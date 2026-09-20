@@ -1,3 +1,4 @@
+import { LocalizedError } from "../../components/LocalizedError";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
@@ -345,7 +346,7 @@ function AcquisitionPanel({ projectId, onLibraryChanged }: { projectId: string; 
           {search.isPending ? text("提交中…", "Submitting…") : text("检索期刊文章", "Search journal articles")}
         </button>
       </div>
-      {search.error ? <p className="message message-error">{search.error.message}</p> : null}
+      {search.error ? <p className="message message-error"><LocalizedError error={search.error} /></p> : null}
       <LibraryJobStatus kind="search" job={searchJob.data?.job} />
       <div className="candidate-list">
         {candidates.map((candidate, index) => {
@@ -390,7 +391,7 @@ function AcquisitionPanel({ projectId, onLibraryChanged }: { projectId: string; 
             : null}
         </p>
       ) : null}
-      {download.error ? <p className="message message-error">{download.error.message}</p> : null}
+      {download.error ? <p className="message message-error"><LocalizedError error={download.error} /></p> : null}
     </section>
   );
 }
@@ -622,7 +623,7 @@ export function LibraryPage() {
         <div><p className="eyebrow">{text("阶段 1 · 共享文献集合", "Stage 1 · Shared source collection")}</p><h1>{text("文献库", "Literature library")}</h1><p className="muted">{text("上传PDF后必须完成MinerU解析，Metadata和正文才会供后续检索与写作使用。", "Uploaded PDFs must complete MinerU parsing before metadata and full text are available to later discovery and writing stages.")}</p></div>
         <div className="library-heading-actions"><ProjectSelector /><details className="compact-advanced-menu"><summary className="button button-secondary">{text("高级维护", "Advanced maintenance")}</summary><div><button className="button button-secondary" type="button" disabled={reindexMissing.isPending} onClick={() => reindexMissing.mutate()}>{reindexMissing.isPending ? text("提交中…", "Submitting…") : text("补建缺失索引", "Build missing indexes")}</button></div></details><label className={`button button-primary file-button${uploadSubmitting ? " disabled" : ""}`}>{uploadSubmitting ? text("正在提交PDF…", "Submitting PDFs…") : text("批量上传PDF", "Upload PDFs in batch")}<input type="file" accept="application/pdf,.pdf" multiple disabled={uploadSubmitting} onChange={(event) => { const files = event.target.files; void uploadFiles(files); event.currentTarget.value = ""; }} /></label></div>
       </div>
-      {reindexMissing.error ? <p className="message message-error">{reindexMissing.error.message}</p> : null}
+      {reindexMissing.error ? <p className="message message-error"><LocalizedError error={reindexMissing.error} /></p> : null}
       <UploadBatchProgress
         uploads={uploads}
         localUploads={currentLocalUploads}
@@ -675,7 +676,7 @@ export function LibraryPage() {
               <DocumentIndexStatus paper={selectedPaper} />
               {query && !library.isFetching && !library.data?.items.some((paper) => paper.paper_id === selectedPaper.paper_id) ? <p className="message" role="status">{text("当前论文已不匹配筛选条件，仍保留在此处供您继续查看。", "This paper no longer matches the filter; it remains open for your review.")}</p> : null}
               {selectedPaper.search_match ? <button type="button" className="library-search-match" onClick={() => setTab("markdown")}><span>{text(`正文命中 · 第 ${selectedPaper.search_match.page_start || "?"} 页`, `Full-text match · Page ${selectedPaper.search_match.page_start || "?"}`)}</span><p>{selectedPaper.search_match.content}</p><code>{selectedPaper.search_match.chunk_id}</code></button> : null}
-              {reindexPaper.error ? <p className="message message-error index-error">{reindexPaper.error.message}</p> : null}
+              {reindexPaper.error ? <p className="message message-error index-error"><LocalizedError error={reindexPaper.error} /></p> : null}
               <nav className="detail-tabs">{(["metadata", "markdown", "pdf"] as const).map((value) => <button key={value} className={tab === value ? "active" : ""} type="button" onClick={() => setTab(value)}>{value === "metadata" ? "Metadata" : value === "markdown" ? "Markdown" : "PDF"}</button>)}</nav>
               {tab === "metadata" ? metadata.isPending || !metadataDraft ? (
                 <div className="editor-panel metadata-loading">{metadata.error ? <ErrorState error={metadata.error} onRetry={() => metadata.refetch()} /> : text("正在加载书目信息…", "Loading bibliographic information…")}</div>

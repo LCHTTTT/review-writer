@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from datetime import datetime
+from decimal import Decimal
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from .auth import PASSWORD_MIN_LENGTH
+from review_writer_core.taxonomy import NEW_PROJECT_TAXONOMY_PROFILE
 
 class HealthResponse(BaseModel):
     status: str
@@ -79,7 +81,7 @@ class ProjectListResponse(BaseModel):
 class ProjectCreateRequest(BaseModel):
     slug: str = Field(min_length=1, max_length=96)
     topic: str = Field(default="", max_length=10_000)
-    taxonomy_profile: str = Field(default="general_academic", min_length=1, max_length=96)
+    taxonomy_profile: str = Field(default=NEW_PROJECT_TAXONOMY_PROFILE, min_length=1, max_length=96)
     model_tier: str | None = Field(default=None, min_length=1, max_length=32)
 
 
@@ -348,6 +350,7 @@ class ProviderSettingsResponse(BaseModel):
     api_key_configured: bool
     api_key_hint: str
     enabled: bool
+    input_usd_per_million: str = "0"
     source: str = "server"
     updated_at: datetime | None = None
 
@@ -362,6 +365,12 @@ class AdminProviderSettingsUpdateRequest(BaseModel):
     wire_api: str = Field(default="", max_length=64)
     api_key: str | None = Field(default=None, max_length=10_000)
     enabled: bool = True
+    input_usd_per_million: Decimal | None = Field(
+        default=None,
+        ge=Decimal("0"),
+        le=Decimal("1000000"),
+        decimal_places=8,
+    )
 
 
 class AdminProviderTestResponse(BaseModel):

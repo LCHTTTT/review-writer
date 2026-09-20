@@ -726,6 +726,22 @@ class NativeWorkflowHandlerTests(unittest.TestCase):
                 context.partial_results[0]["section_progress"]["completed_sections"][0]["heading"],
             )
 
+    def test_section_progress_persists_repair_budget_without_progress_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            status_file = Path(temporary) / "progress.json"
+            checkpoint_file = Path(temporary) / "checkpoint.json"
+            status_file.write_text(json.dumps({"phase": "reviewing", "current": 0, "total": 1}), encoding="utf-8")
+            checkpoint_file.write_text(json.dumps({"entries": {}}), encoding="utf-8")
+            context = _Context(str(uuid.uuid4()))
+            callback = NativeWorkflowHandlers._section_progress_callback(context, status_file, checkpoint_file)
+            callback()
+            checkpoint_file.write_text(json.dumps({"entries": {}, "authoring_states": {
+                "S01": {"state": {"repair_attempted": True}}}}), encoding="utf-8")
+            callback()
+            callback()
+            self.assertEqual(2, len(context.partial_results))
+            self.assertTrue(context.partial_results[-1]["section_checkpoint"]["authoring_states"]["S01"]["state"]["repair_attempted"])
+
     def test_matrix_progress_callback_publishes_live_fact_previews(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             status_file = Path(temporary) / "matrix-progress.json"

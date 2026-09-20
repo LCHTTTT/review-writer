@@ -8,6 +8,6 @@ export function sectionErrorMessage(message: string, text: UiText): string {
   if (/timeout|timed out|524|响应超时/i.test(message)) return text("模型服务响应超时，请稍后继续生成。", "The model service timed out. Resume generation shortly.");
   if (/provider.*unavailable|模型服务暂时不可用/i.test(message)) return text("模型服务暂时不可用，请稍后继续生成。", "The model service is temporarily unavailable. Resume generation shortly.");
   if (/Workflow stage changed/i.test(message)) return text("页面状态已更新，请刷新后重试。", "The workflow changed. Refresh the page and try again.");
-  if (message.length <= 120 && /[\u4e00-\u9fff]/.test(message) && !/Scientific|Traceback|Error:/.test(message)) return message;
+  if (message.length <= 120 && /[\u4e00-\u9fff]/.test(message) && !/Scientific|Traceback|Error:/.test(message)) return text(message, "The operation did not finish. Retry, or contact the administrator if it fails again.");
   return text("本次操作未完成，请重试；若仍失败，请联系管理员。", "The operation did not finish. Retry, or contact the administrator if it fails again.");
 }

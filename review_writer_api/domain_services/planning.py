@@ -4812,7 +4812,8 @@ class PlanningService(
                         "without repeating full study descriptions."
                     )
                 figure_need = f"Support the comparison in {section['title']} where source evidence permits."
-                target_words = max(700, 350 * max(1, len(primary)))
+                # Comparison length grows sublinearly; a paper is not a paragraph.
+                target_words = min(1800, 700 + 100 * max(0, len(primary) - 1))
             thesis_contract = {"text": thesis, "status": "provisional" if role == "body" else "structural_synthesis"}
             depth_contract = derive_section_depth_contract(
                 {

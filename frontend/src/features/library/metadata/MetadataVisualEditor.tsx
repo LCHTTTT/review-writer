@@ -1,3 +1,4 @@
+import { LocalizedError } from "../../../components/LocalizedError";
 import { useUiText } from "../../../i18n/useUiText";
 import {
   isMetadataObject,
@@ -189,7 +190,7 @@ export function MetadataVisualEditor({
         </div>
       </details>
 
-      {error ? <p className="message message-error" role="alert">{error.message}</p> : null}
+      {error ? <p className="message message-error" role="alert"><LocalizedError error={error} /></p> : null}
     </form>
   );
 }

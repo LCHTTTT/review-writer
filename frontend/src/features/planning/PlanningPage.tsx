@@ -1,3 +1,4 @@
+import { LocalizedError } from "../../components/LocalizedError";
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
@@ -540,7 +541,7 @@ function MatrixWorkspace({ payload, projectId, refresh }: { payload: PlanningPay
           <div aria-live="polite">
             {outlineSyncFailed ? <p className="message message-warning" role="status">{text("大纲已保存，页面信息同步失败，请刷新查看。", "Outline saved, but page synchronization failed. Refresh to view it.")}</p> : null}
             {chooseOutline.isError ? <div className="message message-error" role="alert">
-              <strong>{text("大纲未应用：", "Outline was not applied: ")}</strong>{chooseOutline.error.message}
+              <strong>{text("大纲未应用：", "Outline was not applied: ")}</strong><LocalizedError error={chooseOutline.error} />
               {chooseOutline.error instanceof ApiError && chooseOutline.error.status === 409 ? <p>{text("项目状态发生变化，已重新获取当前状态。请重新点击需要的大纲。", "The project state changed and has been fetched again. Select the outline again.")}</p> : null}
             </div> : null}
             {chooseOutline.isSuccess ? <p className="message message-success" role="status">{chooseOutline.variables === "custom" ? text("已启用自定义大纲，请在下方填写章节并保存。", "Custom outline selected. Add sections below and save.") : text("大纲已应用，章节已载入下方编辑器。", "Outline applied. Sections are loaded in the editor below.")}</p> : null}
@@ -560,7 +561,7 @@ function MatrixWorkspace({ payload, projectId, refresh }: { payload: PlanningPay
           <details className="advanced-panel planning-reference-advanced">
             <summary>{text("上传参考综述以学习组织方式（可选）", "Upload a reference review for organization only (optional)")}</summary>
             <div className="advanced-panel-body"><section className="reference-upload"><div><h3>{text("上传综述，仅学习格式与写法", "Upload a review to learn format only")}</h3><p>{text("支持PDF、DOCX、Markdown或TXT。系统分两步处理：先提取层级、节奏和写作方式，再只根据当前主题与Matrix生成全新标题；不会复制、翻译或改写上传综述的标题和内容。", "Supports PDF, DOCX, Markdown, or TXT. The system first extracts hierarchy, pacing, and writing conventions, then generates new headings only from the current topic and Matrix. Uploaded headings and content are never copied, translated, or paraphrased.")}</p></div><label className="button button-secondary file-button">{uploadReference.isPending ? text("正在分析格式…", "Analyzing format…") : text("选择参考综述", "Choose reference review")}<input type="file" accept=".pdf,.docx,.md,.txt" disabled={uploadReference.isPending} onChange={(event) => { const file = event.target.files?.[0]; event.currentTarget.value = ""; if (file) uploadReference.mutate(file); }} /></label></section>
-            {uploadReference.error ? <p className="message message-error">{uploadReference.error.message}</p> : null}
+            {uploadReference.error ? <p className="message message-error"><LocalizedError error={uploadReference.error} /></p> : null}
             {payload.legacy_reference_outline_count ? <p className="message message-warning">{text(`已隐藏 ${payload.legacy_reference_outline_count} 个旧版参考大纲，因为它们没有通过“只学格式”的内容隔离校验；如需使用，请重新上传原参考综述。`, `${payload.legacy_reference_outline_count} legacy reference outlines were hidden because they did not pass format-only content isolation. Upload the source review again to use it safely.`)}</p> : null}
             {payload.reference_outline_candidates?.length ? <div className="reference-candidates">{payload.reference_outline_candidates.map((candidate) => { const style = `reference:${candidate.candidate_id}`; return <button key={String(candidate.candidate_id)} className={selectedStyle === style ? "active" : ""} type="button" {...outlineChoiceProps(style)}><strong>{outlineChoiceText(style, String(candidate.source_name || candidate.candidate_id), String(candidate.source_name || candidate.candidate_id))}</strong><small>{text("仅学习格式 · 内容来自当前Matrix", "Format only · content from current Matrix")}</small></button>; })}</div> : null}</div>
           </details>
@@ -606,7 +607,7 @@ function MatrixWorkspace({ payload, projectId, refresh }: { payload: PlanningPay
             </div>
             {payload.coverage_diagnostics?.warnings?.map((issue) => <p className="message message-warning" key={issue.rule_id}>{issue.rule_id === "coverage.search_cutoff_unrecorded" ? text("尚未记录检索截止日期。", "The search cutoff date has not been recorded.") : issue.rule_id === "coverage.publication_year_missing" ? text("部分已选论文缺少规范化发表年份。", "Some selected papers have no normalized publication year.") : text("覆盖信息不完整。", issue.message || "Coverage information is incomplete.")}</p>)}</div>
           </details>
-          <section className="outline-editor-card"><div className="section-heading"><div><h2>{text("新手大纲编辑器", "Beginner outline editor")}</h2><p>{text("大标题和小标题必须对应当前检索主题；新手模式会自动生成系统需要的格式。", "Every heading and subheading must match the current discovery topic; beginner mode generates the required format automatically.")}</p></div><div className="outline-editor-actions"><button className="button button-secondary" type="button" disabled={!outlineReady || recommendOutline.isPending || saveOutline.isPending || chooseOutline.isPending} onClick={() => recommendOutline.mutate(outlineDraft)}>{recommendOutline.isPending ? text("正在分析主题覆盖…", "Analyzing evidence…") : text("为整个大纲推荐论文", "Recommend papers for the whole outline")}</button><button className="button button-primary" type="button" disabled={!outlineReady || saveOutline.isPending || recommendOutline.isPending || chooseOutline.isPending} onClick={() => saveOutline.mutate()}>{saveOutline.isPending ? text("保存中…", "Saving…") : text("保存大纲", "Save outline")}</button></div></div>{recommendationMessage ? <p className="message message-info">{recommendationMessage}</p> : null}<OutlineBuilder value={outlineDraft} papers={papers} onChange={setOutlineDraft} />{!outlineReady && outlineDraft.trim() ? <p className="message message-warning">{text("请至少添加一个章节，并补全章节标题。", "Add at least one section and complete every section title.")}</p> : null}{recommendOutline.error ? <p className="message message-error">{recommendOutline.error.message}</p> : null}{saveOutline.error ? <p className="message message-error">{saveOutline.error.message}</p> : null}</section>
+          <section className="outline-editor-card"><div className="section-heading"><div><h2>{text("新手大纲编辑器", "Beginner outline editor")}</h2><p>{text("大标题和小标题必须对应当前检索主题；新手模式会自动生成系统需要的格式。", "Every heading and subheading must match the current discovery topic; beginner mode generates the required format automatically.")}</p></div><div className="outline-editor-actions"><button className="button button-secondary" type="button" disabled={!outlineReady || recommendOutline.isPending || saveOutline.isPending || chooseOutline.isPending} onClick={() => recommendOutline.mutate(outlineDraft)}>{recommendOutline.isPending ? text("正在分析主题覆盖…", "Analyzing evidence…") : text("为整个大纲推荐论文", "Recommend papers for the whole outline")}</button><button className="button button-primary" type="button" disabled={!outlineReady || saveOutline.isPending || recommendOutline.isPending || chooseOutline.isPending} onClick={() => saveOutline.mutate()}>{saveOutline.isPending ? text("保存中…", "Saving…") : text("保存大纲", "Save outline")}</button></div></div>{recommendationMessage ? <p className="message message-info">{recommendationMessage}</p> : null}<OutlineBuilder value={outlineDraft} papers={papers} onChange={setOutlineDraft} />{!outlineReady && outlineDraft.trim() ? <p className="message message-warning">{text("请至少添加一个章节，并补全章节标题。", "Add at least one section and complete every section title.")}</p> : null}{recommendOutline.error ? <p className="message message-error"><LocalizedError error={recommendOutline.error} /></p> : null}{saveOutline.error ? <p className="message message-error"><LocalizedError error={saveOutline.error} /></p> : null}</section>
           <details className="outline-options"><summary>{text("查看系统生成的候选大纲", "View system-generated outline candidates")}</summary><pre>{payload.outline_options_md || text("暂无候选大纲。", "No candidate outlines yet.")}</pre></details>
         </section>
       )}
@@ -731,7 +732,7 @@ function ChapterPlanningActions({ payload, tab, generating, confirming, error, o
   tab: "matrix" | "blueprint";
   generating: boolean;
   confirming: boolean;
-  error?: string;
+  error?: React.ReactNode;
   onGenerate: () => void;
   onConfirm: () => void;
   onOpen: () => void;
@@ -795,7 +796,7 @@ function ChapterPlanningActions({ payload, tab, generating, confirming, error, o
         </li>)}</ul>
       </details> : null}
       {!busy && latestJob?.error_message ? <details open={!complete}><summary>{text("上次生成未完成 · 查看原因", "Previous attempt did not finish · View reason")}</summary><p>{latestJob.error_message}</p></details> : null}
-      {error || cancel.error ? <p className="message message-error" role="alert">{error || cancel.error?.message}</p> : null}
+      {error || cancel.error ? <p className="message message-error" role="alert">{error || <LocalizedError error={cancel.error} />}</p> : null}
     </div>
     {activeJob ? <button className="button button-secondary" type="button" disabled={cancel.isPending || activeJob.cancellation_requested} onClick={() => cancel.mutate()}>{activeJob.cancellation_requested ? text("正在停止…", "Stopping…") : text("停止生成", "Stop generation")}</button>
       : tab === "matrix" && sectionCount && payload.blueprint_current ? <button className="button button-primary" type="button" onClick={onOpen}>{text("查看章节规划", "Review chapter plan")}</button>
@@ -865,7 +866,7 @@ export function PlanningPage() {
       {planning.data && project ? <>
         {tab === "matrix" ? <MatrixWorkspace payload={planning.data} projectId={project.project_id} refresh={refresh} /> : null}
         <ChapterPlanningActions payload={planning.data} tab={tab} generating={generateBlueprint.isPending} confirming={confirmBlueprint.isPending}
-          error={(generateBlueprint.error || confirmBlueprint.error || restoreBlueprint.error)?.message}
+          error={(generateBlueprint.error || confirmBlueprint.error || restoreBlueprint.error) ? <LocalizedError error={generateBlueprint.error || confirmBlueprint.error || restoreBlueprint.error} /> : undefined}
           onGenerate={() => generateBlueprint.mutate()} onConfirm={() => confirmBlueprint.mutate()}
           onOpen={() => { const next = new URLSearchParams(searchParams); next.set("tab", "blueprint"); setSearchParams(next); }} refresh={refresh} />
         {tab === "blueprint" ? <BlueprintWorkspace payload={planning.data} restoring={restoreBlueprint.isPending} onRestorePrevious={(artifactId) => restoreBlueprint.mutate(artifactId)} /> : null}

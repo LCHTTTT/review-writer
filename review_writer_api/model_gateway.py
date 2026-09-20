@@ -253,6 +253,9 @@ class ModelGatewayService:
             bool(secret and model),
             "environment",
             "",
+            input_usd_per_million=(
+                self.settings.embedding_provider_price_usd_per_million
+            ),
         )
 
     def embedding_profile(self) -> dict[str, Any]:
@@ -1201,7 +1204,7 @@ class ModelGatewayService:
             label_en="Retrieval embedding",
             description_zh="服务器固定的检索向量模型。",
             description_en="Server-fixed retrieval embedding model.",
-            input_usd_per_million=self.settings.embedding_provider_price_usd_per_million,
+            input_usd_per_million=runtime.input_usd_per_million,
             cached_input_usd_per_million=Decimal("0"),
             output_usd_per_million=Decimal("0"),
         )

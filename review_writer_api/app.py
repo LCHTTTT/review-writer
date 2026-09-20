@@ -105,7 +105,7 @@ from .schemas import (
     UsageTimelineResponse,
 )
 from review_writer_core.taxonomy import (
-    DEFAULT_TAXONOMY_PROFILE,
+    NEW_PROJECT_TAXONOMY_PROFILE,
     taxonomy_profile_catalog,
 )
 from .server_providers import ServerProviderSettingsService
@@ -1055,7 +1055,7 @@ def create_app(
     ) -> TaxonomyProfileCatalogResponse:
         return TaxonomyProfileCatalogResponse(
             items=taxonomy_profile_catalog(),
-            default_profile=DEFAULT_TAXONOMY_PROFILE,
+            default_profile=NEW_PROJECT_TAXONOMY_PROFILE,
         )
 
     @app.post(
@@ -1208,6 +1208,7 @@ def create_app(
                 wire_api=payload.wire_api,
                 api_key=payload.api_key,
                 enabled=payload.enabled,
+                input_usd_per_million=payload.input_usd_per_million,
             )
             return ProviderSettingsResponse.model_validate(record, from_attributes=True)
 
@@ -1582,6 +1583,7 @@ def create_app(
                 current_principal,
                 final_service,
                 job_service,
+                library_service=library_service,
             )
         )
     return app

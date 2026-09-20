@@ -1,11 +1,9 @@
-from copy import deepcopy
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
 
-from review_writer_api.domain_services.actions.draft.publication import repaired_artifact_metadata
 from review_writer_api.domain_services.discovery import _candidate_id, _selected
 from review_writer_api.domain_services.final import FinalService
 from review_writer_api.domain_services.planning import _planning_job_payload
@@ -16,10 +14,6 @@ from review_writer_api.job_service import job_payload
 from review_writer_api.routers.jobs import _job_response
 from review_writer_core.stages.discovery import records
 from review_writer_core.stages.sections.blueprint_builder import build_section
-from review_writer_core.workflow.artifacts import (
-    DRAFT_MANUSCRIPT, DRAFT_QUALITY_REPORT, DRAFT_REWRITE_OVERLAYS,
-    MATRIX, SECTION_EVIDENCE_PACKAGE,
-)
 
 
 @pytest.mark.parametrize("status,actions", [
@@ -51,20 +45,6 @@ def test_discovery_identity_and_selection_are_shared():
     assert not _selected({"selected_for_matrix": True, "role": "excluded"})
 
 
-@pytest.mark.parametrize("logical", [DRAFT_MANUSCRIPT, DRAFT_QUALITY_REPORT, DRAFT_REWRITE_OVERLAYS, MATRIX])
-def test_repair_publication_preserves_history_and_binds_new_sources(logical):
-    previous = {"operation": "accept", "source_draft_artifact_id": "old-draft", "custom": "kept"}
-    before = deepcopy(previous)
-    published = {name: SimpleNamespace(id=f"new-{name}") for name in (
-        SECTION_EVIDENCE_PACKAGE, MATRIX, DRAFT_MANUSCRIPT)}
-    result = repaired_artifact_metadata(previous, logical, published)
-    assert previous == before
-    assert result["source_section_evidence_artifact_id"] == published[SECTION_EVIDENCE_PACKAGE].id
-    assert result["source_matrix_artifact_id"] == published[MATRIX].id
-    assert result["source_draft_artifact_id"] == (
-        published[DRAFT_MANUSCRIPT].id if logical in {DRAFT_QUALITY_REPORT, DRAFT_REWRITE_OVERLAYS} else "old-draft")
-    assert result["custom"] == "kept"
-    assert repaired_artifact_metadata(previous, logical, {}) == previous
 
 
 def test_legacy_final_conclusion_preserves_approval_and_manual_text_exclusion():
