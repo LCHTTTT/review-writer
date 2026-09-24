@@ -26,6 +26,7 @@ def test_all_job_views_share_fields_and_action_policy(status, actions):
     job = SimpleNamespace(id="job", project_id="project", scope="project", job_type="sections.generate",
         status=status, result={"completed_sections": ["S01"]}, progress_current=1, progress_total=2,
         cancellation_requested=False, error_code="", error_message="", retry_of_job_id=None,
+        next_run_at=None, queue_reason="",
         created_at=now, updated_at=now, started_at=None, finished_at=None,
         user_id="private-owner", payload={"internal": "not-a-public-job-field"}, lease_token="private-lease")
     result = job_payload(job)

@@ -59,6 +59,7 @@ from review_writer_core.writing_contracts import (  # noqa: E402
     section_constraint_prompt_block,
 )
 from review_writer_core.model_gateway_client import (  # noqa: E402
+    GatewayRequestError,
     call_json_model as call_gateway_json,
     gateway_configured,
     parse_json_object_text as _parse_json_object_text,
@@ -1652,6 +1653,7 @@ def main() -> int:
     parser.add_argument("--model", default="")
     parser.add_argument("--wire-api", default="")
     parser.add_argument("--audit-mode", choices=("full", "selective"), default=None)
+    parser.add_argument("--section-concurrency", "--max-new-sections", dest="section_concurrency", type=int, default=0)
     args = parser.parse_args()
     root = Path(args.review_root).resolve()
     dotenv = load_dotenv(root)
@@ -1738,24 +1740,28 @@ def main() -> int:
         checkpoint_entries, tasks, evidence_sections
     )
     rejected_checkpoints = {**input_rejections, **rejected_checkpoints}
-    # A usable partial chapter may be published, but a later recovery must still
-    # visit its pending checks. Accepted claims remain in authoring_states.
-    for sid, entry in list(checkpoint_entries.items()):
-        if ((entry.get("synthesis") or {}).get("source_review") or {}).get("unresolved"):
-            rejected_checkpoints[sid] = "source_check_incomplete"
-            del checkpoint_entries[sid]
     for sid, entry in checkpoint_entries.items():
         entry["input_fingerprint"] = section_signatures[sid]
     authoring_states = {sid: value for sid, value in (checkpoint.get("authoring_states") or {}).items()
         if checkpoint.get("project_id") == args.project_id and isinstance(value, dict)
         and value.get("section_input") == section_signatures.get(sid)}
+    failed_progress: list[dict[str, Any]] = [
+        dict(row) for row in checkpoint.get("failed_sections") or []
+        if isinstance(row, dict) and str(row.get("section_id") or "") in task_ids
+    ]
+    # An unbounded CLI invocation is a new explicit attempt. Bounded Worker
+    # leases retain failures until the coordinator decides whether to retry.
+    if not args.section_concurrency:
+        failed_progress = []
     checkpoint_lock = RLock()
     def persist_checkpoint():
         with checkpoint_lock:
             write_section_checkpoint(stage, {"schema_version": 1, "project_id": args.project_id,
                 "task_ids": task_ids, "generation_fingerprint": generation_fingerprint,
                 "entries": checkpoint_entries, "rejected_entries": rejected_checkpoints,
-                "authoring_states": authoring_states})
+                "authoring_states": authoring_states,
+                "failed_sections": failed_progress,
+            })
     def persist_authoring(sid, value):
         with checkpoint_lock:
             authoring_states[sid] = {"section_input": section_signatures[sid], "state": value}
@@ -1845,7 +1851,6 @@ def main() -> int:
         if isinstance(checkpoint_entries.get(section_id), dict)
         and isinstance(checkpoint_entries[section_id].get("writing"), dict)
     ]
-    failed_progress: list[dict[str, Any]] = []
 
     responsibilities = chapter_responsibilities(tasks)
 
@@ -1853,11 +1858,13 @@ def main() -> int:
         def failure(section_id, heading, error, *, evidence_failure=False):
             if evidence_failure:
                 entry = recover_evidence_section(task, section_evidence, evidence, citation_map, error, [])
-                if not (entry.get("output") or {}).get("paragraphs"):
-                    return {"error": "No usable source-supported section is available. Saved generation state was retained for recovery."}
                 entry["input_fingerprint"] = section_signatures[section_id]
                 return entry
-            return {"error": str(error)[:2000]}
+            gateway_details = error.details if isinstance(error, GatewayRequestError) else {}
+            rate_limited = isinstance(error, GatewayRequestError) and (
+                error.status_code == 429 or gateway_details.get("provider_status") == 429
+            )
+            return {"error": str(error)[:2000], "retryable_rate_limit": rate_limited}
         section_id = str(task.get("section_id"))
         role = str(task.get("section_role") or "body").strip().casefold()
         assigned_primary = list(
@@ -1971,10 +1978,10 @@ def main() -> int:
                     + json.dumps({pid: contribution_context(rows.get(pid, {}).get("paper_analysis"), limit=300)
                                   for pid in task.get("allowed_papers") or []}, ensure_ascii=False)
                     + "\nCompleted dependencies (context, not additional source evidence):\n" + json.dumps(task.get("dependency_context", []), ensure_ascii=False)), call=source_call)
+            if source_review.get("unresolved"):
+                return failure(section_id, str(task.get("heading") or section_id),
+                    "Source checking is incomplete. Draft and check state were preserved; retry this section after reviewing its evidence.")
             if not writing_section["paragraphs"]:
-                if source_review.get("unresolved"):
-                    return failure(section_id, str(task.get("heading") or section_id),
-                        "Source checking is incomplete. Generated content was preserved; retry to resume checking.", evidence_failure=False)
                 malformed = any(row.get("reason") in {
                     "invalid_paragraph", "invalid_claim", "missing_or_invalid_source_span", "invalid_result_context"
                 } for row in source_review.get("omitted") or [])
@@ -2000,7 +2007,7 @@ def main() -> int:
                 if generation_mode != "standard" else "pass", **source_review})
         except (RuntimeError, urllib.error.HTTPError, urllib.error.URLError) as exc:
             return failure(section_id, str(task.get("heading") or section_id),
-                str(exc))
+                exc)
         markdown = [f"## {task.get('heading')}", "", overview, ""]
         for item in paragraphs:
             paragraph_id = str(item["paragraph_id"])
@@ -2105,7 +2112,10 @@ def main() -> int:
         sid = task["section_id"]
         active.pop(sid, None)
         if "error" in entry:
-            failed_progress.append({"section_id": sid, "heading": task.get("heading", sid), "error": entry["error"]})
+            failed_progress.append({"section_id": sid, "heading": task.get("heading", sid),
+                                    "error": entry["error"],
+                                    "retryable_rate_limit": bool(entry.get("retryable_rate_limit"))})
+            persist_checkpoint()
         else:
             with checkpoint_lock:
                 checkpoint_entries[sid] = entry
@@ -2120,7 +2130,11 @@ def main() -> int:
                 "section_readiness": entry["output"].get("section_readiness")})
         progress()
 
-    run_sections(tasks, generate, observe, save, completed=checkpoint_entries)
+    run_sections(
+        tasks, generate, observe, save, completed=checkpoint_entries,
+        deferred={row["section_id"] for row in failed_progress},
+        concurrency=args.section_concurrency or 2,
+    )
     if failed_progress:
         write_generation_progress(
             stage,

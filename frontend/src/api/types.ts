@@ -72,6 +72,7 @@ export type ProviderSettingsList = {
 };
 
 export type TextConnection = {
+  max_concurrency?: number;
   id: string;
   revision: number;
   name: string;
@@ -103,7 +104,10 @@ export type AdminProviderTestResult = {
   message: string;
 };
 
+export type ModelChannel = { connection_id: string; model: string; wire_api?: string };
+
 export type ModelTier = {
+  channels?: ModelChannel[];
   id: string;
   model: string;
   label_zh: string;
@@ -346,6 +350,8 @@ export type Job = {
   scope: string;
   job_type: string;
   status: "queued" | "running" | "cancel_requested" | "succeeded" | "failed" | "cancelled" | "interrupted";
+  next_run_at?: string | null;
+  queue_reason?: string;
   result: Record<string, unknown>;
   progress_current: number;
   progress_total: number;

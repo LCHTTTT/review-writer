@@ -854,6 +854,29 @@ class NativeWorkflowHandlerTests(unittest.TestCase):
                     self.assertEqual({"paper_concurrency": expected, "max_model_calls": 5, "max_supplement_rounds": 1},
                                      saved["fact_agent_limits"])
 
+    def test_model_delegation_is_scoped_to_standalone_matrix_not_embedded_blueprint(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            handler = NativeWorkflowHandlers.__new__(NativeWorkflowHandlers)
+            handler.root = root
+            handler.model_gateway = object()
+            handler.planning_service = None
+            handler._staging = lambda *_: root
+            handler._text_gateway_environment = lambda _: ({"REVIEW_WRITER_MODEL_GATEWAY_URL": "internal"}, {})
+            observed = []
+            def run(*_args, **kwargs):
+                observed.append(dict(kwargs["env"]))
+                (root / "matrix-enrichment-output.json").write_text('{"papers": []}', encoding="utf-8")
+            handler.runner = SimpleNamespace(run=run)
+            context = SimpleNamespace(user_id=str(uuid.uuid4()), project_id="project", job_id=str(uuid.uuid4()),
+                job_type="matrix.enrich", checkpoint=lambda: None, cancellation_requested=lambda: False)
+            with patch.dict("os.environ", {"REVIEW_WRITER_DELEGATED_MODEL_ENABLED": "1"}):
+                handler.matrix_enrich(context, {"papers": []})
+                context.job_type = "planning.blueprint"
+                handler.matrix_enrich(context, {"papers": []})
+            self.assertEqual("1", observed[0]["REVIEW_WRITER_DELEGATE_MODEL_CALLS"])
+            self.assertNotIn("REVIEW_WRITER_DELEGATE_MODEL_CALLS", observed[1])
+
     def test_matrix_live_payload_bounds_long_fact_preview(self) -> None:
         live = _matrix_live_payload(
             {

@@ -8,6 +8,8 @@ import unittest
 import uuid
 from copy import deepcopy
 from pathlib import Path
+from unittest.mock import patch, Mock
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 from PIL import Image
@@ -369,6 +371,9 @@ class SectionsV1Tests(unittest.TestCase):
             public_origin="http://testserver",
             credential_encryption_key=TEST_KEY,
             hosted_workspace_root=root / "users",
+            # Offline handlers still require an enabled catalog connection at
+            # job admission; this dummy credential is never sent to a provider.
+            text_provider_api_key="offline-sections-test-key",
         )
         self.app = create_app(
             settings,
@@ -539,6 +544,24 @@ class SectionsV1Tests(unittest.TestCase):
         )
         self.assertEqual(202, response.status_code, response.text)
         return self.wait_job(client, response.json()["id"])
+
+    def test_submission_defers_evidence_and_worker_reuses_preparation(self) -> None:
+        service = self.app.state.sections_service
+        with patch.object(service, "hydrate_tasks_with_evidence", side_effect=AssertionError("HTTP must not retrieve evidence")):
+            payload = service.generation_payload(self.first, self.project_id, defer_evidence=True)
+        self.assertTrue(payload["evidence_preparation_pending"])
+        context = SimpleNamespace(user_id=self.first.user_id, project_id=self.project_id,
+            job_id=str(uuid.uuid4()), report_progress=Mock(), report_partial_result=Mock(), checkpoint=Mock())
+        with patch.object(service, "generation_payload", wraps=service.generation_payload) as prepare:
+            first = service.prepare_generation_job(context, payload)
+            second = service.prepare_generation_job(context, payload)
+        self.assertEqual(1, prepare.call_count)
+        self.assertEqual(first, second)
+        self.assertFalse(first["evidence_preparation_pending"])
+        self.assertTrue(first["evidence_package"]["sections"])
+        stale = {**payload, "source_blueprint_artifact_id": "superseded"}
+        with self.assertRaises(WorkflowConflict):
+            service.prepare_generation_job(context, stale)
 
     def test_payload_resolves_blueprint_papers(self) -> None:
         with TestClient(self.app) as client:

@@ -366,7 +366,8 @@ class ServerProviderSettingsService:
             ))
 
     async def test_connection(
-        self, principal: Principal, provider_kind: str, *, model_id: str | None = None
+        self, principal: Principal, provider_kind: str, *, model_id: str | None = None,
+        _channel: dict | None = None,
     ) -> ServerProviderTestResult:
         principal.require(Permission.PROVIDER_MANAGE)
         kind = self._kind(provider_kind)
@@ -379,6 +380,23 @@ class ServerProviderSettingsService:
                 model = resolve_model_tier(model_id, self.session_factory)
             except ValueError as exc:
                 raise ProviderSettingsError(str(exc)) from exc
+            from .model_catalog import model_channels, routed_model
+            channels = model_channels(model)
+            if _channel is None and len(channels) > 1:
+                results = []
+                for channel in channels:
+                    try:
+                        result = await self.test_connection(principal, provider_kind,
+                            model_id=model_id, _channel=channel)
+                    except ProviderSettingsError as exc:
+                        result = ServerProviderTestResult(kind.value, False, 0, 0, str(exc))
+                    results.append(result)
+                ok = all(result.ok for result in results)
+                return ServerProviderTestResult(kind.value, ok, 200 if ok else 0,
+                    sum(result.latency_ms for result in results),
+                    "All model channels passed." if ok else "; ".join(
+                        f"Channel {i + 1}: {result.message}" for i, result in enumerate(results) if not result.ok))
+            model = routed_model(model, _channel or channels[0])
             from .text_connections import runtime_for_connection
             runtime = runtime_for_connection(self, model.connection_id)
         if not runtime.enabled:

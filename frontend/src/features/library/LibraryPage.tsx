@@ -11,8 +11,8 @@ import { ProjectSelector, useSelectedProject } from "../../components/ProjectSel
 import { useUiText } from "../../i18n/useUiText";
 import { buildPaperDisplayLabels } from "../../utils/paperLabels";
 import {
-  cloneMetadata,
   markMetadataReviewed,
+  metadataForEditing,
   metadataForSave,
   type MetadataRecord,
 } from "./metadata/metadataEditorModel";
@@ -404,6 +404,7 @@ export function LibraryPage() {
   const [selectedId, setSelectedId] = useState("");
   const [tab, setTab] = useState<DetailTab>("metadata");
   const [metadataDraft, setMetadataDraft] = useState<MetadataRecord | null>(null);
+  const [abstractReextractResult, setAbstractReextractResult] = useState("");
   const [localUploads, setLocalUploads] = useState<UploadStatus[]>([]);
   const [uploadBatchExpectation, setUploadBatchExpectation] = useState<{ batchId: string; total: number } | null>(null);
   const [uploadSubmitting, setUploadSubmitting] = useState(false);
@@ -506,9 +507,10 @@ export function LibraryPage() {
   });
   useEffect(() => {
     setMetadataDraft(null);
+    setAbstractReextractResult("");
   }, [selectedPaper?.paper_id]);
   useEffect(() => {
-    if (metadata.data) setMetadataDraft(cloneMetadata(metadata.data));
+    if (metadata.data) setMetadataDraft(metadataForEditing(metadata.data));
   }, [metadata.data]);
   const saveMetadata = useMutation({
     mutationFn: ({ paperId, value }: { paperId: string; value: MetadataRecord }) => apiRequest<MetadataRecord>(`/api/v1/library/papers/${encodeURIComponent(paperId)}/metadata`, {
@@ -517,9 +519,21 @@ export function LibraryPage() {
     }),
     onSuccess: async (saved, { paperId }) => {
       queryClient.setQueryData(queryKeys.libraryMetadata(paperId), saved);
-      if (selectedPaper?.paper_id === paperId) setMetadataDraft(cloneMetadata(saved));
+      if (selectedPaper?.paper_id === paperId) setMetadataDraft(metadataForEditing(saved));
       await refreshLibrary();
       await queryClient.invalidateQueries({ queryKey: queryKeys.libraryBibliographyAudit(paperId) });
+    },
+  });
+  const reextractAbstract = useMutation({
+    mutationFn: (paperId: string) => apiRequest<{ metadata: MetadataRecord; result: string }>(
+      `/api/v1/library/papers/${encodeURIComponent(paperId)}/abstract-reextract`,
+      { method: "POST" },
+    ),
+    onSuccess: async ({ metadata: saved, result }, paperId) => {
+      queryClient.setQueryData(queryKeys.libraryMetadata(paperId), saved);
+      if (selectedPaper?.paper_id === paperId) setMetadataDraft(metadataForEditing(saved));
+      setAbstractReextractResult(result);
+      await refreshLibrary();
     },
   });
   const deletePaper = useMutation({
@@ -558,12 +572,13 @@ export function LibraryPage() {
     },
     onSuccess: async (saved, { paperId }) => {
       queryClient.setQueryData(queryKeys.libraryMetadata(paperId), saved);
-      if (selectedPaper?.paper_id === paperId) setMetadataDraft(cloneMetadata(saved));
+      if (selectedPaper?.paper_id === paperId) setMetadataDraft(metadataForEditing(saved));
       await queryClient.invalidateQueries({ queryKey: ["library"] });
       await refreshLibrary();
     },
   });
-  const metadataDirty = Boolean(metadataDraft && metadata.data && JSON.stringify(metadataDraft) !== JSON.stringify(metadata.data));
+  const metadataDirty = Boolean(metadataDraft && metadata.data
+    && JSON.stringify(metadataForSave(metadataDraft)) !== JSON.stringify(metadataForSave(metadata.data)));
 
   async function uploadFiles(files: FileList | null) {
     if (!files?.length) return;
@@ -686,10 +701,13 @@ export function LibraryPage() {
                   dirty={metadataDirty}
                   saving={saveMetadata.isPending}
                   reviewing={markReviewed.isPending}
-                  error={saveMetadata.error || markReviewed.error}
+                  reextracting={reextractAbstract.isPending}
+                  reextractResult={abstractReextractResult}
+                  error={saveMetadata.error || markReviewed.error || reextractAbstract.error}
                   onChange={setMetadataDraft}
                   onSave={() => saveMetadata.mutate({ paperId: selectedPaper.paper_id, value: metadataForSave(metadataDraft) })}
                   onReview={() => markReviewed.mutate({ paperId: selectedPaper.paper_id, value: metadataForSave(metadataDraft) })}
+                  onReextract={() => reextractAbstract.mutate(selectedPaper.paper_id)}
                 />
               ) : null}
               {tab === "markdown" ? <pre className="markdown-preview">{markdown.isPending ? text("正在加载…", "Loading…") : markdown.data}</pre> : null}

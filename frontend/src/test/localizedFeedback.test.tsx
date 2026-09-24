@@ -11,6 +11,12 @@ it("explains translation failures without exposing a technical code", () => {
   expect(diagnosticText("QUERY_TRANSLATION_FAILED: timeout", "zh-CN")).toContain("本次检索未开始");
   expect(diagnosticText("QUERY_TRANSLATION_FAILED: timeout", "en")).toContain("Search has not started");
 });
+it("explains bibliography resolution failures as recoverable actions", () => {
+  expect(diagnosticText("Selected bibliography candidate is unavailable or stale.", "zh-CN"))
+    .toContain("重新自动核验");
+  expect(diagnosticText("Bibliography record is missing required fields: title, authors.", "zh-CN"))
+    .toContain("现有结果已保留");
+});
 function Probe() {
   const [message, setMessage] = useLocalizedMessage();
   return <><button onClick={() => setMessage(["已保存", "Saved"])}>save</button><p role="status">{message}</p></>;

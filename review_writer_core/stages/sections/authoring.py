@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+from copy import deepcopy
 from difflib import SequenceMatcher
 
 
@@ -60,6 +61,45 @@ def prose_layout(text, claims):
             return [], ["unmapped_prose_requires_source_binding"]
         layout.append({"transition": gap})
     return layout, []
+
+
+def bind_discourse_gaps(paragraph):
+    """Retain exact prose, extending adjacent spans for mandatory semantic review.
+
+    This is mapping, not evidence verification: no free-text gap is certified as
+    navigation. Its scientific content must pass the existing source auditor.
+    Ambiguous/overlapping spans remain explicit repair targets.
+    """
+    if not isinstance(paragraph, dict):
+        return paragraph
+    text = normalized(paragraph.get("text"))
+    claims = paragraph.get("claims") or []
+    if not text or not claims or any(not isinstance(c, dict) for c in claims):
+        return paragraph
+    if not prose_layout(text, [{"claim_id": str(i), "claim": c.get("text")} for i, c in enumerate(claims)])[1]:
+        return paragraph
+    positions = []
+    end = 0
+    for claim in claims:
+        span = normalized(claim.get("text"))
+        if not span or text.count(span) != 1:
+            return paragraph
+        start = text.find(span)
+        if start < end:
+            return paragraph
+        positions.append((start, start + len(span)))
+        end = start + len(span)
+    result = deepcopy(paragraph)
+    for i, claim in enumerate(result["claims"]):
+        start, end = positions[i]
+        left = 0 if i == 0 else start
+        right = positions[i + 1][0] if i + 1 < len(positions) else len(text)
+        extended = text[left:right].strip()
+        if extended != normalized(claim.get("text")):
+            claim["text"] = extended
+            claim["review_reasons"] = list(dict.fromkeys([
+                *(claim.get("review_reasons") or []), "discourse_span_requires_source_review"]))
+    return result
 
 
 def retained_layout(layout, claim_ids):

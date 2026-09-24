@@ -166,6 +166,9 @@ def reusable_section_entries(entries, tasks, evidence_sections):
         output = entry["output"]
         from review_writer_core.stages.sections.source_writing import BINDING_CONTRACT
         source_review = entry["synthesis"].get("source_review") or {}
+        if source_review.get("unresolved"):
+            rejected[section_id] = "source_check_incomplete"
+            continue
         if (source_review.get("binding_contract") != BINDING_CONTRACT
                 and any(item.get("reason") == "missing_or_invalid_source_span"
                         for item in source_review.get("omitted") or [] if isinstance(item, dict))):

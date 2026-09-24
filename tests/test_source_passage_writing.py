@@ -6,8 +6,9 @@ from pathlib import Path
 import pytest
 
 from review_writer_core.stages.sections.source_writing import (
-    CONTRACT, write_from_sources, valid_source_claim,
+    CONTRACT, complete_cited_anchor_spans, write_from_sources, valid_source_claim,
 )
+from review_writer_core.model_gateway_client import DeferredModelCall
 from review_writer_core.stages.sections.coverage import reusable_section_entries
 from review_writer_api.domain_services.sections import SectionsService
 from review_writer_api.errors import WorkflowValidationError
@@ -38,6 +39,253 @@ def test_audited_rewrite_preserves_source_binding_without_an_extra_call():
     assert valid_source_claim(writing["claims"][0], {"a": source()})
     assert len(calls) == 2
     assert report["omitted"] == []
+
+
+@pytest.mark.parametrize("formula,plain", [
+    (r"$\mathrm { P d } ( \mathrm { P P h } _ { 3 } ) _ { 4 }$", "Pd(PPh3)4"),
+    (r"$\mathrm { C O } _ { 2 }$", "CO2"),
+    (r"$\mathrm { C o C l } _ { 2 }$", "CoCl2"),
+])
+def test_same_cited_passage_recovers_tex_formula_outside_short_quote(formula, plain):
+    passage = f"The reaction used {formula} to form the reported allene."
+    claim = f"The reaction used {plain} to form the reported allene."
+    evidence = [source(content=passage)]
+    calls = []
+    def model(_prompt, _schema, label):
+        calls.append(label)
+        if label == "section-source-writing":
+            return {"paragraphs": [{"claims": [{"text": claim, "claim_kind": "reported_finding",
+                "support_spans": [{"evidence_key": "E001", "quote": "The reaction used"}]}]}]}
+        return {"claims": [{"claim_id": "S01-p1-C01", "status": "supported", "text": "", "reason": ""}]}
+    writing, _, report = write_from_sources(
+        section_id="S01", task=task(), evidence=evidence, context="", call=model
+    )
+    assert writing["claims"][0]["claim"] == claim
+    assert writing["claims"][0]["evidence_refs"][0]["quote"] == passage
+    assert valid_source_claim(writing["claims"][0], {"a": evidence[0]})
+    assert report["unresolved"] == []
+    assert calls == ["section-source-writing", "section-used-claim-check"]
+
+
+def test_missing_anchor_in_cited_passage_repairs_a_supported_verdict():
+    passage = "A palladium catalyst afforded the allene in 92% yield."
+    claim = "Pd(PPh3)4 afforded the allene in 92% yield."
+    calls = []
+    def model(prompt, _schema, label):
+        calls.append(label)
+        if label == "section-source-writing":
+            return {"paragraphs": [{"claims": [{"text": claim, "claim_kind": "reported_finding",
+                "support_spans": [{"evidence_key": "E001", "quote": passage}]}]}]}
+        if label == "section-used-claim-check":
+            return {"claims": [{"claim_id": "S01-p1-C01", "status": "supported", "text": "", "reason": ""}]}
+        assert label == "section-source-content-repair"
+        assert "named chemical entity" in prompt
+        return {"claims": [{"claim_id": "S01-p1-C01", "status": "rewritten",
+                            "text": passage, "reason": "Use only the reported catalyst identity."}]}
+    writing, _, report = write_from_sources(
+        section_id="S01", task=task(), evidence=[source(content=passage)],
+        context="", call=model,
+    )
+    assert writing["claims"][0]["claim"] == passage
+    assert report["unresolved"] == []
+    assert calls == ["section-source-writing", "section-used-claim-check", "section-source-content-repair"]
+
+
+def test_unresolved_source_recheck_does_not_repeat_paid_repair_for_changed_verdict_wording():
+    passage = "A palladium catalyst afforded the allene in 92% yield."
+    claim = "Pd(PPh3)4 afforded the allene in 92% yield."
+    saved, calls = {}, []
+
+    def save(value):
+        saved.clear()
+        saved.update(deepcopy(value))
+
+    def model(_prompt, _schema, label):
+        calls.append(label)
+        if label == "section-source-writing":
+            return {"paragraphs": [{"claims": [{"text": claim, "claim_kind": "reported_finding",
+                "support_spans": [{"evidence_key": "E001", "quote": passage}]}]}]}
+        if label == "section-used-claim-check":
+            return {"claims": [{"claim_id": "S01-p1-C01", "status": "supported", "text": "",
+                                "reason": f"Source check {calls.count(label)}."}]}
+        assert label == "section-source-content-repair"
+        return {"claims": [{"claim_id": "S01-p1-C01", "status": "unresolved", "text": "",
+                            "reason": "Catalyst identity cannot be verified."}]}
+
+    args = dict(section_id="S01", task=task(), evidence=[source(content=passage)],
+                context="", call=model, save_state=save)
+    _, _, first = write_from_sources(**args)
+    assert first["unresolved"]
+    _, _, second = write_from_sources(**args, resume_state=deepcopy(saved))
+    assert second["unresolved"]
+    assert calls.count("section-source-writing") == 1
+    assert calls.count("section-used-claim-check") == 2
+    assert calls.count("section-source-content-repair") == 1
+
+
+def test_uncited_passage_cannot_supply_missing_anchor():
+    cited = source(content="A palladium catalyst afforded an allene.")
+    uncited = source("b", "B", "Pd(PPh3)4 was used in a separate study.")
+    refs = [{"evidence_key": "a", "quote": cited["content"]}]
+    checked, repairs = complete_cited_anchor_spans(
+        "Pd(PPh3)4 afforded an allene.", refs, {"a": cited, "b": uncited}
+    )
+    assert checked == refs
+    assert repairs == []
+
+
+def test_selective_anchor_check_repairs_legacy_incomplete_audit_and_resumes_same_request():
+    evidence = [source(content="An allene was obtained using a zinc catalyst.")]
+    good, bad = "An allene was obtained.", "ZnI2 afforded the allene in 98% yield."
+    saved, audit_prompts = {}, []
+    def save(value):
+        saved.clear()
+        saved.update(deepcopy(value))
+    def model(prompt, schema, label):
+        if label == "section-source-writing":
+            return {"paragraphs": [{"claims": [{"text": text, "claim_kind": "reported_finding",
+                "support_spans": [{"evidence_key": "a", "quote": evidence[0]["content"]}]}
+                for text in (good, bad)]}]}
+        return {"claims": [
+            {"claim_id": "S01-p1-C01", "status": "supported", "text": ""},
+            {"claim_id": "S01-p1-C02", "status": "narrowed",
+             "text": "A zinc catalyst was used to obtain the allene.", "reason": "Only catalyst class is supported."}]}
+    args = dict(section_id="S01", task=task(), evidence=evidence, context="",
+                audit_mode="selective", save_state=save)
+    write_from_sources(**args, call=model)
+    # Model the old checkpoint: a cached audit omitted the anchor-mismatched
+    # sentence, but a different sentence was verified successfully.
+    saved["accepted_claims"] = [c for c in saved["accepted_claims"] if c["claim_id"] == "S01-p1-C01"]
+    saved["audit"] = {"claims": [{"claim_id": "S01-p1-C01", "status": "supported", "text": ""}]}
+    saved["scientific_ids"] = []
+    saved["target_ids"] = ["S01-p1-C01"]
+    saved["repair_attempted"] = True
+    def deferred(prompt, schema, label):
+        assert label == "section-used-claim-check"
+        audit_prompts.append(prompt)
+        raise DeferredModelCall("anchor-audit")
+    with pytest.raises(DeferredModelCall):
+        write_from_sources(**args, call=deferred, resume_state=deepcopy(saved))
+    def resumed(prompt, schema, label):
+        assert label == "section-used-claim-check"
+        audit_prompts.append(prompt)
+        payload = json.loads(prompt[prompt.index('{"claims":'):])
+        assert [c["claim_id"] for c in payload["claims"]] == ["S01-p1-C02"]
+        assert payload["review_reasons"]["S01-p1-C02"] == ["source_anchor_mismatch"]
+        return model(prompt, schema, label)
+    writing, _, report = write_from_sources(**args, call=resumed, resume_state=deepcopy(saved))
+    assert audit_prompts[0] == audit_prompts[1]
+    assert len(writing["claims"]) == 2
+    assert not report["unresolved"]
+    assert valid_source_claim(writing["claims"][1], {"a": evidence[0]})
+
+
+@pytest.mark.parametrize("replacement", [
+    "The reaction afforded an allene in 82% yield using ZnI2.",
+    "An allene was obtained using ZnI2 in 82% yield.",
+])
+def test_source_value_correction_is_verified_and_publishable(replacement):
+    evidence = [source(content="The reaction afforded an allene in 82% yield using ZnI2.")]
+    writing, generated, report, _ = write(
+        evidence, text="The reaction afforded an allene in 98% yield using ZnBr2.",
+        audit_status="rewritten", replacement=replacement)
+    assert writing["claims"][0]["claim"] == replacement
+    assert report["narrowed"] and not report["unresolved"]
+    assert valid_source_claim(writing["claims"][0], {"a": evidence[0]})
+    package, built, synthesis, plan = bundle(writing, generated, evidence)
+    SectionsService._validate_academic_bundle(
+        {"tasks": [task()], "blueprint": {"schema_version": 2}}, built, synthesis, plan, package)
+
+
+@pytest.mark.parametrize("audit_mode", ["full", "selective"])
+@pytest.mark.parametrize("repair_mode", ["unresolved", "wrong_anchor", "missing", "duplicate"])
+def test_partial_scientific_failure_retains_verified_prose_not_protocol_errors(repair_mode, audit_mode):
+    evidence = [source(content="An allene was obtained. The catalyst is recorded as ZnI -promoted.")]
+    good, bad = "An allene was obtained.", "ZnI2 gave the allene in 98% yield."
+    calls = []
+    def model(prompt, schema, label):
+        calls.append(label)
+        if label == "section-source-writing":
+            return {"paragraphs": [{"claims": [{"text": text, "claim_kind": "reported_finding",
+                "support_spans": [{"evidence_key": "a", "quote": evidence[0]["content"]}]}
+                for text in (good, bad)]}]}
+        valid = {"claim_id": "S01-p1-C01", "status": "supported", "text": ""}
+        uncertain = {"claim_id": "S01-p1-C02", "status": "unresolved", "text": "",
+                     "reason": "The formula and yield cannot be verified."}
+        if label == "section-used-claim-check":
+            return {"claims": [valid, uncertain]}
+        assert label == "section-source-content-repair"
+        assert "SAME material, experiment" in prompt
+        assert "anchor_gaps" in prompt
+        if repair_mode == "missing":
+            return {"claims": []}
+        if repair_mode == "duplicate":
+            return {"claims": [uncertain, uncertain]}
+        if repair_mode == "wrong_anchor":
+            uncertain.update(status="rewritten", text=bad)
+        return {"claims": [uncertain]}
+    writing, generated, report = write_from_sources(
+        section_id="S01", task=task(), evidence=evidence, context="", call=model, audit_mode=audit_mode)
+    assert [c["claim"] for c in writing["claims"]] == [good]
+    if repair_mode in {"missing", "duplicate"}:
+        assert report["unresolved"] and not report["omitted"]
+    else:
+        assert not report["unresolved"]
+        assert report["omitted"][0]["reason"] == "source_support_unconfirmed"
+        assert report["omitted"][0]["proposed_claim"]["claim"] == bad
+        assert writing["section_review"]["status"] == "needs_revision"
+        package, built, synthesis, plan = bundle(writing, generated, evidence)
+        synthesis["sections"][0]["source_review"] = report
+        SectionsService._validate_academic_bundle(
+            {"tasks": [task()], "blueprint": {"schema_version": 2}}, built, synthesis, plan, package)
+    assert calls.count("section-source-content-repair") == 1
+
+
+@pytest.mark.parametrize("audit_mode", ["full", "selective"])
+def test_partial_chapter_finishes_as_limited_evidence_and_reuses_checkpoint(tmp_path, monkeypatch, audit_mode):
+    project = tmp_path / "review-projects/demo"
+    stage, planning = project / "02_section_drafting", project / "01_matrix_outline"
+    stage.mkdir(parents=True)
+    planning.mkdir()
+    evidence = [source()]
+    payloads = {stage / "section_tasks.json": [task()],
+                stage / "section_evidence.json": {"sections": [{"section_id": "S01", "retrieval_mode": "lexical", "hits": evidence}]},
+                planning / "literature_matrix.json": {"rows": [{"paper_id": "A", "title": "Catalyst study"}]},
+                planning / "section_blueprint.json": {"review_topic": "Catalysts", "schema_version": 2, "sections": [task()]}}
+    for path, payload in payloads.items():
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(pipeline.sys, "argv", [str(SCRIPT), "--review-root", str(tmp_path), "--project-id", "demo", "--api-key", "test", "--model", "test", "--audit-mode", audit_mode])
+    monkeypatch.setattr(pipeline, "load_dotenv", lambda *a: {})
+    monkeypatch.setattr(pipeline, "load_blueprint_rule_pack", lambda *a: "Use evidence")
+    monkeypatch.setattr(pipeline, "load_cross_study_synthesis_skill", lambda *a: "Use evidence")
+    calls = []
+    bad = "ZnI2 gave 99% yield."
+    def model(prompt, schema, *args, label, **kwargs):
+        calls.append(label)
+        if label == "section-source-writing":
+            return {"paragraphs": [{"role": "anchor_case", "claims": [
+                {"text": text, "claim_kind": "reported_finding", "support_spans": [
+                    {"evidence_key": "a", "quote": evidence[0]["content"]}]}
+                for text in (evidence[0]["content"], bad)]}]}
+        verdict = {"claim_id": "S01-p1-C02", "status": "unresolved", "text": "",
+                   "reason": "No source supports this formula or yield."}
+        return {"claims": [verdict] if label == "section-source-content-repair" else [
+            {"claim_id": "S01-p1-C01", "status": "supported", "text": ""}, verdict]}
+    monkeypatch.setattr(pipeline, "call_structured_llm", model)
+    assert pipeline.main() == 0
+    checkpoint = json.loads((stage / "section_checkpoints.json").read_text(encoding="utf-8"))
+    entry = checkpoint["entries"]["S01"]
+    assert entry["output"]["generation_mode"] == "limited_evidence"
+    assert "ZnI2" not in entry["output"]["draft_md"]
+    assert "90%" in entry["output"]["draft_md"]
+    assert entry["synthesis"]["source_review"]["omitted"][0]["disposition"] == "withheld"
+    package = {"sections": [{"section_id": "S01", "retrieval_mode": "lexical", "hits": evidence}], "evidence_registry": evidence}
+    SectionsService._validate_academic_bundle(
+        {"tasks": [task()], "blueprint": {"schema_version": 2}},
+        {"sections": [entry["output"]]}, {"sections": [entry["synthesis"]]},
+        {"planning_mode": "evidence_first_source_writing", "sections": [entry["writing"]]}, package)
+    assert pipeline.main() == 0
+    assert calls == ["section-source-writing", "section-used-claim-check", "section-source-content-repair"]
 
 
 def test_section_thread_and_presentation_reach_writer_and_style_does_not_reject_facts():
@@ -337,6 +585,39 @@ def test_invalid_replacement_rechecks_original_once_instead_of_deleting_it():
     assert calls.count("section-source-content-repair") == 1
 
 
+def test_deferred_content_repair_resumes_without_discarding_the_paid_result():
+    saved, repair_prompts = {}, []
+
+    def save(value):
+        saved.clear()
+        saved.update(deepcopy(value))
+
+    def first_call(prompt, _schema, label):
+        if label == "section-source-writing":
+            return {"paragraphs": [{"claims": [prose_claim(source()["content"], source()["content"])]}]}
+        if label == "section-used-claim-check":
+            return {"claims": [{"claim_id": "S01-p1-C01", "status": "narrowed",
+                                "text": "The yield was 99%.", "reason": "Check result."}]}
+        assert label == "section-source-content-repair"
+        repair_prompts.append(prompt)
+        raise DeferredModelCall("model-child")
+
+    arguments = dict(section_id="S01", task=task(), evidence=[source()], context="", save_state=save)
+    with pytest.raises(DeferredModelCall):
+        write_from_sources(**arguments, call=first_call)
+    assert saved["content_repair_attempted"] and saved["content_repair_pending"]
+
+    def resumed_call(prompt, _schema, label):
+        assert label == "section-source-content-repair"
+        repair_prompts.append(prompt)
+        return {"claims": [{"claim_id": "S01-p1-C01", "status": "supported", "text": "", "reason": ""}]}
+
+    writing, _, _ = write_from_sources(**arguments, call=resumed_call, resume_state=saved)
+    assert len(repair_prompts) == 2 and repair_prompts[0] == repair_prompts[1]
+    assert writing["claims"][0]["source_verification"]["status"] == "supported"
+    assert not saved.get("content_repair_pending")
+
+
 def test_result_records_are_only_kept_for_actual_supported_claims():
     records = [{"evidence_key": "a", "object": "Catalyst A", "conditions": "25 C; 60 minutes", "result": "90%", "units": "%"}]
     writing, _, report, calls = write(records=records)
@@ -557,12 +838,69 @@ def test_selective_review_sends_only_concrete_uncertainties():
     assert [c["source_verification"]["status"] for c in writing["claims"]] == ["program_checked", "supported"]
 
 
+def test_review_reason_order_keeps_delegated_request_stable():
+    sentences = [f"Catalyst A was studied under condition {index}." for index in range(8)]
+    evidence = [source(content=" ".join(sentences))]
+    paragraphs = [{"claims": [prose_claim(sentence, sentence, reasons=["Check attribution."])
+                              for sentence in sentences]}]
+    model, calls = selective_model(evidence, paragraphs)
+    write_from_sources(section_id="S01", task=task(), evidence=evidence,
+                       context="", call=model, audit_mode="selective")
+    prompts = [prompt for label, prompt in calls if label == "section-used-claim-check"]
+    assert len(prompts) == 1
+    payload = json.loads(prompts[0][prompts[0].index('{"claims":'):])
+    claim_ids = [claim["claim_id"] for claim in payload["claims"]]
+    assert len(claim_ids) == len(sentences)
+    assert list(payload["review_reasons"]) == sorted(claim_ids)
+
+
+def test_deferred_audit_resumes_the_same_paid_request():
+    evidence = [source()]
+    paragraph = {"claims": [prose_claim(evidence[0]["content"], evidence[0]["content"])]}
+    saved, audit_prompts = {}, []
+
+    def save(value):
+        saved.clear()
+        saved.update(deepcopy(value))
+
+    def first_call(prompt, _schema, label):
+        if label == "section-source-writing":
+            return {"paragraphs": [paragraph]}
+        audit_prompts.append(prompt)
+        raise DeferredModelCall("model-child")
+
+    arguments = dict(section_id="S01", task=task(), evidence=evidence,
+                     context="", audit_mode="full", save_state=save)
+    with pytest.raises(DeferredModelCall):
+        write_from_sources(**arguments, call=first_call)
+    assert saved["proposed"]["paragraphs"] == [paragraph]
+    assert saved["repair_attempted"] and saved["audit_pending"]
+
+    def resumed_call(prompt, _schema, label):
+        assert label == "section-used-claim-check"
+        audit_prompts.append(prompt)
+        payload = json.loads(prompt[prompt.index('{"claims":'):])
+        return {"claims": [{"claim_id": claim["claim_id"], "status": "supported",
+                            "text": "", "reason": ""} for claim in payload["claims"]]}
+
+    writing, _, _ = write_from_sources(**arguments, call=resumed_call, resume_state=saved)
+    assert len(audit_prompts) == 2 and audit_prompts[0] == audit_prompts[1]
+    assert writing["claims"][0]["source_verification"]["status"] == "supported"
+    assert not saved.get("audit_pending")
+
+
 @pytest.mark.parametrize("prefix", ["The mechanism is universal. ", "We next compare the methods at 99 C. "])
 def test_unmapped_science_is_not_allowed_as_a_transition(prefix):
     text = "Catalyst A was studied at 25 C."
-    model, _ = selective_model([source()], [{"text": prefix + text, "claims": [prose_claim(text, source()["content"])]}])
+    def model(prompt, schema, label):
+        if label == "section-source-writing":
+            return {"paragraphs": [{"text": prefix + text, "claims": [prose_claim(text, source()["content"])]}]}
+        assert label == "section-used-claim-check"
+        assert "discourse_span_requires_source_review" in prompt
+        return {"claims": [{"claim_id": "S01-p1-C01", "status": "narrowed", "text": text,
+                            "reason": "The prefixed assertion is not supported."}]}
     writing, generated, report = write_from_sources(section_id="S01", task=task(), evidence=[source()], context="", call=model, audit_mode="selective")
-    assert report["prose_issues"][0]["reason"] == "unmapped_prose_requires_source_binding"
+    assert report["checked_claim_count"] == 1
     assert prefix.strip() not in bundle(writing, generated, [source()])[1]["sections"][0]["paragraphs"][0]["text"]
 
 
@@ -679,7 +1017,10 @@ def test_local_mapping_repair_recovers_prose_and_quote_and_is_checkpointed():
         if label == "section-source-writing":
             return {"paragraphs": [broken]}
         if label == "section-source-mapping-repair":
-            return {"repairs": [{"paragraph_index": 0, "paragraph": repaired}]}
+            from review_writer_core.stages.sections.source_writing import fingerprint
+            return {"claim_repairs": [{"paragraph_index": 0, "claim_index": 0,
+                "input_fingerprint": fingerprint(broken["claims"][0]),
+                "support_spans": repaired["claims"][0]["support_spans"], "result_context": None}]}
         return {"claims": [{"claim_id": "S01-p1-C01", "status": "supported", "text": "", "reason": ""}]}
     args = dict(section_id="S01", task=task(), evidence=evidence, context="", call=model, save_state=save)
     result = write_from_sources(**args)
@@ -688,6 +1029,45 @@ def test_local_mapping_repair_recovers_prose_and_quote_and_is_checkpointed():
     assert valid_source_claim(result[0]["claims"][0], {"a": evidence[0]})
     assert write_from_sources(**args, resume_state=deepcopy(saved)) == result
     assert calls == ["section-source-writing", "section-source-mapping-repair", "section-used-claim-check"]
+
+
+def test_deferred_mapping_repair_resumes_the_same_paid_request():
+    evidence = [source()]
+    text = "After 60 minutes at 25 C, Catalyst A achieved 90% pollutant degradation."
+    broken = {"text": text, "claims": [prose_claim(text, "Incorrect copied quote")]}
+    repaired = {"text": text, "claims": [prose_claim(text, evidence[0]["content"])]}
+    saved, repair_prompts = {}, []
+
+    def save(value):
+        saved.clear()
+        saved.update(deepcopy(value))
+
+    def first_call(prompt, _schema, label):
+        if label == "section-source-writing":
+            return {"paragraphs": [broken]}
+        assert label == "section-source-mapping-repair"
+        repair_prompts.append(prompt)
+        raise DeferredModelCall("model-child")
+
+    arguments = dict(section_id="S01", task=task(), evidence=evidence, context="", save_state=save)
+    with pytest.raises(DeferredModelCall):
+        write_from_sources(**arguments, call=first_call)
+    assert saved["mapping_repair_attempted"] and saved["mapping_repair_pending"]
+
+    def resumed_call(prompt, _schema, label):
+        if label == "section-source-mapping-repair":
+            repair_prompts.append(prompt)
+            from review_writer_core.stages.sections.source_writing import fingerprint
+            return {"claim_repairs": [{"paragraph_index": 0, "claim_index": 0,
+                "input_fingerprint": fingerprint(broken["claims"][0]),
+                "support_spans": repaired["claims"][0]["support_spans"], "result_context": None}]}
+        assert label == "section-used-claim-check"
+        return {"claims": [{"claim_id": "S01-p1-C01", "status": "supported", "text": "", "reason": ""}]}
+
+    writing, _, _ = write_from_sources(**arguments, call=resumed_call, resume_state=saved)
+    assert len(repair_prompts) == 2 and repair_prompts[0] == repair_prompts[1]
+    assert writing["claims"][0]["claim"] == text
+    assert not saved.get("mapping_repair_pending")
 
 
 def test_bad_table_cell_does_not_remove_supported_prose():
@@ -727,7 +1107,7 @@ def test_optional_mapping_repair_malformed_response_preserves_valid_claims(malfo
     text = "Catalyst A was studied at 25 C."
     def model(prompt, schema, label):
         if label == "section-source-writing":
-            return {"paragraphs": [{"text": "The mechanism is universal. " + text,
+            return {"paragraphs": [{"text": "A differently worded paragraph without the supplied claim span.",
                                     "claims": [prose_claim(text, source()["content"])]}]}
         if label == "section-source-mapping-repair":
             return malformed
@@ -737,27 +1117,46 @@ def test_optional_mapping_repair_malformed_response_preserves_valid_claims(malfo
     assert report["prose_issues"]
 
 
-def test_planned_table_record_is_recovered_and_semantically_audited():
+def test_missing_optional_table_record_does_not_rewrite_supported_prose():
     text = source()["content"]
     original = {"text": text, "claims": [prose_claim(text, text)]}
-    repaired = deepcopy(original)
-    repaired["claims"][0]["result_context"] = [{"evidence_key": "E001", "object": "Catalyst A",
-        "conditions": "25 C, 60 minutes", "result": "90% pollutant degradation", "units": ""}]
+    calls = []
+    def model(prompt, schema, label):
+        calls.append(label)
+        assert label == "section-source-writing"
+        return {"paragraphs": [original]}
+    writing, _, report = write_from_sources(section_id="S01", task={**task(), "paper_roles": [
+        {"paper_id": "A", "presentation": "table"}]}, evidence=[source()], context="", call=model, audit_mode="selective")
+    assert not writing["claims"][0]["result_context"]
+    assert report["checked_claim_count"] == 0
+    assert report["mapping_repair_diagnostics"]["comparison_papers_without_records"] == ["A"]
+    assert report["omitted"] == []
+    assert calls == ["section-source-writing"]
+
+
+@pytest.mark.parametrize("navigation", [
+    "The present review focuses on the axial-chiral subset.",
+    "The comparison proceeds by substrate family and tracks product class and substrate scope.",
+    "本节按底物类别组织讨论，并比较不同方法的适用范围。",
+])
+def test_navigation_preserves_prose_without_mapping_model_and_still_gets_audited(navigation):
+    text = source()["content"]
+    paragraph = {"text": text + " " + navigation, "claims": [prose_claim(text, text)]}
+    original = deepcopy(paragraph)
     calls = []
     def model(prompt, schema, label):
         calls.append(label)
         if label == "section-source-writing":
-            return {"paragraphs": [original]}
-        if label == "section-source-mapping-repair":
-            return {"repairs": [{"paragraph_index": 0, "paragraph": repaired}]}
-        assert "source_mapping_repaired" in prompt
+            return {"paragraphs": [paragraph]}
+        assert label == "section-used-claim-check"
+        assert "discourse_span_requires_source_review" in prompt
         return {"claims": [{"claim_id": "S01-p1-C01", "status": "supported", "text": "", "reason": ""}]}
-    writing, _, report = write_from_sources(section_id="S01", task={**task(), "paper_roles": [
-        {"paper_id": "A", "presentation": "table"}]}, evidence=[source()], context="", call=model, audit_mode="selective")
-    assert writing["claims"][0]["result_context"]
+    writing, _, report = write_from_sources(section_id="S01", task=task(), evidence=[source()],
+        context="", call=model, audit_mode="selective")
+    assert paragraph == original
+    assert writing["claims"][0]["claim"] == original["text"]
     assert report["checked_claim_count"] == 1
-    assert report["omitted"] == []
-    assert calls == ["section-source-writing", "section-source-mapping-repair", "section-used-claim-check"]
+    assert calls == ["section-source-writing", "section-used-claim-check"]
 
 
 

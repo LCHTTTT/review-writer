@@ -32,7 +32,7 @@ from review_writer_api.errors import (
 from review_writer_api.figure_rules import image_size
 from review_writer_api.job_service import job_payload as _job_payload
 from review_writer_api.mineru_artifacts import mineru_storage_paths
-from review_writer_api.security import Permission, Principal
+from review_writer_api.security import Permission, Principal, Role
 from review_writer_api.workflow_models import LibraryArtifact, LibraryPaper
 from review_writer_api.workflow_repository import ArtifactRecord, WorkflowRepository
 from review_writer_core.review_structure import (
@@ -1580,15 +1580,8 @@ class SectionsService(ArtifactBackedService):
             output.append(task)
         return output
 
-    def hydrate_tasks_with_evidence(
-        self,
-        principal: Principal,
-        project_id: str,
-        tasks: list[dict[str, Any]],
-        matrix_rows: list[dict[str, Any]],
-    ) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, LibraryPaper]]:
-        """Build the one task/evidence projection used before and during jobs."""
-
+    def _generation_catalog(self, principal, tasks, matrix_rows):
+        """Cheap membership validation, without passage or vector retrieval."""
         matrix_by_id = {
             str(row.get("paper_id") or ""): row
             for row in matrix_rows
@@ -1610,6 +1603,17 @@ class SectionsService(ArtifactBackedService):
                 "Blueprint contains papers that are missing from the current Matrix or active Library.",
                 details={"paper_ids": missing},
             )
+        return matrix_by_id, catalog
+
+    def hydrate_tasks_with_evidence(
+        self,
+        principal: Principal,
+        project_id: str,
+        tasks: list[dict[str, Any]],
+        matrix_rows: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, LibraryPaper]]:
+        """Build the one task/evidence projection used before and during jobs."""
+        matrix_by_id, catalog = self._generation_catalog(principal, tasks, matrix_rows)
         evidence_package = self._evidence_package(
             principal,
             project_id,
@@ -1641,7 +1645,7 @@ class SectionsService(ArtifactBackedService):
         return hydrated, evidence_package, catalog
 
     def generation_payload(
-        self, principal: Principal, project_id: str
+        self, principal: Principal, project_id: str, *, defer_evidence: bool = False
     ) -> dict[str, Any]:
         principal.require(Permission.PROJECT_WRITE)
         project = self._owned_project(principal, project_id)
@@ -1680,6 +1684,18 @@ class SectionsService(ArtifactBackedService):
         matrix_rows = matrix.get("rows") if isinstance(matrix, dict) else None
         if not isinstance(matrix_rows, list):
             raise WorkflowConflict("The current Matrix is invalid.")
+        if defer_evidence:
+            self._generation_catalog(principal, tasks, matrix_rows)
+            state = self.repository.get_stage_state(principal.user_id, project_id, "sections")
+            return {
+                "project_id": project_id,
+                "source_blueprint_artifact_id": blueprint_artifact.id,
+                "source_matrix_artifact_id": matrix_artifact.id,
+                "source_outline_artifact_id": outline_artifact.id,
+                "tasks": tasks,
+                "expected_sections_revision": state.revision if state else 0,
+                "evidence_preparation_pending": True,
+            }
         tasks, evidence_package, catalog = self.hydrate_tasks_with_evidence(
             principal, project_id, tasks, matrix_rows
         )
@@ -1752,6 +1768,31 @@ class SectionsService(ArtifactBackedService):
                 for paper_id in assigned
             },
         }
+
+    def prepare_generation_job(self, context, payload):
+        """Prepare evidence once per job, in its existing disposable staging area."""
+        principal = Principal(context.user_id, frozenset({Role.USER}))
+        project_id = str(context.project_id)
+        self.validate_generation_inputs(principal, project_id, payload)
+        directory = self.artifacts.workspace_manager.trusted_user_directory(
+            context.user_id, ".review-writer", "job-staging", str(uuid.UUID(context.job_id))
+        )
+        cache = directory / "prepared-section-input.json"
+        if cache.is_file():
+            prepared = json.loads(cache.read_text(encoding="utf-8"))
+            self.validate_generation_inputs(principal, project_id, prepared)
+        else:
+            context.report_progress(0, len(payload.get("tasks") or []))
+            context.report_partial_result({"section_progress": {"phase": "preparing_evidence"}})
+            prepared = self.generation_payload(principal, project_id)
+            self.validate_generation_inputs(principal, project_id, payload)
+            context.checkpoint()
+            temporary = directory / f"prepared-section-input-{uuid.uuid4().hex}.tmp"
+            temporary.write_text(json.dumps(prepared, ensure_ascii=False), encoding="utf-8")
+            temporary.replace(cache)
+        return {**payload, **prepared,
+                "expected_sections_revision": payload.get("expected_sections_revision", prepared.get("expected_sections_revision", 0)),
+                "evidence_preparation_pending": False}
 
     @staticmethod
     def _validate_academic_bundle(

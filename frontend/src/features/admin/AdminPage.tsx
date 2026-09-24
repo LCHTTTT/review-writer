@@ -26,6 +26,8 @@ import { ErrorState } from "../../components/ErrorState";
 import { useUiText } from "../../i18n/useUiText";
 import { SystemErrors } from "./SystemErrors";
 import { StorageMaintenance } from "./StorageMaintenance";
+import { ModelConcurrencyPanel } from "./ModelConcurrencyPanel";
+import { WorkerStatusPanel } from "./WorkerStatusPanel";
 
 type ProviderDraft = {
   base_url: string;
@@ -407,6 +409,8 @@ export function AdminPage() {
       </div> : null}
 
       {visited.has("activity") ? <div id="admin-activity" className="admin-content-panel" hidden={section !== "activity"}>
+      <WorkerStatusPanel active={section === "activity"} />
+      <ModelConcurrencyPanel active={section === "activity"} />
       <StorageMaintenance active={section === "activity"} />
       <SystemErrors active={section === "activity"} />
       <section className="surface admin-audit-panel">

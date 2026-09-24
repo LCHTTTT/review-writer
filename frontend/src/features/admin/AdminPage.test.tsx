@@ -13,6 +13,8 @@ const catalog = { revision: 1, default_tier: "m1", items: [{ id: "m1", model: "m
 let client: QueryClient;
 beforeEach(() => {
   vi.mocked(apiRequest).mockImplementation(async (url, options) => {
+    if (url === "/api/v1/admin/workers") return { paused_queues: { scientific: false, image: false, ingest: false, document: false, bibliography: false }, workers: [], queue_counts: {} };
+    if (url === "/api/v1/admin/model-concurrency") return { limits: { text: { global: 8, user: 1 }, image: { global: 1, user: 1 }, embedding: { global: 2, user: 1 } }, version: 0, updated_at: null };
     if (options?.method === "PUT") return { ...providers[0], ...JSON.parse(String(options.body)) };
     if (options?.method === "POST") return {};
     if (url === "/api/v1/me") return { user_id: "admin" };

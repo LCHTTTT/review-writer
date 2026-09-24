@@ -18,6 +18,14 @@ class HealthResponse(BaseModel):
     components: dict[str, str] = Field(default_factory=dict)
 
 
+class AdminConcurrencyUpdateRequest(BaseModel):
+    limits: dict[str, dict[str, int]]
+
+
+class AdminQueuePauseRequest(BaseModel):
+    paused: bool
+
+
 class BrowserAuthConfigResponse(BaseModel):
     enabled: bool
     registration_enabled: bool
@@ -135,8 +143,15 @@ class ModelCatalogResponse(BaseModel):
     revision: int = 0
 
 
+class ModelChannelResponse(BaseModel):
+    connection_id: str = Field(min_length=1, max_length=64)
+    model: str = Field(min_length=1, max_length=255)
+    wire_api: str = Field(default="", pattern="^(|responses|chat-completions)$")
+
+
 class AdminModelTierResponse(ModelTierResponse):
     connection_id: str = Field(default="default", min_length=1, max_length=64)
+    channels: list[ModelChannelResponse] = Field(default_factory=list, max_length=16)
 
 
 class AdminModelCatalogResponse(ModelCatalogResponse):
@@ -144,6 +159,7 @@ class AdminModelCatalogResponse(ModelCatalogResponse):
 
 
 class TextConnectionUpdateRequest(BaseModel):
+    max_concurrency: int | None = Field(default=None, ge=1, le=32)
     name: str = Field(min_length=1, max_length=100)
     base_url: str = Field(min_length=1, max_length=2048)
     wire_api: str = Field(pattern="^(responses|chat-completions)$")
@@ -174,6 +190,13 @@ class ModelGatewayResultResponse(BaseModel):
     error: dict[str, Any] | None = None
     status: str = Field(pattern="^(running|succeeded|failed)$")
     result: ModelGatewayResponse | None = None
+
+
+class ModelDelegationResponse(BaseModel):
+    model_job_id: str
+    status: str
+    output_text: str = ""
+    error: str = ""
 
 
 class EmbeddingGatewayRequest(BaseModel):
@@ -400,6 +423,8 @@ class JobResponse(BaseModel):
     scope: str
     job_type: str
     status: str
+    next_run_at: str | None = None
+    queue_reason: str = ""
     result: dict
     progress_current: int
     progress_total: int
