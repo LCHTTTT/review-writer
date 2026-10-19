@@ -32,14 +32,18 @@ export function placeKeywordsAfterAbstract(content: string) {
   return clean.slice(0, at).trimEnd() + "\n\n" + KEYWORDS_SLOT + "\n\n" + clean.slice(at);
 }
 
-export function EditableManuscript({ content, keywords, paragraphs, userId, projectId, revision, disabled, refresh, onEditingChange }: {
+export function EditableManuscript({ content, keywords, paragraphs, userId, projectId, revision, disabled, refresh, onEditingChange, staleParagraphIds }: {
   content: string; paragraphs: DialogueParagraph[]; userId: string; projectId: string; revision: number;
   keywords?: ReactNode;
   disabled?: boolean; refresh: () => Promise<unknown>; onEditingChange: (key: string, dirty: boolean) => void;
+  staleParagraphIds?: string[];
 }) {
+  const stale = new Set(staleParagraphIds || []);
   return <div className="draft-editable-manuscript">{manuscriptSegments(keywords ? placeKeywordsAfterAbstract(content) : content, paragraphs).map((part, i) =>
     part.paragraph ? <ParagraphManualEditor key={part.paragraph.paragraph_key} paragraph={part.paragraph}
-      displayText={part.text} projectId={projectId} revision={revision} disabled={disabled} refresh={refresh}
+      displayText={part.text} projectId={projectId} revision={revision}
+      disabled={disabled || stale.has(part.paragraph.paragraph_id) || stale.has(part.paragraph.paragraph_key)}
+      refresh={refresh}
       scratchKey={`${userId}:${projectId}:${part.paragraph.paragraph_key}:manual`}
       onEditingChange={dirty => onEditingChange(part.paragraph!.paragraph_key, dirty)} /> :
       <Fragment key={`static-${i}`}>{part.text.split(KEYWORDS_SLOT).map((chunk, index) => <Fragment key={index}>

@@ -75,7 +75,7 @@ def matrix_live_payload(
         "current": max(0, int(status.get("current") or 0)),
         "total": max(0, int(status.get("total") or 0)),
         "current_paper_id": str(status.get("current_paper_id") or ""),
-        "active_paper_ids": [str(item) for item in status.get("active_paper_ids") or [] if str(item)][:3],
+        "active_paper_ids": [str(item) for item in status.get("active_paper_ids") or [] if str(item)],
         "target_axis_ids": [
             str(item) for item in status.get("target_axis_ids") or [] if str(item)
         ],

@@ -24,6 +24,14 @@ type SectionProgressResult = {
   failed_sections?: FailedSection[];
   evidence_hit_count?: number;
   evidence_paper_count?: number;
+  prepared_section_count?: number;
+  preparation_total?: number;
+  retrieval_count?: number;
+  reused_prepared_sections?: number;
+  preparation_step?: string;
+  query_embedding_ready?: number;
+  query_embedding_total?: number;
+  semantic_status?: string;
 };
 
 function progressResult(job?: Job): SectionProgressResult {
@@ -36,10 +44,13 @@ function progressResult(job?: Job): SectionProgressResult {
 export function SectionJobProgress({ job }: { job: Job }) {
   const { text } = useUiText();
   const [preview, setPreview] = useState<{ jobId: string; sectionId: string }>();
+  const live = progressResult(job);
   const total = Math.max(0, Number(job.progress_total || 0));
   const current = Math.max(0, Math.min(Number(job.progress_current || 0), total || Number.MAX_SAFE_INTEGER));
-  const percentage = total > 0 ? Math.round((current / total) * 100) : undefined;
-  const live = progressResult(job);
+  const preparing = job.status === "running" && live.phase === "preparing_evidence";
+  const displayTotal = preparing ? Math.max(0, Number(live.preparation_total || total)) : total;
+  const displayCurrent = preparing ? Math.min(displayTotal, Math.max(0, Number(live.prepared_section_count || 0))) : current;
+  const percentage = displayTotal > 0 ? Math.round((displayCurrent / displayTotal) * 100) : undefined;
   const draftedCount = Math.min(total, new Set(live.drafted_section_ids || []).size);
   const completed = Array.isArray(live.completed_sections) ? live.completed_sections : [];
   const failed = Array.isArray(live.failed_sections) ? live.failed_sections : [];
@@ -88,6 +99,17 @@ export function SectionJobProgress({ job }: { job: Job }) {
         ? text("章节处理完成，部分章节暂不生成", "Sections processed; some have no prose")
         : text("章节正文已全部生成", "All section prose generated");
       detail = text("正在整理章节报告和图像候选。", "Finalizing the report and figure candidates.");
+    } else if (live.phase === "preparing_evidence" && live.preparation_step === "query_embeddings") {
+      title = text("正在批量准备检索问题", "Preparing retrieval queries in batches");
+      detail = text(`已完成 ${live.query_embedding_ready || 0}/${live.query_embedding_total || 0} 个问题的向量准备；相同问题会复用，不逐篇重复调用。`,
+        `${live.query_embedding_ready || 0}/${live.query_embedding_total || 0} query vectors ready; identical queries are reused across papers.`);
+    } else if (live.phase === "preparing_evidence") {
+      title = live.current_heading
+        ? text(`正在准备章节证据：${live.current_heading}`, `Preparing section evidence: ${live.current_heading}`)
+        : text("正在准备章节证据", "Preparing section evidence");
+      detail = text(`证据已准备 ${live.prepared_section_count || 0}/${live.preparation_total || total} 章；本次已检索 ${live.retrieval_count || 0} 次，复用 ${live.reused_prepared_sections || 0} 章。正文尚未开始生成。`,
+        `Evidence ready for ${live.prepared_section_count || 0}/${live.preparation_total || total} sections; ${live.retrieval_count || 0} retrievals this attempt, ${live.reused_prepared_sections || 0} sections reused. Prose generation has not started.`);
+      if (live.semantic_status === "degraded") detail += text(" 语义检索暂不可用，本次保留原文关键词检索结果。", " Semantic retrieval is unavailable; source keyword evidence is retained.");
     } else if (live.active_sections?.length) {
       title = text(`正在处理 ${live.active_sections.length} 个章节`, `Processing ${live.active_sections.length} sections`);
       detail = live.active_sections.map(section => `${section.heading} · ${section.phase === "reviewing"
@@ -130,15 +152,16 @@ export function SectionJobProgress({ job }: { job: Job }) {
     detail = text("服务中断后可重新启动章节任务。", "Restart the section job after the service interruption.");
   }
 
-  const counter = total > 0 ? `${current}/${total}` : text("准备中", "Preparing");
+  const counter = displayTotal > 0 ? `${displayCurrent}/${displayTotal}` : text("准备中", "Preparing");
+  const progressLabel = preparing ? text("章节证据准备进度", "Section evidence preparation progress") : text("章节生成进度", "Section generation progress");
 
   return (
     <section className={`section-job-progress ${job.status} ${active && !total ? "indeterminate" : ""}`} role="status" aria-live="polite" aria-atomic="true">
-      <header><div><span>{text("章节生成进度", "Section generation progress")}</span><strong>{title}</strong></div><em>{counter}</em></header>
+      <header><div><span>{progressLabel}</span><strong>{title}</strong></div><em>{counter}</em></header>
       <div
         className="section-job-progress-track"
         role="progressbar"
-        aria-label={text("章节生成进度", "Section generation progress")}
+        aria-label={progressLabel}
         aria-valuemin={total ? 0 : undefined}
         aria-valuemax={total ? 100 : undefined}
         aria-valuenow={percentage}

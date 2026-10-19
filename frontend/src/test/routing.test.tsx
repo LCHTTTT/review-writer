@@ -60,8 +60,40 @@ describe("public and authenticated routing", () => {
 
     renderApp("/");
 
-    expect(await screen.findByRole("heading", { name: "从文献证据到可交付终稿，始终保持可追溯。" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "从化学文献到综述，读得清楚，写得有据。" })).toBeInTheDocument();
     expect(screen.getAllByRole("link", { name: "进入工作台" })[0]).toHaveAttribute("href", "/workspace");
+  });
+
+  it("shows the public bilingual guide without signing in", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async input => {
+      const path = requestPath(input);
+      if (path === "/api/v1/auth/config") return jsonResponse({ enabled: true, registration_enabled: true });
+      if (path === "/api/v1/me") return jsonResponse({ detail: "Not authenticated" }, 401);
+      throw new Error(`Unexpected request: ${path}`);
+    });
+    renderApp("/guide#quick-start");
+    expect(await screen.findByRole("heading", { name: "从第一个项目到综述终稿" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: "开始创建项目" })).toHaveAttribute("href", "/login?next=%2Fworkspace%23create-project");
+    expect(screen.getByRole("link", { name: /前往终稿审计与导出/ })).toHaveAttribute("href", "/final");
+    fireEvent.click(screen.getByRole("button", { name: "EN" }));
+    expect(screen.getByRole("heading", { name: "From your first project to the final review" })).toBeInTheDocument();
+    expect(document.documentElement.lang).toBe("en");
+    expect(screen.getByRole("link", { name: /Go to Paper analysis and outline/ })).toHaveAttribute("href", "/planning?view=reading");
+  });
+
+  it("keeps the selected project in guide stage links", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async input => {
+      const path = requestPath(input);
+      if (path === "/api/v1/auth/config") return jsonResponse({ enabled: true, registration_enabled: true });
+      if (path === "/api/v1/me") return jsonResponse(principal);
+      throw new Error(`Unexpected request: ${path}`);
+    });
+    renderApp("/guide?project=project-1");
+    expect(await screen.findByRole("heading", { name: "从第一个项目到综述终稿" })).toBeInTheDocument();
+    expect(screen.getByRole("link", { name: /前往文献库/ })).toHaveAttribute("href", "/library?project=project-1");
+    expect(screen.getByRole("link", { name: /前往文献分析与大纲/ })).toHaveAttribute("href", "/planning?view=reading&project=project-1");
+    expect(screen.getByRole("link", { name: "开始创建项目" })).toHaveAttribute("href", "/workspace#create-project");
+    expect(document.querySelector("details.guide-toc-mobile summary")).toHaveTextContent("指南目录");
   });
 
   it("redirects a signed-out user from a protected stage to the login page", async () => {
@@ -97,7 +129,7 @@ describe("public and authenticated routing", () => {
     fireEvent.change(screen.getByLabelText("密码"), { target: { value: "correct-password" } });
     fireEvent.click(screen.getByRole("button", { name: "登录并进入工作台" }));
 
-    expect(await screen.findByRole("heading", { name: "科学综述项目" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "化学综述项目" })).toBeInTheDocument();
   });
 
   it("requests a password reset without revealing whether the email exists", async () => {
@@ -201,11 +233,13 @@ describe("public and authenticated routing", () => {
     });
 
     renderApp("/workspace");
-    fireEvent.change(await screen.findByRole("textbox", { name: /项目ID/ }), { target: { value: "new-review" } });
+    fireEvent.change(await screen.findByRole("textbox", { name: /项目名称/ }), { target: { value: "轴手性联烯 综述" } });
     fireEvent.change(screen.getByRole("textbox", { name: /研究主题/ }), { target: { value: "A new review topic" } });
     fireEvent.click(screen.getByRole("button", { name: "创建项目" }));
 
-    expect(await screen.findByRole("heading", { name: "文献库" })).toBeInTheDocument();
+    // The destination is lazy-loaded; allow the production build's parallel
+    // test workers to finish loading it without relaxing project assertions.
+    expect(await screen.findByRole("heading", { name: "文献库" }, { timeout: 5000 })).toBeInTheDocument();
     expect(screen.getByLabelText("当前项目")).toHaveValue("new-project-id");
     await waitFor(() => expect(acquisitionRequests).toHaveLength(2));
     expect(acquisitionRequests.every((url) => url.includes("project_id=new-project-id"))).toBe(true);

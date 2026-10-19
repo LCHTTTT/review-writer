@@ -157,7 +157,7 @@ def assign_primary_paper_sections(
             item.get("context_paper_ids") or item.get("context_papers") or []
         )
         item["primary_papers"] = []
-        item["supporting_papers"] = []
+        item["supporting_papers"] = _unique(item.get("supporting_paper_ids") or [])
         normalized.append(item)
 
     primary_owner: dict[str, str] = {}
@@ -183,6 +183,7 @@ def assign_primary_paper_sections(
     representatives = representatives[: max(1, int(max_synthesis_papers))]
 
     for item in normalized:
+        item["supporting_papers"] = _unique(p for p in item["supporting_papers"] if p not in item["primary_papers"])
         if item["section_role"] not in {"introduction", "conclusion"}:
             continue
         requested = [

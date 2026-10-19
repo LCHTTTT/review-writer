@@ -11,18 +11,16 @@ import uuid
 from pathlib import Path
 
 from fastapi.testclient import TestClient
-from sqlalchemy import create_engine, event, func, select
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.pool import StaticPool
+from sqlalchemy import func, select
 
 from review_writer_api.app import create_app
 from review_writer_api.config import ApiSettings, database_url_from_env
 from review_writer_api.database import Base, Project, User, create_session_factory, database_session
 from review_writer_api.security import Principal, Role
+from review_writer_api.tests._test_support import session_factory
 from review_writer_api.workflow_models import (
     WorkflowArtifact,
     WorkflowJob,
-    WorkflowSystemState,
 )
 
 
@@ -37,22 +35,6 @@ def repository_api():
         raise AssertionError("The isolated PostgreSQL workflow repository is missing.") from exc
     return errors, repository
 
-
-def session_factory():
-    engine = create_engine(
-        "sqlite+pysqlite:///:memory:",
-        connect_args={"check_same_thread": False},
-        poolclass=StaticPool,
-    )
-
-    @event.listens_for(engine, "connect")
-    def enable_foreign_keys(dbapi_connection, _connection_record):
-        cursor = dbapi_connection.cursor()
-        cursor.execute("PRAGMA foreign_keys=ON")
-        cursor.close()
-
-    Base.metadata.create_all(engine)
-    return sessionmaker(bind=engine, expire_on_commit=False), engine
 
 
 class WorkflowRepositoryTests(unittest.TestCase):
@@ -473,6 +455,45 @@ class WorkflowRepositoryTests(unittest.TestCase):
                 self.ids["project_a"],
                 "legacy-draft-output.json",
             )
+        )
+
+    def test_invalidate_stages_marks_pending_and_drops_current_pointers(self) -> None:
+        owner, project = self.ids["user_a"], self.ids["project_a"]
+        draft_run = self.repository.create_stage_run(
+            owner, project, "draft", status="succeeded"
+        )
+        draft = self.repository.create_artifact(
+            owner,
+            project,
+            logical_name="draft/manuscript.md",
+            artifact_type="json",
+            relative_path=".artifacts/draft/manuscript.md",
+            content_sha256=f"{1401:064x}",
+            size_bytes=1401,
+            mtime_ns=1401,
+            producer_stage="draft",
+            producer_run_id=draft_run.id,
+        )
+        self.repository.promote_stage_artifacts_atomically(
+            owner,
+            project,
+            "draft",
+            artifact_ids={"draft/manuscript.md": draft.id},
+            run_id=draft_run.id,
+            expected_revision=0,
+        )
+        self.assertIsNotNone(
+            self.repository.get_current_artifact(owner, project, "draft/manuscript.md")
+        )
+
+        self.repository.invalidate_stages(owner, project, ("draft", "final"))
+
+        self.assertIsNone(
+            self.repository.get_current_artifact(owner, project, "draft/manuscript.md")
+        )
+        self.assertEqual(
+            "pending",
+            self.repository.get_stage_state(owner, project, "draft").status,
         )
 
     def test_readiness_is_required_only_after_legacy_inventory_is_recorded(self) -> None:

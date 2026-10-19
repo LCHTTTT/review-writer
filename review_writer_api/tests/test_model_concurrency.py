@@ -50,12 +50,23 @@ class ModelConcurrencyTests(unittest.TestCase):
             initial = client.get("/api/v1/admin/model-concurrency")
             self.assertEqual(200, initial.status_code)
             self.assertEqual(0, initial.json()["version"])
+            self.assertEqual(5, initial.json()["fact_paper_concurrency"])
             invalid = client.put("/api/v1/admin/model-concurrency",
                 json={"limits": {**selected, "text": {"global": 1, "user": 2}}})
             self.assertEqual(422, invalid.status_code)
             saved = client.put("/api/v1/admin/model-concurrency", json={"limits": selected})
             self.assertEqual(200, saved.status_code)
             self.assertEqual(1, saved.json()["version"])
+            changed = client.put("/api/v1/admin/model-concurrency",
+                json={"limits": selected, "fact_paper_concurrency": 7})
+            self.assertEqual(200, changed.status_code)
+            self.assertEqual(7, changed.json()["fact_paper_concurrency"])
+            for invalid_value in [0, 9, 1.5, True, "5"]:
+                self.assertEqual(422, client.put("/api/v1/admin/model-concurrency",
+                    json={"limits": selected, "fact_paper_concurrency": invalid_value}).status_code)
+            # Old clients must not reset an administrator's existing paper cap.
+            compatible = client.put("/api/v1/admin/model-concurrency", json={"limits": selected})
+            self.assertEqual(7, compatible.json()["fact_paper_concurrency"])
             queues = client.get("/api/v1/admin/workers")
             self.assertEqual(200, queues.status_code)
             self.assertFalse(queues.json()["paused_queues"]["scientific"])
@@ -63,6 +74,7 @@ class ModelConcurrencyTests(unittest.TestCase):
             self.assertEqual(200, paused.status_code)
             self.assertTrue(paused.json()["paused_queues"]["scientific"])
         self.assertEqual(selected, load(self.sessions, self.settings)["limits"])
+        self.assertEqual(7, load(self.sessions, self.settings)["fact_paper_concurrency"])
         restricted = create_app(self.settings, principal_provider=lambda: self.user,
             session_factory_override=self.sessions)
         with TestClient(restricted) as client:

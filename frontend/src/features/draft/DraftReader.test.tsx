@@ -39,8 +39,11 @@ it("reading navigation does not open a discussion unless requested", async () =>
   const nav = screen.getByRole("navigation", { name: "Manuscript contents" });
   fireEvent.click(await within(nav).findByRole("button", { name: "Methods" }));
   expect(choose).not.toHaveBeenCalled();
-  fireEvent.click(within(nav).getByRole("button", { name: "Discuss current chapter" }));
-  expect(within(nav).getByRole("button", { name: "Discuss current chapter" })).toHaveClass("button-primary", "draft-discuss-button");
+  const discuss = screen.getByRole("button", { name: "Discuss current chapter" });
+  expect(discuss.closest(".draft-reader-toolbar")).not.toBeNull();
+  expect(within(nav).queryByRole("button", { name: "Discuss current chapter" })).toBeNull();
+  fireEvent.click(discuss);
+  expect(discuss).toHaveClass("button-primary", "draft-discuss-button");
   expect(choose).toHaveBeenCalledWith("Methods");
 });
 

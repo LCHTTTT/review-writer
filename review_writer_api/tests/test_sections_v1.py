@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 import json
 import tempfile
-import time
 import unittest
 import uuid
 from copy import deepcopy
@@ -19,7 +18,7 @@ from sqlalchemy.orm import sessionmaker
 from review_writer_api.app import create_app
 from review_writer_api.config import ApiSettings
 from review_writer_api.database import Base, Project, User
-from review_writer_api.errors import WorkflowConflict, WorkflowValidationError
+from review_writer_api.errors import WorkflowConflict, WorkflowNotFound, WorkflowValidationError
 from review_writer_api.security import Principal, Role
 from review_writer_api.workflow_models import (
     LibraryArtifact,
@@ -29,6 +28,7 @@ from review_writer_api.workflow_models import (
 )
 from review_writer_api.domain_services.planning import BLUEPRINT_LOGICAL_NAME
 from review_writer_api.domain_services.sections import _merge_evidence_registry_row
+from review_writer_api.tests._test_support import JobPollingMixin
 from review_writer_api.tests.planning_fixtures import seed_verified_matrix, offline_argument_planner
 from review_writer_core.claim_contracts import argument_projection
 from review_writer_core.stages.sections.evidence_resolution import pending_markdown, resolution_record
@@ -37,7 +37,7 @@ from review_writer_core.stages.sections.evidence_resolution import pending_markd
 TEST_KEY = base64.urlsafe_b64encode(bytes(range(32))).decode("ascii").rstrip("=")
 
 
-class SectionsV1Tests(unittest.TestCase):
+class SectionsV1Tests(JobPollingMixin, unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         root = Path(self.temporary.name)
@@ -527,19 +527,10 @@ class SectionsV1Tests(unittest.TestCase):
             )
             self.assertEqual(200, confirmed_blueprint.status_code, confirmed_blueprint.text)
 
-    def wait_job(self, client: TestClient, job_id: str) -> dict:
-        deadline = time.monotonic() + 5
-        while time.monotonic() < deadline:
-            payload = client.get(f"/api/v1/jobs/{job_id}").json()
-            if payload["status"] in {"succeeded", "failed", "cancelled", "interrupted"}:
-                return payload
-            time.sleep(0.02)
-        self.fail("Job did not finish.")
-
-    def start(self, client: TestClient, key: str = "sections") -> dict:
+    def start(self, client: TestClient, key: str = "sections", *, restart: bool = False) -> dict:
         response = client.post(
             f"/api/v1/projects/{self.project_id}/sections/jobs",
-            json={},
+            json={"restart": restart},
             headers=self.headers(key),
         )
         self.assertEqual(202, response.status_code, response.text)
@@ -562,6 +553,93 @@ class SectionsV1Tests(unittest.TestCase):
         stale = {**payload, "source_blueprint_artifact_id": "superseded"}
         with self.assertRaises(WorkflowConflict):
             service.prepare_generation_job(context, stale)
+
+    def test_preparation_cache_identity_changes_with_retrieval_profile(self) -> None:
+        service = self.app.state.sections_service
+        payload = service.generation_payload(self.first, self.project_id, defer_evidence=True)
+        profile = {"enabled": True, "model": "model-a", "dimension": 2}
+        tuning = SimpleNamespace(top_k=2)
+        index = SimpleNamespace(enabled=False, tuning=tuning, _current_embedding_profile=lambda: profile)
+        with patch.object(service, "library_index", index):
+            original = service._preparation_fingerprint(self.first, self.project_id, payload)
+            profile["model"] = "model-b"
+            self.assertNotEqual(original, service._preparation_fingerprint(self.first, self.project_id, payload))
+            profile["model"] = "model-a"
+            tuning.top_k = 3
+            self.assertNotEqual(original, service._preparation_fingerprint(self.first, self.project_id, payload))
+
+    def test_shared_ready_embeddings_checked_once_and_cached_evidence_is_identical(self) -> None:
+        self._seed_document_indexes()
+        service = self.app.state.sections_service
+        catalog = service._catalog(self.first, ["P001"])
+        tasks = [{"section_id": sid, "heading": "Copper methods", "primary_papers": ["P001"],
+                  "supporting_papers": [], "allowed_papers": ["P001"]} for sid in ["S01", "S02"]]
+        saved = {}
+        index = service.library_index
+        with patch.object(index, "vector_enabled", True), \
+             patch.object(index, "ensure_embeddings", return_value={"P001": "ready"}) as ensure, \
+             patch.object(index, "_semantic_ranked_ids", return_value=[]):
+            first = service._evidence_package(self.first, self.project_id, tasks, catalog,
+                on_section=lambda section: saved.update({section["section_id"]: deepcopy(section)}))
+            second = service._evidence_package(self.first, self.project_id, tasks, catalog,
+                prepared_sections=saved)
+        ensure.assert_called_once_with(self.first, ["P001"])
+        self.assertEqual(first, second)
+
+    def test_partial_evidence_preparation_survives_retry_without_repeating_ready_section(self) -> None:
+        service = self.app.state.sections_service
+        payload = service.generation_payload(self.first, self.project_id, defer_evidence=True)
+        original = SimpleNamespace(user_id=self.first.user_id, project_id=self.project_id,
+            job_id=str(uuid.uuid4()), report_progress=Mock(), report_partial_result=Mock(), checkpoint=Mock())
+        real_package = service._evidence_package
+        saved_ids = []
+        def interrupted(*args, **kwargs):
+            save = kwargs["on_section"]
+            def save_then_stop(section):
+                save(section)
+                saved_ids.append(section["section_id"])
+                raise RuntimeError("interrupted after checkpoint")
+            return real_package(*args, **{**kwargs, "on_section": save_then_stop})
+        with patch.object(service, "_evidence_package", side_effect=interrupted):
+            with self.assertRaisesRegex(RuntimeError, "after checkpoint"):
+                service.prepare_generation_job(original, payload)
+        self.assertEqual(1, len(saved_ids))
+        retry = SimpleNamespace(**{**vars(original), "job_id": str(uuid.uuid4()), "retry_of_job_id": original.job_id})
+        source = SimpleNamespace(project_id=self.project_id, job_type="sections.generate", retry_of_job_id=None)
+        newly_prepared = []
+        def resumed(*args, **kwargs):
+            self.assertIn(saved_ids[0], kwargs["prepared_sections"])
+            save = kwargs["on_section"]
+            def record(section):
+                newly_prepared.append(section["section_id"])
+                save(section)
+            return real_package(*args, **{**kwargs, "on_section": record})
+        with patch.object(service.repository, "get_job", return_value=source), \
+             patch.object(service, "_evidence_package", side_effect=resumed):
+            result = service.prepare_generation_job(retry, payload)
+        self.assertNotIn(saved_ids[0], newly_prepared)
+        self.assertEqual(len(payload["tasks"]), len(result["evidence_package"]["sections"]))
+
+    def test_source_empty_comparison_reuses_prepared_passages_without_retrieval(self) -> None:
+        from review_writer_core.stages.sections.synthesis_inputs import link_synthesis_tasks
+        service = self.app.state.sections_service
+        tasks = link_synthesis_tasks([
+            {"section_id": "source", "section_role": "body", "primary_papers": ["P001"],
+             "supporting_papers": [], "allowed_papers": ["P001"]},
+            {"section_id": "comparison", "section_role": "body", "primary_papers": [],
+             "supporting_papers": [], "allowed_papers": [],
+             "writing_requirements": [{"type": "cross_study_synthesis"}]},
+        ])
+        cached = {"source": {"section_id": "source", "hits": [{"paper_id": "P001",
+            "evidence_key": "source-key", "chunk_id": "source-chunk", "content": "Real source",
+            "claim_eligible": True, "support_level": "direct"}]}}
+        with patch.object(service.library_index, "retrieve", side_effect=AssertionError("must reuse passages")):
+            package = service._evidence_package(self.first, self.project_id, tasks,
+                service._catalog(self.first, ["P001"]), prepared_sections=cached)
+        comparison = package["sections"][-1]
+        self.assertEqual("lexical", comparison["retrieval_mode"])
+        self.assertEqual(cached["source"]["hits"], comparison["hits"])
+        self.assertEqual([], tasks[-1]["primary_papers"])
 
     def test_retry_reuses_verified_preparation_without_retrieval(self) -> None:
         service = self.app.state.sections_service
@@ -1145,6 +1223,42 @@ class SectionsV1Tests(unittest.TestCase):
             all(len(plan["websearch_query"]) < 1000 for plan in section["query_plans"])
         )
 
+    def test_primary_paper_prior_work_facts_recover_own_body_passages(self) -> None:
+        self._seed_document_indexes()
+        with self.sessions.begin() as session:
+            index = session.query(LibraryDocumentIndex).filter_by(paper_id="P001").one()
+            for ordinal, page, heading, content in [
+                (1, 1, "Introduction", "Earlier copper allenation procedures used other substrates and products. " * 3),
+                (2, 2, "Results", "Our copper allenation of the selected substrate furnished the target allene under tested conditions. " * 2),
+                (3, 3, "Discussion", "The substrate scope of this copper allenation included several substitutions and one failed example. " * 2),
+                (4, 4, "References", "Copper allenation is mentioned in cited articles and previous methods. " * 3),
+            ]:
+                session.add(LibraryDocumentChunk(
+                    index_id=index.id, user_id=index.user_id, paper_id="P001",
+                    chunk_id=f"body-{ordinal}", ordinal=ordinal, content=content,
+                    normalized_content=content.casefold(), content_type="text",
+                    section_path_json=[heading], page_start=page, page_end=page,
+                    block_start=ordinal, block_end=ordinal, asset_refs_json=[], is_reference=False,
+                ))
+        service = self.app.state.sections_service
+        catalog = service._catalog(self.first, ["P001"])
+        task = {"section_id": "S01", "heading": "Target allene", "primary_papers": ["P001"],
+                "supporting_papers": [], "allowed_papers": ["P001"]}
+        prior_only = {"P001": {"paper_analysis": {"contribution": "Copper allenation furnished the target allene"},
+                               "scientific_facts": [{"study_ownership": "prior_work", "field_id": "scope",
+                                                     "value": "Earlier procedures were limited."}]}}
+        section = service._evidence_package(self.first, self.project_id, [task], catalog, prior_only)["sections"][0]
+        recovered = [hit for hit in section["hits"]
+                     if "primary_contribution_recovery" in hit["retrieval_passes"]]
+        self.assertEqual({2, 3}, {hit["page_start"] for hit in recovered})
+        self.assertTrue(all(hit["claim_eligible"] for hit in recovered))
+        with_own_fact = {"P001": {"scientific_facts": [{"study_ownership": "own_results",
+                         "field_id": "quantitative_results", "value": "The target allene was isolated.",
+                         "support_level": "direct", "evidence_refs": [{"evidence_key": "k"}]}]}}
+        section = service._evidence_package(self.first, self.project_id, [task], catalog, with_own_fact)["sections"][0]
+        self.assertFalse(any("primary_contribution_recovery" in hit["retrieval_passes"]
+                             for hit in section["hits"]))
+
     def test_relaxed_question_match_is_retained_as_claim_eligible_evidence(self) -> None:
         self._seed_document_indexes()
         with self.sessions.begin() as session:
@@ -1671,7 +1785,7 @@ class SectionsV1Tests(unittest.TestCase):
                 ],
                 "scientific_claims": [],
             },
-            review_topic="A scientific review",
+            review_topic="A chemistry review",
         )
 
         ids = {plan["question_id"] for plan in plans}
@@ -1719,6 +1833,65 @@ class SectionsV1Tests(unittest.TestCase):
         self.assertEqual("failed", job["status"])
         self.assertEqual(1, self.writer_calls)
         self.assertEqual("SECTION_PROVIDER_UNAVAILABLE", job["error_code"])
+
+    def test_current_input_retry_still_generates_after_provider_recovers(self) -> None:
+        self.transient_failures = 1
+        with TestClient(self.app) as client:
+            failed = self.start(client, "valid-source-retry")
+            self.assertEqual("failed", failed["status"])
+            retried = client.post(f"/api/v1/jobs/{failed['id']}/retry",
+                headers=self.headers("valid-source-retry-again"))
+            self.assertEqual(202, retried.status_code, retried.text)
+            finished = self.wait_job(client, retried.json()["id"])
+        self.assertEqual("succeeded", finished["status"])
+        self.assertEqual(failed["id"], finished["retry_of_job_id"])
+
+    def test_status_is_small_owned_and_does_not_read_manuscript(self) -> None:
+        service = self.app.state.sections_service
+        with TestClient(self.app) as client, patch.object(service, "get", side_effect=AssertionError("No full manuscript read")):
+            result = client.get(f"/api/v1/projects/{self.project_id}/sections/status", headers=self.headers())
+            self.assertEqual(200, result.status_code, result.text)
+            self.assertEqual({"artifact_ids", "job_id", "job_status"}, set(result.json()))
+            self.assertLess(len(result.content), 1000)
+        with self.assertRaises(WorkflowNotFound):
+            service.status(self.second, self.project_id)
+
+    def test_complete_outputs_reject_normal_generation_but_allow_explicit_restart(self) -> None:
+        with TestClient(self.app) as client:
+            completed = self.start(client, "complete-before-stale-click")
+            calls = self.writer_calls
+            response = client.post(f"/api/v1/projects/{self.project_id}/sections/jobs", json={}, headers=self.headers("stale-click"))
+            self.assertEqual(409, response.status_code, response.text)
+            self.assertTrue(response.json()["error"]["details"]["current_outputs_available"])
+            self.assertEqual(calls, self.writer_calls)
+            retry = client.post(f"/api/v1/jobs/{completed['id']}/retry", headers=self.headers())
+            self.assertEqual(409, retry.status_code, retry.text)
+            self.assertTrue(retry.json()["error"]["details"]["current_outputs_available"])
+            self.assertEqual(calls, self.writer_calls)
+            with patch.object(self.app.state.job_service, "submit", side_effect=WorkflowConflict("Explicit restart admitted")):
+                response = client.post(f"/api/v1/projects/{self.project_id}/sections/jobs", json={"restart": True}, headers=self.headers("restart"))
+            self.assertIn("Explicit restart admitted", response.text)
+
+    def test_stale_retry_is_rejected_before_enqueue_and_report_marks_old_sources(self) -> None:
+        service = self.app.state.sections_service
+        repository = self.app.state.workflow_repository
+        payload = service.generation_payload(self.first, self.project_id, defer_evidence=True)
+        # A same-title outline with a new immutable identity must not be resumed.
+        payload["source_outline_artifact_id"] = str(uuid.uuid4())
+        source = repository.create_or_get_job(self.first.user_id, self.project_id, "project",
+            "sections.generate", "stale-input-retry", payload)
+        repository.claim_job(source.id)
+        repository.mark_job_failed(source.id, error_code="TEST_FAILURE", error_message="provider stopped")
+        before = repository.list_project_jobs(self.first.user_id, self.project_id, job_type="sections.generate")
+        with TestClient(self.app) as client:
+            response = client.post(f"/api/v1/jobs/{source.id}/retry", headers=self.headers())
+            self.assertEqual(409, response.status_code, response.text)
+            self.assertTrue(response.json()["error"]["details"]["retry_inputs_stale"])
+            report = client.get(f"/api/v1/projects/{self.project_id}/sections", headers=self.headers()).json()
+        self.assertFalse(next(job for job in report["report"]["jobs"] if job["id"] == source.id)["retry_inputs_current"])
+        self.assertEqual(len(before), len(repository.list_project_jobs(self.first.user_id, self.project_id, job_type="sections.generate")))
+        self.assertEqual(0, self.writer_calls)
+        self.assertEqual("failed", repository.get_job(self.first.user_id, source.id).status)
 
     def test_successful_task_publishes_section_artifact(self) -> None:
         with TestClient(self.app) as client:
@@ -1772,7 +1945,7 @@ class SectionsV1Tests(unittest.TestCase):
     def test_report_uses_current_jobs(self) -> None:
         with TestClient(self.app) as client:
             first = self.start(client, "report-1")
-            second = self.start(client, "report-2")
+            second = self.start(client, "report-2", restart=True)
             payload = client.get(f"/api/v1/projects/{self.project_id}/sections").json()
         job_ids = [job["id"] for job in payload["report"]["jobs"]]
         self.assertIn(first["id"], job_ids)
@@ -1782,7 +1955,7 @@ class SectionsV1Tests(unittest.TestCase):
     def test_stage_run_records_dirty_and_recomputed_section_ids(self) -> None:
         with TestClient(self.app) as client:
             first = self.start(client, "dirty-first")
-            second = self.start(client, "dirty-second")
+            second = self.start(client, "dirty-second", restart=True)
         self.assertEqual("succeeded", first["status"], first)
         self.assertEqual("succeeded", second["status"], second)
         self.assertEqual(first["result"]["section_ids"], first["result"]["dirty_object_ids"])

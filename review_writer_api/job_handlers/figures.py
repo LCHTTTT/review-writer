@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -72,9 +73,13 @@ class FigureJobHandlers:
                 requested_figure_type,
                 "--render-mode",
                 "ai-edit",
+                "--palette",
+                str(payload.get("palette") or os.environ.get("REVIEW_WRITER_FIGURE_PALETTE", "").strip() or "monochrome"),
                 "--require-redrawn",
             ]
-        if requested_figure_type.strip().casefold() != "auto":
+        if payload.get("edit_instructions"):
+            command.extend(["--edit-instructions", str(payload["edit_instructions"])])
+        if requested_figure_type.strip().casefold() != "auto" or payload.get("edit_instructions"):
             command.append("--force-standard-ai-edit")
         self.runner.run(
             command,

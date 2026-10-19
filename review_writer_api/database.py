@@ -223,13 +223,16 @@ class Project(Base, TimestampMixin):
         Uuid, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True
     )
     slug: Mapped[str] = mapped_column(String(96), nullable=False)
+    # NULL identifies legacy directories named by slug; new projects use UUIDs.
+    storage_slug: Mapped[str | None] = mapped_column(String(96), nullable=True)
     topic: Mapped[str] = mapped_column(Text, default="", nullable=False)
     taxonomy_profile: Mapped[str] = mapped_column(
         String(96), default="general_academic", nullable=False
     )
     model_tier: Mapped[str] = mapped_column(String(32), default="terra", nullable=False)
     status: Mapped[str] = mapped_column(String(32), default="active", nullable=False)
-    current_stage: Mapped[str] = mapped_column(String(64), default="discovery", nullable=False)
+    # The current stage is derived from stage_states on every read, so it is not
+    # persisted: a stored copy could only drift from the checkpoints it mirrors.
     stage_states: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, nullable=False)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 

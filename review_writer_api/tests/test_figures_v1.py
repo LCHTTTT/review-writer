@@ -331,6 +331,25 @@ class FiguresV1Tests(NativeFigureApiTestCase):
             finished = self.wait_job(client, retried.json()["id"])
         self.assertEqual("succeeded", finished["status"])
 
+    def test_changed_figure_selection_rejects_old_retry_without_provider_call(self) -> None:
+        self.redraw_error = "Image request rejected: adult content safety policy"
+        with TestClient(self.app) as client:
+            self.confirm_review(client)
+            failed = self.start_redraw(client, "stale-redraw")
+            self.assertEqual("failed", failed["status"])
+            service = self.app.state.figures_service
+            state = service.repository.get_stage_state(self.first.user_id, self.project_id, "figure-review")
+            saved = client.put(f"/api/v1/projects/{self.project_id}/figures/review/P001",
+                json={"revision": state.revision, "candidate_index": 0, "review_note": "switch candidate"},
+                headers=self.headers("switch-before-retry"))
+            self.assertEqual(200, saved.status_code, saved.text)
+            calls = self.redraw_calls
+            retried = client.post(f"/api/v1/jobs/{failed['id']}/retry",
+                headers=self.headers("stale-redraw-retry"))
+        self.assertEqual(409, retried.status_code, retried.text)
+        self.assertTrue(retried.json()["error"]["details"]["retry_inputs_stale"])
+        self.assertEqual(calls, self.redraw_calls)
+
     def test_running_batch_redraw_can_be_cancelled_cooperatively(self) -> None:
         self.block_redraw = True
         with TestClient(self.app) as client:

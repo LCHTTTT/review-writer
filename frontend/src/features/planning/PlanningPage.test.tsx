@@ -1,12 +1,12 @@
 import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Job } from "../../api/types";
 import { usePreferences } from "../../state/preferences";
 import { PlanningPage, type PlanningPayload } from "./PlanningPage";
-import { ChapterPlanningWorkspace } from "./ChapterPlanningWorkspace";
+import { ChapterPlanningWorkspace } from "../sections/ChapterPlanningWorkspace";
 import { apiRequest } from "../../api/client";
 
 vi.mock("../../components/ProjectSelector", () => ({
@@ -19,6 +19,8 @@ const clients: QueryClient[] = [];
 let payload: Record<string, unknown>;
 let requests: Array<{ path: string; init: RequestInit }>;
 let applyOutline: (body: { revision: number; outline_style: string }) => Promise<Response>;
+/** Full rows the paper detail endpoint returns, keyed by paper id. */
+let matrixRowDetail: Record<string, Record<string, unknown>>;
 
 function basicBlueprint() {
   return {
@@ -92,6 +94,7 @@ describe("default argument planning and candidate confirmation", () => {
       selected_outline_md: "## Evidence theme", literature_matrix: { rows: [] },
     };
     requests = [];
+    matrixRowDetail = {};
     applyOutline = async (body) => {
       payload = { ...payload, matrix_revision: body.revision + 1, outline_current: true,
         outline_selection: { outline_style: body.outline_style }, selected_outline_md: "## Applied section" };
@@ -101,8 +104,32 @@ describe("default argument planning and candidate confirmation", () => {
       const path = String(input);
       if (["POST", "PUT"].includes(init.method || "")) requests.push({ path, init });
       if (path === `${planningPath}/outline` && init.method === "PUT") return applyOutline(JSON.parse(String(init.body)));
-      if (path === `${planningPath}/blueprint`) payload = { ...payload, ...basicBlueprint() };
-      if (path === `${planningPath}/blueprint/jobs`) {
+      if (path === `${planningPath}/reference-outlines` && init.method === "POST") {
+        return Response.json({
+          filename: "reference.md",
+          outline_md: "## 1. Introduction\nSection role: introduction\n\n### 1.1 Scope\n",
+          section_count: 2,
+          skipped: ["Abstract", "References"],
+          dropped_duplicates: [],
+          unverified: [],
+          introduced_heading: false,
+          truncated: 0,
+          confidence: "high",
+          extraction_source: "markdown-headings",
+          matrix_revision: payload.matrix_revision,
+        }, { status: 201 });
+      }
+      const matrixRow = path.match(new RegExp(`^${planningPath}/matrix/(.+)$`));
+      if (matrixRow) {
+        const paperId = decodeURIComponent(matrixRow[1]);
+        const listed = ((payload.literature_matrix as { rows?: Array<Record<string, unknown>> })?.rows || [])
+          .find((row) => row.paper_id === paperId);
+        const row = matrixRowDetail[paperId] || listed;
+        if (!row) throw new Error(`Unknown matrix row: ${paperId}`);
+        return Response.json({ paper: row, matrix_revision: payload.matrix_revision });
+      }
+      if (path === `/api/v1/projects/project-1/sections/blueprint`) payload = { ...payload, ...basicBlueprint() };
+      if (path === `/api/v1/projects/project-1/sections/blueprint/jobs`) {
         const job = enhancementJob("queued");
         payload = { ...payload, blueprint_jobs: [job] };
         return Response.json(job, { status: 202 });
@@ -111,10 +138,10 @@ describe("default argument planning and candidate confirmation", () => {
         payload = { ...payload, blueprint_jobs: [enhancementJob("cancelled")] };
         return Response.json(enhancementJob("cancelled"));
       }
-      if (path === `${planningPath}/blueprint/confirm`) {
+      if (path === `/api/v1/projects/project-1/sections/blueprint/confirm`) {
         payload = { ...payload, blueprint_approved: true, blueprint_candidate_pending: false };
       }
-      if ([planningPath, `${planningPath}/blueprint`, `${planningPath}/blueprint/confirm`].includes(path)) {
+      if ([planningPath, "/api/v1/projects/project-1/sections/planning", `/api/v1/projects/project-1/sections/blueprint`, `/api/v1/projects/project-1/sections/blueprint/confirm`].includes(path)) {
         return Response.json(payload);
       }
       throw new Error(`Unexpected request: ${path}`);
@@ -146,7 +173,7 @@ describe("default argument planning and candidate confirmation", () => {
     renderPlanning("blueprint");
     fireEvent.click(await screen.findByRole("button", { name: "生成章节规划" }));
     await screen.findByRole("button", { name: "停止生成" });
-    expect(requests.map(({ path }) => path)).toEqual([`${planningPath}/blueprint/jobs`]);
+    expect(requests.map(({ path }) => path)).toEqual([`/api/v1/projects/project-1/sections/blueprint/jobs`]);
     expect(JSON.parse(String(requests[0].init.body))).toEqual({ revision: 5 });
     expect(new Headers(requests[0].init.headers).get("Idempotency-Key")).toBeTruthy();
     expect(screen.queryByRole("button", { name: "增强章节论证（可选）" })).not.toBeInTheDocument();
@@ -162,9 +189,10 @@ describe("default argument planning and candidate confirmation", () => {
   it("shows paper roles and evidence coverage without requiring a fixed comparison count", async () => {
     payload = { ...payload, ...basicBlueprint() };
     renderPlanning("blueprint");
-    expect(await screen.findByRole("heading", { name: "论文在本章中的作用" })).toBeInTheDocument();
-    expect(screen.getByText(/Introduces the reference method/, { selector: "li" })).toBeInTheDocument();
-    expect(screen.getByText(/所需证据已覆盖/)).toBeInTheDocument();
+    const rolesHeading = await screen.findByRole("heading", { name: "论文在本章中的作用" });
+    rolesHeading.closest("details")!.setAttribute("open", "");
+    expect(screen.getByText(/Introduces the reference method/, { selector: "p" })).toBeInTheDocument();
+    expect(screen.getByText(/已覆盖/)).toBeInTheDocument();
     expect(screen.getByText(/支撑材料 · 待正文核实/)).toBeInTheDocument();
     expect(screen.queryByText(/至少.*个比较段落/)).not.toBeInTheDocument();
   });
@@ -182,7 +210,7 @@ describe("default argument planning and candidate confirmation", () => {
     expect(await screen.findByText("章节规划已完成 · 1 个章节")).toBeInTheDocument();
     expect(screen.getAllByRole("button", { name: "重新生成" })).toHaveLength(1);
     expect(screen.getByRole("button", { name: "确认章节规划" })).toBeEnabled();
-    const disclosure = screen.getByText("1 篇论文未纳入本次综述 · 查看原因").closest("details")!;
+    const disclosure = screen.getByText("1 篇论文未分配至正文 · 查看状态与原因").closest("details")!;
     expect(disclosure).not.toHaveAttribute("open");
     fireEvent.click(disclosure.querySelector("summary")!);
     expect(disclosure).toHaveAttribute("open");
@@ -209,7 +237,7 @@ describe("default argument planning and candidate confirmation", () => {
     expect(screen.getByText("Source lookup temporarily unavailable.")).toBeVisible();
     fireEvent.click(resume);
     await screen.findByRole("button", { name: "停止生成" });
-    expect(requests.map(({ path }) => path)).toEqual([`${planningPath}/blueprint/jobs`]);
+    expect(requests.map(({ path }) => path)).toEqual([`/api/v1/projects/project-1/sections/blueprint/jobs`]);
     expect(JSON.parse(String(requests[0].init.body))).toEqual({ revision: 6 });
   });
 
@@ -336,11 +364,72 @@ describe("default argument planning and candidate confirmation", () => {
       outline_candidates: [{ source: "topic", outline_style: "topic-guided", title: "Recommended" }] };
     renderPlanning();
     fireEvent.click(await screen.findByRole("button", { name: "选择大纲" }));
-    const choose = screen.getByRole("button", { name: "使用推荐大纲" });
+    const card = screen.getByRole("heading", { name: "主题推荐" }).closest("article")!;
+    const choose = within(card).getByRole("button", { name: "使用此结构" });
     expect(choose).toBeEnabled();
     fireEvent.click(choose);
     await screen.findByText("大纲已应用，章节已载入下方编辑器。");
-    expect(screen.getByRole("button", { name: "当前推荐大纲" })).toBeDisabled();
+    expect(within(card).getByRole("button", { name: "当前选择" })).toBeDisabled();
+  });
+
+  it("shows the recommendation as one structure choice without routing details or paid refresh actions", async () => {
+    payload = { ...payload, outline_candidates: [{ source: "topic", outline_style: "topic-guided",
+      topic_outline_intent: { routing_diagnostics: { body_section_count: 3, assigned_paper_count: 7,
+        unassigned_paper_count: 1, unused_papers: [{ paper_id: "P001", reason: "Requires a more precise route" }],
+        unsupported_sections: [{ title: "Missing strategy", reason: "No selected source supports this scope" }] } } }],
+      topic_recommendation: { status: "succeeded", input_fingerprint: "new-facts", additional_evidence_available: true } };
+    renderPlanning();
+    fireEvent.click(await screen.findByRole("button", { name: "选择大纲" }));
+    const card = screen.getByRole("heading", { name: "主题推荐" }).closest("article")!;
+    expect(within(card).getAllByRole("button")).toHaveLength(1);
+    expect(within(card).getByRole("button", { name: "使用此结构" })).toBeEnabled();
+    expect(within(card).queryByText("查看推荐依据")).not.toBeInTheDocument();
+    expect(within(card).queryByText(/待确定论文|分配.*主论文|按最新事实|Missing strategy/)).not.toBeInTheDocument();
+    expect(requests.some(r => r.init.method === "POST")).toBe(false);
+  });
+
+  it("lets a newly generated recommendation be adopted even when the saved style is already topic-guided", async () => {
+    payload = { ...payload, outline_current: true, topic_recommendation_selected: false,
+      outline_selection: { outline_style: "topic-guided" },
+      outline_candidates: [{ source: "topic", outline_style: "topic-guided", title: "Updated recommendation" }] };
+    renderPlanning();
+    fireEvent.click(await screen.findByRole("button", { name: "选择大纲" }));
+    const card = screen.getByRole("heading", { name: "主题推荐" }).closest("article")!;
+    expect(within(card).getByRole("button", { name: "使用此结构" })).toBeEnabled();
+    expect(requests.some(r => r.init.method === "POST")).toBe(false);
+  });
+
+  it("preserves unsaved edits when switching to the recommendation is cancelled", async () => {
+    payload = { ...payload, outline_candidates: [{ source: "topic", outline_style: "topic-guided" }] };
+    renderPlanning();
+    fireEvent.click(await screen.findByRole("button", { name: "选择大纲" }));
+    fireEvent.change(screen.getByRole("textbox", { name: "章节标题" }), { target: { value: "My edited outline" } });
+    const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
+    const card = screen.getByRole("heading", { name: "主题推荐" }).closest("article")!;
+    fireEvent.click(within(card).getByRole("button", { name: "使用此结构" }));
+    expect(confirm).toHaveBeenCalledOnce();
+    expect(requests).toEqual([]);
+    expect(screen.getByRole("textbox", { name: "章节标题" })).toHaveValue("My edited outline");
+    confirm.mockReturnValue(true);
+    fireEvent.click(within(card).getByRole("button", { name: "使用此结构" }));
+    await screen.findByText("大纲已应用，章节已载入下方编辑器。");
+    expect(requests).toHaveLength(1);
+    expect(JSON.parse(String(requests[0].init.body)).outline_style).toBe("topic-guided");
+    expect(requests[0].path).toBe(`${planningPath}/outline`);
+  });
+
+  it("uses the same English selection action for a saved topic outline without regenerating it", async () => {
+    usePreferences.setState({ language: "en" });
+    payload = { ...payload, outline_selection: { outline_style: "topic-guided" }, topic_recommendation_selected: true,
+      outline_candidates: [{ source: "topic", outline_style: "topic-guided" }],
+      topic_recommendation: { status: "succeeded", input_fingerprint: "facts-updated", additional_evidence_available: true } };
+    renderPlanning();
+    fireEvent.click(await screen.findByRole("button", { name: "Choose outline" }));
+    const card = screen.getByRole("heading", { name: "Topic recommendation" }).closest("article")!;
+    expect(within(card).getByRole("button", { name: "Current selection" })).toBeDisabled();
+    expect(within(card).getAllByRole("button")).toHaveLength(1);
+    expect(requests).toEqual([]);
+    expect(screen.getByRole("textbox", { name: "Section title" })).toHaveValue("Evidence theme");
   });
 
   it("prevents duplicate generation while the default planner is running", async () => {
@@ -375,6 +464,38 @@ describe("default argument planning and candidate confirmation", () => {
     expect(await screen.findByRole("button", { name: "确认章节规划" })).toBeDisabled();
     expect(screen.getByRole("button", { name: "继续生成" })).toBeEnabled();
     expect(requests).toEqual([]);
+  });
+
+  it("separates successful job execution from an unfinished chapter plan and names the chapter", async () => {
+    const basic = basicBlueprint();
+    payload = { ...payload, ...basic, blueprint_jobs: [enhancementJob("succeeded")], section_blueprint: {
+      ...basic.section_blueprint,
+      academic_planning: { status: "incomplete", execution_status: "completed", content_status: "partial", incomplete_sections: ["S04"] },
+      sections: [...(basic.section_blueprint.sections || []), {
+        section_id: "S04", title: "Cross-category comparison", section_role: "body",
+        planning_status: "incomplete", evidence_readiness: { reason: "Planning output was incomplete." },
+      }],
+    } };
+    renderPlanning("blueprint");
+    expect(await screen.findByText(/任务执行已完成/)).toBeInTheDocument();
+    expect(screen.getAllByText(/Cross-category comparison/).length).toBeGreaterThan(0);
+    expect(screen.getByRole("button", { name: "继续生成" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "确认章节规划" })).toBeDisabled();
+  });
+
+  it("shows unsupported outline ranges without treating them as blank chapters or blocking confirmation", async () => {
+    const basic = basicBlueprint();
+    payload = { ...payload, ...basic, section_blueprint: {
+      ...basic.section_blueprint,
+      academic_planning: { status: "completed", execution_status: "completed", content_status: "partial", unsupported_sections: ["S04"] },
+      scope_coverage_gaps: [{ section_id: "S04", title: "Conjugated enynes", reason_code: "no_selected_supporting_papers" }],
+      sections: basic.section_blueprint.sections,
+    } };
+    renderPlanning("blueprint");
+    expect(await screen.findByText(/当前缺少支持文献的范围/)).toBeInTheDocument();
+    expect(screen.getByText(/规划内容状态：有范围缺少支持文献/)).toBeInTheDocument();
+    expect(screen.getByText(/Conjugated enynes/)).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "确认章节规划" })).toBeEnabled();
   });
 
   it.each([
@@ -440,7 +561,128 @@ describe("default argument planning and candidate confirmation", () => {
       progress_current: 2, progress_total: 5,
       result: { planning_pipeline: { phase: "fact_enrichment" } } }] };
     renderPlanning("blueprint");
-    expect(await screen.findByText("正在核验当前主题需要的事实依据")).toBeInTheDocument();
+    expect(await screen.findByText("正在整理导读与本节所需证据")).toBeInTheDocument();
     expect(screen.getByText("2/5 篇论文已分析")).toBeInTheDocument();
+  });
+
+  it("keeps a first-use empty matrix ordinary and does not submit analysis on page load", async () => {
+    renderPlanning();
+    expect(await screen.findByText("Discovery确认后会在这里显示Matrix。")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    expect(requests).toEqual([]);
+  });
+
+  it.each(["STATE_CONFLICT", "PROVIDER_EMPTY_RESPONSE"])("does not treat an empty checkpoint as extracted facts (%s)", async (error_code) => {
+    const job = { ...enhancementJob("failed"), job_type: "matrix.enrich", error_code,
+      error_message: error_code === "STATE_CONFLICT" ? "The delegated model task did not finish. No model call was replayed automatically."
+        : "模型仅返回推理过程，没有可用答案。",
+      result: { matrix_enrichment_checkpoint: { completed_papers: [], entries: { P001: { result: {} } } },
+        matrix_enrichment_recovery: { completed_paper_ids: [], publication_pending: false } } };
+    payload = { ...payload, literature_matrix: { rows: [{ paper_id: "P001", title: "Study" }] },
+      matrix_enrichment: { jobs: [job] } };
+    renderPlanning();
+    expect(await screen.findByText("上次科学事实分析未完成。")).toBeVisible();
+    expect(screen.queryByText(/事实已经提取|本篇分析结果已生成|任务期间论文分析状态发生变化/)).not.toBeInTheDocument();
+    expect(screen.getByText(/未完成部分可能需要模型调用并产生费用/)).toBeVisible();
+    expect(screen.queryByText(/不会重新调用模型/)).not.toBeInTheDocument();
+    expect(requests).toEqual([]);
+  });
+
+  it("reports finished results only for a genuine publication conflict", async () => {
+    payload = { ...payload, literature_matrix: { rows: [{ paper_id: "P001", title: "Study" }] },
+      matrix_enrichment: { jobs: [{ ...enhancementJob("failed"), job_type: "matrix.enrich", error_code: "STATE_CONFLICT",
+        error_message: "Matrix changed before publication.", available_actions: ["retry"],
+        result: { matrix_enrichment_recovery: { completed_paper_ids: ["P001"], publication_pending: true } } }] } };
+    renderPlanning();
+    expect(await screen.findByText("已有分析结果尚未同步到文献分析。")).toBeVisible();
+    expect(await screen.findByText(/本篇分析结果已生成/)).toBeVisible();
+    expect(screen.queryByText(/不会重新调用模型/)).not.toBeInTheDocument();
+    expect(requests).toEqual([]);
+  });
+
+  it("keeps completed papers and unsaved notes visible after a failed single-paper update", async () => {
+    payload = { ...payload, literature_matrix: { rows: [{ paper_id: "P001", title: "Completed study", main_content: "Saved note",
+      paper_analysis: { contribution: "Existing contribution", evidence_keys: ["source-1"] },
+      fact_enrichment: { status: "complete", processing: { reading: "completed" },
+        fact_extraction_profile: { reading_strategy: "review-oriented/1", reading_status: "completed", reading_source_key: "source-1" } },
+    }, { paper_id: "P002", title: "Failed study", fact_enrichment: { status: "failed" } }] },
+      matrix_enrichment: { jobs: [{ ...enhancementJob("failed"), job_type: "matrix.enrich", error_code: "PROVIDER_EMPTY_RESPONSE",
+        error_message: "模型仅返回推理过程，没有可用答案。", result: { matrix_enrichment_recovery: { completed_paper_ids: [], publication_pending: false } } }] } };
+    renderPlanning();
+    expect(await screen.findByText("Existing contribution")).toBeVisible();
+    expect(screen.getByRole("button", { name: "继续未完成分析（1）" })).toBeEnabled();
+    const note = screen.getByPlaceholderText("转化、条件、证据、范围、限制与综述相关性");
+    fireEvent.change(note, { target: { value: "My unsaved note" } });
+    await act(async () => { await clients[0].invalidateQueries(); });
+    expect(note).toHaveValue("My unsaved note");
+    expect(requests).toEqual([]);
+  });
+
+  it("shows a completed zero-fact paper guide and preserves unsaved notes through a read-only refresh", async () => {
+    payload = { ...payload, literature_matrix: { rows: [{ paper_id: "P001", title: "Mechanism study", main_content: "Saved note",
+      scientific_facts: [], paper_analysis: { contribution: "Explains a control experiment", evidence_keys: ["source-1"] },
+      fact_enrichment: { status: "partial", review_readiness: "source_not_established",
+        processing: { reading: "completed", extraction: "completed", verification: "not_required" },
+        fact_extraction_profile: { reading_strategy: "review-oriented/1", reading_status: "completed", reading_source_key: "source-1" } },
+    }] } };
+    renderPlanning();
+    expect(await screen.findByRole("region", { name: "论文导读" })).toHaveTextContent("Explains a control experiment");
+    expect(screen.getAllByText("已阅读").length).toBeGreaterThan(0);
+    expect(screen.getByRole("button", { name: "继续未完成分析（0）" })).toBeDisabled();
+    const note = screen.getByPlaceholderText("转化、条件、证据、范围、限制与综述相关性");
+    fireEvent.change(note, { target: { value: "My unsaved note" } });
+    await act(async () => { await clients[0].invalidateQueries(); });
+    expect(note).toHaveValue("My unsaved note");
+    expect(screen.queryByText("已核验事实依据")).not.toBeInTheDocument();
+    expect(requests).toEqual([]);
+  });
+
+  it("fills the outline editor from an imported reference document without saving it", async () => {
+    const confirmSpy = vi.spyOn(window, "confirm").mockReturnValue(true);
+    renderPlanning();
+    fireEvent.click(await screen.findByRole("button", { name: "选择大纲" }));
+    const input = screen.getByText("选择参考综述文档").closest("label")!.querySelector("input[type=file]") as HTMLInputElement;
+    const file = new File(["# Title\n\n## 1. Introduction\n"], "reference.md", { type: "text/markdown" });
+    fireEvent.change(input, { target: { files: [file] } });
+    expect(await screen.findByText(/已从《reference\.md》导入 2 个章节/)).toBeInTheDocument();
+    expect(screen.getByText(/已跳过非章节内容：Abstract、References/)).toBeInTheDocument();
+    // The editor strips the section number from the heading text it shows.
+    expect(screen.getAllByRole("textbox", { name: "章节标题" })[0]).toHaveValue("Introduction");
+    // Importing only fills the editor: the outline itself is not written until the user saves.
+    expect(requests.filter((item) => item.path === `${planningPath}/outline`)).toEqual([]);
+    confirmSpy.mockRestore();
+  });
+
+  it("loads the opened paper's records on demand and takes its status from the list digest", async () => {
+    // Reading is not finished, so the status comes from the limited-record check —
+    // which now reads the list digest instead of records the list does not carry.
+    const enrichment = { status: "partial", review_readiness: "complete" };
+    payload = { ...payload, literature_matrix: { rows: [{ paper_id: "P001", title: "Mechanism study",
+      facts_digest: { has_pending_revision: false, has_limited_fact: true }, fact_enrichment: enrichment }] } };
+    matrixRowDetail = { P001: { paper_id: "P001", title: "Mechanism study", fact_enrichment: enrichment,
+      scientific_facts: [{ fact_id: "F1", field_id: "finding", value: "Reaction proceeds at room temperature.",
+        support_level: "context_only", verification: { status: "uncertain" } }] } };
+    renderPlanning();
+    // The list row carries no records, so this text can only come from the paper's own row.
+    expect(await screen.findByText("Reaction proceeds at room temperature.")).toBeInTheDocument();
+    // The digest reports the limitation although the records did not arrive with the list.
+    expect(screen.getByText(/分析已完成，但部分记录不确定/)).toBeInTheDocument();
+    expect(requests).toEqual([]);
+  });
+
+  it("does not report a paper as fact-free while its records are still loading", async () => {
+    payload = { ...payload, literature_matrix: { rows: [{ paper_id: "P001", title: "Mechanism study",
+      facts_digest: { has_pending_revision: false, has_limited_fact: false },
+      fact_enrichment: { status: "complete", review_readiness: "complete",
+        processing: { reading: "completed", extraction: "completed", verification: "not_required" },
+        fact_extraction_profile: { reading_strategy: "review-oriented/1", reading_status: "completed", reading_source_key: "source-1" } } }] } };
+    const originalFetch = vi.mocked(globalThis.fetch).getMockImplementation()!;
+    vi.mocked(globalThis.fetch).mockImplementation(async (input, init = {}) => {
+      if (String(input).startsWith(`${planningPath}/matrix/`)) return new Promise<Response>(() => {});
+      return originalFetch(input, init);
+    });
+    renderPlanning();
+    expect(await screen.findByText("正在加载本篇的事实记录…")).toBeVisible();
+    expect(screen.queryByText(/当前没有可单独列出的发现/)).not.toBeInTheDocument();
   });
 });

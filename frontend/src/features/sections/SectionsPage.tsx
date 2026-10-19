@@ -16,10 +16,12 @@ import { buildPaperDisplayLabels, replacePaperIdsForDisplay } from "../../utils/
 import { SectionJobProgress } from "./SectionJobProgress";
 import { SectionStageActions } from "./SectionStageActions";
 import { findSectionJobForDisplay, replaceSectionJobSnapshot } from "./sectionJobResume";
+import { useSectionStatusSync } from "./useSectionStatusSync";
 import { sectionReadinessLabel } from "./sectionStatusLabels";
 import type { PlanningPayload } from "../planning/PlanningPage";
-import { ChapterPlanningWorkspace } from "../planning/ChapterPlanningWorkspace";
+import { ChapterPlanningWorkspace } from "./ChapterPlanningWorkspace";
 import { usePlanningCompletionSync } from "../planning/usePlanningCompletionSync";
+import { ChapterRewrite } from "./ChapterRewrite";
 
 type SectionTask = Record<string, unknown> & {
   section_id?: string;
@@ -185,6 +187,7 @@ type SectionDraftState = ContentDiagnostics & {
 };
 
 type SectionsPayload = {
+  section_index_artifact_id?: string;
   project_id: string;
   section_tasks: SectionTask[];
   section_files: SectionFile[];
@@ -300,12 +303,12 @@ function SynthesisView({ section, mode }: { section?: { summary?: string; compon
   return <div className="academic-state-view"><header><span className="step-label">{text("自动综合", "Automatic synthesis")}</span><h2>{text("章节知识综合", "Section knowledge synthesis")}</h2><p>{section.summary || text("综合组件已按当前证据准备。", "Synthesis components were prepared from current evidence.")}</p><small>{mode}</small></header><div className="academic-card-list">{(section.components || []).map((component) => <article key={component.component_id}><div><strong>{component.component_type}</strong><span className={`status-pill ${component.status === "supported" ? "ok" : "warning"}`}>{component.status}</span></div><p>{component.summary || component.purpose}</p><footer><span>{component.necessity}</span><span>{text(`${component.evidence_keys?.length || 0} 个证据键`, `${component.evidence_keys?.length || 0} evidence keys`)}</span></footer></article>)}</div></div>;
 }
 
-function WritingPlanView({ section, paperLabels }: { section?: { route?: string; overview_intent?: string; paragraphs?: WritingParagraph[]; claims?: WritingClaim[]; narrative_diagnostics?: NarrativeDiagnostics }; paperLabels: Map<string, string> }) {
+export function WritingPlanView({ section, paperLabels }: { section?: { route?: string; overview_intent?: string; paragraphs?: WritingParagraph[]; claims?: WritingClaim[]; narrative_diagnostics?: NarrativeDiagnostics }; paperLabels: Map<string, string> }) {
   const { text } = useUiText();
   if (!section) return <div className="empty-state">{text("当前章节尚无写作计划。", "This section has no writing plan yet.")}</div>;
   const claims = new Map((section.claims || []).map((claim) => [claim.claim_id, claim]));
   const narrative = section.narrative_diagnostics;
-  return <div className="academic-state-view"><header><span className="step-label">{text(`路线 ${section.route || "—"}`, `Route ${section.route || "—"}`)}</span><h2>{text("段落与 Claim/Citation 计划", "Paragraph and Claim/Citation plan")}</h2><p>{section.overview_intent}</p>{narrative ? <div className="chip-list"><span className={`status-pill ${narrative.status === "complete" ? "ok" : "warning"}`}>{narrative.status === "complete" ? text("叙事结构完整", "Narrative structure complete") : text("叙事结构偏浅", "Narrative structure shallow")}</span><span>{text(`${narrative.paragraph_count || 0}/${narrative.target_paragraph_count || 0} 段`, `${narrative.paragraph_count || 0}/${narrative.target_paragraph_count || 0} paragraphs`)}</span><span>{text(`${narrative.comparison_paragraph_count || 0}/${narrative.minimum_comparison_paragraphs || 0} 个比较段`, `${narrative.comparison_paragraph_count || 0}/${narrative.minimum_comparison_paragraphs || 0} comparison paragraphs`)}</span></div> : null}</header><div className="academic-card-list">{(section.paragraphs || []).map((paragraph) => <article key={paragraph.paragraph_id}><div><strong>{paragraph.paragraph_id} · {paragraph.argument_role}</strong></div><h3>{paragraph.theme}</h3><p>{paragraph.objective}</p><blockquote>{paragraph.reader_takeaway}</blockquote>{(paragraph.claim_ids || []).map((claimId) => { const claim = claims.get(claimId); return <details key={claimId}><summary>{claimId} · {claim?.claim_kind}</summary><p>{claim?.claim}</p><div className="chip-list">{(claim?.citation_group || []).map((paperId) => <span key={paperId}>{paperLabels.get(paperId) || paperId}</span>)}<span>{claim?.epistemic_status}</span><span>{claim?.support_status}</span></div><small>{claim?.evidence_ceiling}</small></details>; })}</article>)}</div></div>;
+  return <div className="academic-state-view"><header><span className="step-label">{text(`路线 ${section.route || "—"}`, `Route ${section.route || "—"}`)}</span><h2>{text("段落与 Claim/Citation 计划", "Paragraph and Claim/Citation plan")}</h2><p>{section.overview_intent}</p>{narrative ? <div className="chip-list"><span className={`status-pill ${narrative.status === "complete" ? "ok" : narrative.status === "shallow" || narrative.status === "advisory" ? "warning" : ""}`}>{narrative.status === "complete" ? text("叙事审校通过", "Narrative review passed") : narrative.status === "shallow" || narrative.status === "advisory" ? text("有表达优化建议", "Writing suggestions available") : text("未单独评估文风", "Style not separately assessed")}</span><span>{text(`${narrative.paragraph_count || 0} 段`, `${narrative.paragraph_count || 0} paragraphs`)}</span><span>{text(`${narrative.comparison_paragraph_count || 0} 个比较段`, `${narrative.comparison_paragraph_count || 0} comparison paragraphs`)}</span></div> : null}</header><div className="academic-card-list">{(section.paragraphs || []).map((paragraph) => <article key={paragraph.paragraph_id}><div><strong>{paragraph.paragraph_id} · {paragraph.argument_role}</strong></div><h3>{paragraph.theme}</h3><p>{paragraph.objective}</p><blockquote>{paragraph.reader_takeaway}</blockquote>{(paragraph.claim_ids || []).map((claimId) => { const claim = claims.get(claimId); return <details key={claimId}><summary>{claimId} · {claim?.claim_kind}</summary><p>{claim?.claim}</p><div className="chip-list">{(claim?.citation_group || []).map((paperId) => <span key={paperId}>{paperLabels.get(paperId) || paperId}</span>)}<span>{claim?.epistemic_status}</span><span>{claim?.support_status}</span></div><small>{claim?.evidence_ceiling}</small></details>; })}</article>)}</div></div>;
 }
 
 function ReviewView({ section }: { section?: SectionDraftState }) {
@@ -314,7 +317,7 @@ function ReviewView({ section }: { section?: SectionDraftState }) {
   const reviews = section.reviews || [];
   const readiness = String(section.section_readiness?.status || "");
   const depth = section.depth_diagnostics;
-  return <div className="academic-state-view"><header><span className="step-label">{text("自动审校", "Automatic review")}</span><h2>{reviews[0]?.decision || text("待审校", "Pending")}</h2><div className="chip-list">{readiness ? <span className={`status-pill ${readiness === "scientific_complete" ? "ok" : "warning"}`}>{sectionReadinessLabel(readiness, text)}</span> : null}<span>{section.generation_mode || text("标准生成", "Standard")}</span>{depth ? <span>{text(`${depth.actual_word_count || 0}/${depth.minimum_word_count || 0} 词`, `${depth.actual_word_count || 0}/${depth.minimum_word_count || 0} words`)}</span> : null}</div><p>{reviews[0]?.repair_objective || text("Claim、引用与段落身份校验已完成。", "Claim, citation, and paragraph identity validation is complete.")}</p></header><div className="academic-card-list">{(section.validations || []).map((validation, index) => <article key={`${validation.rule_id}-${index}`}><div><strong>{validation.rule_id}</strong><span className={`status-pill ${validation.status === "pass" ? "ok" : "warning"}`}>{validation.status}</span></div><p>{validation.target_id}</p></article>)}{reviews.flatMap((review) => review.issues || []).map((issue, index) => <article key={`${issue.type}-${index}`}><div><strong>{issue.type}</strong><span className="status-pill warning">{issue.severity}</span></div><p>{issue.reason}</p></article>)}</div></div>;
+  return <div className="academic-state-view"><header><span className="step-label">{text("自动审校", "Automatic review")}</span><h2>{reviews[0]?.decision || text("待审校", "Pending")}</h2><div className="chip-list">{readiness ? <span className={`status-pill ${readiness === "scientific_complete" ? "ok" : "warning"}`}>{sectionReadinessLabel(readiness, text)}</span> : null}<span>{section.generation_mode || text("标准生成", "Standard")}</span>{depth ? <span>{text(`${depth.actual_word_count || 0} 词`, `${depth.actual_word_count || 0} words`)}</span> : null}</div><p>{reviews[0]?.repair_objective || text("Claim、引用与段落身份校验已完成。", "Claim, citation, and paragraph identity validation is complete.")}</p></header><div className="academic-card-list">{(section.validations || []).map((validation, index) => <article key={`${validation.rule_id}-${index}`}><div><strong>{validation.rule_id}</strong><span className={`status-pill ${validation.status === "pass" ? "ok" : "warning"}`}>{validation.status}</span></div><p>{validation.target_id}</p></article>)}{reviews.flatMap((review) => review.issues || []).map((issue, index) => <article key={`${issue.type}-${index}`}><div><strong>{issue.type}</strong><span className="status-pill warning">{issue.severity}</span></div><p>{issue.reason}</p></article>)}</div></div>;
 }
 
 export function SectionsPage() {
@@ -330,7 +333,7 @@ export function SectionsPage() {
   const [planningView, setPlanningView] = useState<"auto" | "plan" | "drafts">("auto");
   const planning = useQuery({
     queryKey: ["planning", project?.project_id || ""],
-    queryFn: () => apiRequest<PlanningPayload>(`/api/v1/projects/${encodeURIComponent(project!.project_id)}/planning`),
+    queryFn: () => apiRequest<PlanningPayload>(`/api/v1/projects/${encodeURIComponent(project!.project_id)}/sections/planning`),
     enabled: Boolean(project),
     refetchInterval: (query) => (query.state.data?.blueprint_jobs || []).some((job) => jobIsActive(job.status)) ? 1500 : false,
   });
@@ -340,6 +343,7 @@ export function SectionsPage() {
     !activeBlueprintApproved || Boolean(planning.data?.blueprint_candidate_pending)
   ));
   const showDrafts = activeBlueprintApproved && !showPlanning;
+  useSectionStatusSync(project?.project_id || "", showDrafts, () => setJobId(""));
   const sections = useQuery({
     queryKey: ["sections", project?.project_id || ""],
     queryFn: () => apiRequest<SectionsPayload>(`/api/v1/projects/${encodeURIComponent(project!.project_id)}/sections`),
@@ -355,7 +359,10 @@ export function SectionsPage() {
     Boolean(payload?.handoff.current),
   );
   const polledJob = useJob(jobId || reportJob?.id || "");
-  const currentJob = polledJob.data || reportJob;
+  const currentJob = polledJob.data ? {
+    ...polledJob.data,
+    retry_inputs_current: payload?.report.jobs.find(job => job.id === polledJob.data.id)?.retry_inputs_current,
+  } : reportJob;
   const currentJobActive = Boolean(currentJob && jobIsActive(currentJob.status));
   const reportJobs = useMemo(
     () => replaceSectionJobSnapshot(payload?.report.jobs || [], currentJob),
@@ -363,6 +370,7 @@ export function SectionsPage() {
   );
   const canResumeCurrentJob = Boolean(
     currentJob
+    && currentJob.retry_inputs_current !== false
     && (
       (currentJob.available_actions || []).includes("retry")
       || ["failed", "cancelled", "interrupted"].includes(currentJob.status)
@@ -417,7 +425,7 @@ export function SectionsPage() {
     if (currentJob.status === "succeeded") {
       void queryClient.invalidateQueries({ queryKey: ["sections", project?.project_id || ""] });
     }
-  }, [currentJob, project?.project_id, queryClient]);
+  }, [currentJob?.id, currentJob?.status, project?.project_id, queryClient]);
 
   const activeTask = useMemo(() => {
     const file = files.find((item) => item.name === selectedId);
@@ -434,7 +442,7 @@ export function SectionsPage() {
   const displayedMergedContent = replacePaperIdsForDisplay(payload?.section_drafts_md, paperLabels);
 
   const submission = useRef<{ projectId: string; promise: Promise<Job> } | null>(null);
-  const submitSections = (resume: boolean) => {
+  const submitSections = (resume: boolean, restart = false) => {
     const projectId = project!.project_id;
     if (submission.current?.projectId === projectId) return submission.current.promise;
     const promise = (async () => {
@@ -442,9 +450,14 @@ export function SectionsPage() {
         return await apiRequest<Job>(resume
           ? `/api/v1/jobs/${encodeURIComponent(currentJob!.id)}/retry`
           : `/api/v1/projects/${encodeURIComponent(projectId)}/sections/jobs`, {
-          method: "POST", headers: { "Idempotency-Key": newIdempotencyKey() }, ...jsonBody({}),
+          method: "POST", headers: { "Idempotency-Key": newIdempotencyKey() }, ...jsonBody({ restart }),
         });
       } catch (error) {
+        if (error instanceof ApiError && (error.details.current_outputs_available || error.details.retry_inputs_stale)) {
+          await queryClient.invalidateQueries({ queryKey: ["sections", projectId] });
+          setJobId("");
+          throw error;
+        }
         // A lost response does not imply the server failed to create the job.
         if (!(error instanceof ApiError) || error.status === 409) {
           const latest = await apiRequest<SectionsPayload>(`/api/v1/projects/${encodeURIComponent(projectId)}/sections`).catch(() => null);
@@ -470,7 +483,7 @@ export function SectionsPage() {
     mutationFn: () => submitSections(canResumeCurrentJob), onSuccess: showSubmittedJob,
   });
   const regenerate = useMutation({
-    mutationFn: () => submitSections(false), onSuccess: showSubmittedJob,
+    mutationFn: () => submitSections(false, true), onSuccess: showSubmittedJob,
   });
   const confirm = useMutation({
     mutationFn: () => apiRequest(`/api/v1/projects/${encodeURIComponent(project!.project_id)}/sections/confirm`, {
@@ -501,6 +514,7 @@ export function SectionsPage() {
       {showDrafts && sections.error ? <ErrorState error={sections.error} onRetry={() => sections.refetch()} /> : null}
       {payload ? <>
         {payload.handoff.drafts_stale ? <p className="message message-warning">{text("章节规划已更新，旧章节草稿仍保留，但不会作为当前正文显示。请按需重新生成。", "The chapter plan changed. Old drafts are retained but are not current manuscript content. Regenerate as needed.")}</p> : null}
+        {!payload.handoff.current && payload.report.jobs.some(job => job.retry_inputs_current === false && job.result.section_checkpoint) ? <p className="message message-info">{text("旧续跑任务对应的规划已更新。请使用“生成章节正文”按当前规划开始；历史成果和检查点仍保留。", "The previous continuation uses an older plan. Generate section drafts from the current plan; historical outputs and checkpoints are retained.")}</p> : null}
         {currentJob && currentJobActive && tab !== "report" ? <div className="section-live-progress-banner"><SectionJobProgress job={currentJob} /></div> : null}
         <div className="sections-grid-react">
           <section className="pane section-list-react"><div className="pane-head"><div><span className="step-label">{text("章节", "Sections")}</span><h2>{tasks.length} {text("个章节", "sections")}</h2></div></div><div className="paper-list">{(taskOnly ? tasks : files).map((item) => {
@@ -514,6 +528,9 @@ export function SectionsPage() {
           <section className="pane section-preview-react"><nav className="detail-tabs">{mainTabs.map(([value, label]) => <button key={value} type="button" className={tab === value ? "active" : ""} onClick={() => { setTab(value); setShowAdvanced(false); }}>{label}</button>)}</nav><details className="advanced-panel section-advanced-tabs" open={showAdvanced} onToggle={(event) => setShowAdvanced(event.currentTarget.open)}><summary>{text("生成依据与检查详情", "Generation inputs and checks")}</summary><div className="advanced-panel-body advanced-tab-list">{advancedTabs.map(([value, label]) => <button key={value} type="button" className={tab === value ? "active" : ""} onClick={() => { setTab(value); setShowAdvanced(true); }}>{label}</button>)}</div></details><div className="section-preview-content">
             {tab === "synthesis" ? <SynthesisView section={activeSynthesis} mode={payload.synthesis_state?.planning_mode} /> : null}
             {tab === "writing" ? <WritingPlanView section={activeWritingPlan} paperLabels={paperLabels} /> : null}
+            {tab === "section" && payload.section_index_artifact_id && activeDraftState && !taskOnly ? <ChapterRewrite
+              projectId={project!.project_id} sectionId={taskId(activeTask)} indexArtifactId={payload.section_index_artifact_id}
+              refresh={async () => {await Promise.all([sections.refetch(), queryClient.invalidateQueries({queryKey: ["draft", project!.project_id]})]);}} /> : null}
             {tab === "section" ? <SectionContentNotice section={activeDraftState} /> : null}
             {tab === "section" ? <MarkdownView content={displayedActiveContent} empty={text("当前章节尚未生成。", "This section has not been generated.")} /> : null}
             {tab === "merged" ? <MarkdownView content={displayedMergedContent} empty={text("当前没有合并预览。", "No merged preview is available.")} /> : null}

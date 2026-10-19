@@ -161,6 +161,8 @@ def outline_sections(markdown: str) -> list[dict[str, Any]]:
                 current["section_role"] = role
         elif lowered.startswith("assigned papers:"):
             current["paper_ids"] = _paper_id_list(line.split(":", 1)[1])
+        elif lowered.startswith("supporting papers:"):
+            current["supporting_paper_ids"] = _paper_id_list(line.split(":", 1)[1])
         elif re.match(r"^(?:context|contextual) papers:", line, re.I):
             current["context_paper_ids"] = _paper_id_list(line.split(":", 1)[1])
         else:
@@ -262,6 +264,9 @@ def _append_rendered_section(lines: list[str], section: dict[str, Any]) -> None:
     paper_ids = list(dict.fromkeys(section.get("paper_ids") or []))
     if paper_ids:
         lines.append(f"Assigned papers: {', '.join(paper_ids)}.")
+    supporting = list(dict.fromkeys(section.get("supporting_paper_ids") or []))
+    if supporting:
+        lines.append(f"Supporting papers: {', '.join(supporting)}.")
     context_ids = list(dict.fromkeys(section.get("context_paper_ids") or []))
     if context_ids:
         lines.append(f"Context papers: {', '.join(context_ids)}.")

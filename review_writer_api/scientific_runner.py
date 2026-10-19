@@ -385,6 +385,9 @@ class ScientificRunner:
                         f"Scientific provider timed out{suffix} after "
                         f"{attempt} attempts. Please retry the task."
                     )
+                elif category in {"reasoning_only", "empty_response", "output_limit", "context_limit", "outcome_unknown", "model_unavailable"}:
+                    from review_writer_core.provider_errors import provider_error_message
+                    reason = provider_error_message({"category": category})
                 elif category == "transient_service_unavailable":
                     diagnostic = self._diagnostic_summary(last_stderr, last_stdout)
                     if provider_call_completed:

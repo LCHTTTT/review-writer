@@ -114,7 +114,7 @@ class ArtifactService:
             safe_run_id = str(uuid.UUID(str(run_id)))
         except ValueError as exc:
             raise WorkflowValidationError("Stage run ID is invalid.") from exc
-        project_root = self.workspace_manager.project_path(user_id, project.slug)
+        project_root = self.workspace_manager.project_path(user_id, project.storage_slug or project.slug)
         expected_parent = self._secure_storage_root(project_root, ".staging")
         directory = (expected_parent / safe_run_id).resolve()
         if directory.parent != expected_parent:
@@ -178,7 +178,7 @@ class ArtifactService:
             return existing
 
         artifact_id = str(uuid.uuid4())
-        project_root = self.workspace_manager.project_path(user_id, project.slug)
+        project_root = self.workspace_manager.project_path(user_id, project.storage_slug or project.slug)
         artifacts_root = self._secure_storage_root(project_root, ".artifacts")
         destination = (
             artifacts_root

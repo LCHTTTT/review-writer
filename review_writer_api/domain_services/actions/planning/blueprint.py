@@ -10,6 +10,7 @@ from review_writer_core.claim_contracts import ARGUMENT_CONTRACT
 from review_writer_core.academic_contracts import blueprint_taxonomy_diagnostics
 from review_writer_core.scientific_facts import fact_is_usable, fact_support_spans, fact_needs_verification
 from review_writer_core.classification_axes import classification_contract_from_document
+from review_writer_core.review_fact_readiness import REVIEW_READING_STRATEGY
 from review_writer_api.database import utc_now
 from review_writer_api.errors import (
     WorkflowConflict,
@@ -121,10 +122,10 @@ class PlanningBlueprintActionsMixin:
                     if key in source:
                         row[key] = deepcopy(source[key])
 
-    def blueprint_job_payload(self, principal, project_id, *, revision):
+    def blueprint_job_payload(self, principal, project_id, *, revision, reading_strategy=REVIEW_READING_STRATEGY):
         matrix_job = self.repository.get_current_job(principal.user_id, scope="project",
             project_id=project_id, job_type="matrix.enrich", operation_key="matrix-enrichment")
-        prepared = self.prepare_blueprint(principal, project_id, revision=revision)
+        prepared = self.prepare_blueprint(principal, project_id, revision=revision, reading_strategy=reading_strategy)
         prepared["integrated_fact_enrichment"] = {
             "enabled": True,
             "mode": "reuse_current_facts_and_fill_gaps",
@@ -194,7 +195,8 @@ class PlanningBlueprintActionsMixin:
                 rebased["base_blueprint_artifact_id"] = None
                 rebased["blueprint_revision"] += int(prepared.get("blueprint_state_exists", False))
         self.validate_prepared_blueprint(principal, project_id, rebased)
-        refreshed = self.blueprint_job_payload(principal, project_id, revision=rebased["blueprint_revision"])
+        refreshed = self.blueprint_job_payload(principal, project_id, revision=rebased["blueprint_revision"],
+                                               reading_strategy=prepared.get("reading_strategy"))
         # Pinning and request metadata remain the original job's responsibility.
         refreshed.pop("await_matrix_job_id", None)
         return refreshed
@@ -355,7 +357,13 @@ class PlanningBlueprintActionsMixin:
         if (len({item.get("paper_id") for item in unused}) != len(unused)
             or {item.get("paper_id") for item in unused} != selected - assigned or assigned - selected
             or any(item.get("reason_code") not in {"out_of_scope", "insufficient_evidence"} or not str(item.get("reason") or "").strip() for item in unused)):
-            raise WorkflowValidationError("Every selected paper needs a reviewed assignment or unused-paper reason.")
+            raise WorkflowValidationError(
+                "Some selected papers still need a chapter assignment or a specific exclusion reason. Continue chapter planning; completed chapters will be reused.",
+                details={"unresolved_paper_ids": sorted((selected - assigned) - {
+                    item.get("paper_id") for item in unused
+                    if item.get("reason_code") in {"out_of_scope", "insufficient_evidence"} and str(item.get("reason") or "").strip()
+                })},
+            )
         blueprint["taxonomy_diagnostics"] = blueprint_taxonomy_diagnostics(blueprint, selected)
         promotion = {BLUEPRINT_LOGICAL_NAME: artifact.id}
         # Publication may reuse identical immutable inputs from an earlier run.

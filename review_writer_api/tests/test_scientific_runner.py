@@ -58,6 +58,18 @@ class ScientificRunnerTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temporary.cleanup()
 
+    def test_reasoning_only_failure_never_replays_the_scientific_batch(self):
+        script = ("import pathlib,sys,json; p=pathlib.Path('attempts.txt'); "
+                  "p.write_text(str(int(p.read_text())+1) if p.exists() else '1'); "
+                  "sys.stderr.write('REVIEW_WRITER_ERROR:'+json.dumps({'category':'reasoning_only','http_status':502})+'\\n'); sys.exit(2)")
+        with self.assertRaises(self.RunFailed) as failed:
+            self.runner.run([sys.executable, '-c', script], cwd=self.root,
+                staging_directory=self.root, expected_outputs=('never.txt',))
+        self.assertEqual('1', (self.root / 'attempts.txt').read_text())
+        self.assertEqual(1, failed.exception.attempts)
+        self.assertFalse(failed.exception.retryable)
+        self.assertIn('仅返回推理内容', str(failed.exception))
+
     def test_model_wait_marker_reports_wait_without_losing_job_lease(self):
         from review_writer_api.worker_wait_state import bind_model_wait_callback
 

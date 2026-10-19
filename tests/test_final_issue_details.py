@@ -64,3 +64,9 @@ def test_final_issue_details_retains_concrete_targets() -> None:
         ("claim", "S02-p1-C01"),
         ("reference", "P002"),
     }
+def test_paper_label_findings_show_the_leaked_phrase_without_duplicate_generic_warning():
+    rows = final_issue_details({"publication_voice_issues": [
+        {"code": "internal_paper_identifier", "phrase": "P502", "line": 4}],
+        "warning_issues": ["publication_voice_leakage"]})
+    assert rows == [{"target_type": "manuscript", "target_id": "current_final",
+                     "issues": ["internal_paper_identifier"], "title": "P502"}]

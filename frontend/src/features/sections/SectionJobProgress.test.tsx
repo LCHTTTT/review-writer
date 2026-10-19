@@ -109,6 +109,28 @@ describe("SectionJobProgress", () => {
     expect(screen.getByRole("progressbar", { name: "章节生成进度" })).toHaveAttribute("aria-valuenow", "10");
   });
 
+  it("shows evidence preparation separately from completed prose", () => {
+    render(<SectionJobProgress job={job({ progress_current: 0, result: { section_progress: {
+      phase: "preparing_evidence", current_heading: "My chapter", prepared_section_count: 3,
+      preparation_total: 28, retrieval_count: 17, reused_prepared_sections: 2, completed_sections: [],
+    } } })} />);
+    expect(screen.getByText("正在准备章节证据：My chapter")).toBeInTheDocument();
+    expect(screen.getByText(/证据已准备 3\/28 章；本次已检索 17 次，复用 2 章。正文尚未开始生成/)).toBeInTheDocument();
+    expect(screen.queryByText("正在生成：My chapter")).not.toBeInTheDocument();
+    expect(screen.getByText("3/28")).toBeInTheDocument();
+    expect(screen.getByRole("progressbar", { name: "章节证据准备进度" })).toHaveAttribute("aria-valuenow", "11");
+  });
+
+  it("shows batched query preparation without presenting it as drafted chapters", () => {
+    render(<SectionJobProgress job={job({ progress_current: 0, result: { section_progress: {
+      phase: "preparing_evidence", preparation_step: "query_embeddings", query_embedding_ready: 24,
+      query_embedding_total: 75, preparation_total: 28, completed_sections: [],
+    } } })} />);
+    expect(screen.getByText("正在批量准备检索问题")).toBeInTheDocument();
+    expect(screen.getByText(/已完成 24\/75 个问题的向量准备/)).toBeInTheDocument();
+    expect(screen.getByText("0/28")).toBeInTheDocument();
+  });
+
   it("shows finalization while the job remains active at the chapter total", () => {
     render(<SectionJobProgress job={job({ progress_current: 10 })} />);
     expect(screen.getByText("章节正文已全部生成")).toBeInTheDocument();

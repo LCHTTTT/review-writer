@@ -39,7 +39,7 @@ from .config import ApiSettings
 from .container import ApplicationContainer
 from .credentials import ProviderSettingsError
 from .database import create_session_factory, utc_now
-from .errors import ProjectArchiveFailed, WorkflowError
+from .errors import WorkflowError
 from .system_errors import FailureRecorder, list_failures, record_failure, safe_summary
 from .job_service import JobService
 from .gateway_client import test_provider_through_gateway
@@ -95,41 +95,31 @@ from .schemas import (
     PrincipalResponse,
     ProviderSettingsListResponse,
     ProviderSettingsResponse,
-    ProjectCreateRequest,
-    ProjectListResponse,
-    ProjectModelTierUpdateRequest,
-    ProjectResponse,
-    ProjectTaxonomyProfileUpdateRequest,
-    ProjectTaxonomyProfileUpdateResponse,
-    TaxonomyProfileCatalogResponse,
     RegisterRequest,
     CreditTransactionListResponse,
     CreditTransactionResponse,
     UsageSummaryResponse,
     UsageTimelineResponse,
 )
-from review_writer_core.taxonomy import (
-    NEW_PROJECT_TAXONOMY_PROFILE,
-    taxonomy_profile_catalog,
-)
 from .server_providers import ServerProviderSettingsService
 from .password_reset_mailer import SmtpPasswordResetMailer
-from .security import AuthorizationError, Permission, Principal, local_owner_principal
+from .security import AuthorizationError, Permission, Principal, bearer_token, local_owner_principal
 from .services import ProjectService
 from .routers.files import build_file_router
+from .routers.projects import build_projects_router
 from .routers.jobs import build_job_router
 from .routers.library import build_library_router
 from .routers.discovery import build_discovery_router
 from .routers.drafts import build_drafts_router
 from .routers.final import build_final_router
 from .routers.planning import build_planning_router
-from .routers.sections import build_sections_router
+from .routers.sections import build_sections_router, build_chapter_planning_router
 from .job_handlers.stage_execution import register_planning_handlers, register_sections_handler
 from .job_handlers.discovery_execution import register_discovery_handlers
 from .job_handlers.figures_execution import register_figure_handlers
 from .job_handlers.draft_execution import register_draft_handlers
 from .job_handlers.final_execution import register_final_handlers
-from .routers.figures import build_figures_router
+from .routers.images import build_images_router
 from .scientific_runner import ScientificRunner
 from .workflow_repository import WorkflowRepository
 from .workspaces import HostedWorkspaceManager
@@ -325,7 +315,11 @@ def create_app(
         else None
     )
     drafts_service = (
-        DraftsService(workflow_repository, artifact_service)
+        DraftsService(
+            workflow_repository,
+            artifact_service,
+            reaction_quickref_tables=resolved.reaction_quickref_tables,
+        )
         if workflow_repository is not None and artifact_service is not None
         else None
     )
@@ -344,6 +338,8 @@ def create_app(
             model_gateway,
             planning_service=planning_service,
             sections_service=sections_service,
+            runtime_settings=resolved,
+            session_factory=session_factory,
         ).mapping()
         if scientific_runner is not None and hosted_workspace_manager is not None
         else {}
@@ -514,6 +510,7 @@ def create_app(
         response.headers["Cross-Origin-Opener-Policy"] = "same-origin"
         if request.url.path in {
             "/",
+            "/guide",
             "/admin",
             "/settings",
             "/library",
@@ -523,6 +520,7 @@ def create_app(
             "/images",
             "/draft",
             "/final",
+            "/conversation",
         }:
             response.headers["Content-Security-Policy"] = portal_csp()
             response.headers["Cache-Control"] = "no-store"
@@ -544,6 +542,7 @@ def create_app(
             "/figures",
             "/draft",
             "/final",
+            "/conversation",
         }:
             return True
         if not path.startswith("/api/"):
@@ -1057,111 +1056,9 @@ def create_app(
                 billing_service.admin_usage_summary()
             )
 
-    @app.get("/api/v1/projects", response_model=ProjectListResponse, tags=["projects"])
-    def projects(principal: Principal = Depends(current_principal)) -> ProjectListResponse:
-        items = project_service.list_projects(principal)
-        return ProjectListResponse(items=items, count=len(items))
-
-    @app.get(
-        "/api/v1/taxonomy-profiles",
-        response_model=TaxonomyProfileCatalogResponse,
-        tags=["projects"],
+    app.include_router(
+        build_projects_router(current_principal, project_service, artifact_service)
     )
-    def taxonomy_profiles(
-        _principal: Principal = Depends(current_principal),
-    ) -> TaxonomyProfileCatalogResponse:
-        return TaxonomyProfileCatalogResponse(
-            items=taxonomy_profile_catalog(),
-            default_profile=NEW_PROJECT_TAXONOMY_PROFILE,
-        )
-
-    @app.post(
-        "/api/v1/projects",
-        response_model=ProjectResponse,
-        status_code=status.HTTP_201_CREATED,
-        tags=["projects"],
-    )
-    def create_project(
-        payload: ProjectCreateRequest,
-        principal: Principal = Depends(current_principal),
-    ) -> ProjectResponse:
-        record = project_service.create_project(
-            principal,
-            slug=payload.slug,
-            topic=payload.topic,
-            taxonomy_profile=payload.taxonomy_profile,
-            model_tier=payload.model_tier,
-        )
-        return ProjectResponse.model_validate(record)
-
-    @app.patch(
-        "/api/v1/projects/{project_id}/model-tier",
-        response_model=ProjectResponse,
-        tags=["projects"],
-    )
-    def update_project_model_tier(
-        project_id: str,
-        payload: ProjectModelTierUpdateRequest,
-        principal: Principal = Depends(current_principal),
-    ) -> ProjectResponse:
-        record = project_service.update_project_model_tier(
-            principal, project_id, model_tier=payload.model_tier
-        )
-        return ProjectResponse.model_validate(record)
-
-    @app.patch(
-        "/api/v1/projects/{project_id}/taxonomy-profile",
-        response_model=ProjectTaxonomyProfileUpdateResponse,
-        tags=["projects"],
-    )
-    def update_project_taxonomy_profile(
-        project_id: str,
-        payload: ProjectTaxonomyProfileUpdateRequest,
-        principal: Principal = Depends(current_principal),
-    ) -> ProjectTaxonomyProfileUpdateResponse:
-        result = project_service.update_project_taxonomy_profile(
-            principal,
-            project_id,
-            taxonomy_profile=payload.taxonomy_profile,
-            confirm_downstream_invalidation=payload.confirm_downstream_invalidation,
-        )
-        return ProjectTaxonomyProfileUpdateResponse(
-            project=ProjectResponse.model_validate(result.project),
-            changed=result.changed,
-            matrix_entered=result.matrix_entered,
-            downstream_stale=result.downstream_stale,
-        )
-
-    @app.get("/api/v1/projects/{project_id}", response_model=ProjectResponse, tags=["projects"])
-    def project(project_id: str, principal: Principal = Depends(current_principal)) -> ProjectResponse:
-        record = project_service.get_project(principal, project_id)
-        if record is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found.")
-        return ProjectResponse.model_validate(record)
-
-    @app.delete(
-        "/api/v1/projects/{project_id}",
-        status_code=status.HTTP_204_NO_CONTENT,
-        tags=["projects"],
-    )
-    def delete_project(
-        project_id: str,
-        principal: Principal = Depends(current_principal),
-    ) -> None:
-        record = project_service.get_project(principal, project_id)
-        if record is None:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found.")
-        if not project_service.delete_project(principal, record.project_id):
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Project not found.")
-        if artifact_service is not None:
-            try:
-                artifact_service.trash_project(principal.user_id, record.slug)
-            except Exception as exc:
-                restored = project_service.restore_project(principal, record.project_id)
-                raise ProjectArchiveFailed(
-                    "The project files could not be archived; database deletion was rolled back.",
-                    details={"database_restored": restored},
-                ) from exc
 
     if provider_settings_service is not None:
 
@@ -1190,7 +1087,8 @@ def create_app(
         ):
             principal.require(Permission.PROVIDER_MANAGE)
             try:
-                return save_model_concurrency(session_factory, payload.limits, principal.user_id)
+                return save_model_concurrency(session_factory, payload.limits, principal.user_id,
+                                              fact_paper_concurrency=payload.fact_paper_concurrency)
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -1318,6 +1216,11 @@ def create_app(
 
     if isinstance(model_gateway, ModelGatewayService):
 
+        def internal_gateway_token(request: Request) -> str:
+            if not resolved.embedded_gateway_routes_enabled:
+                raise HTTPException(status_code=404, detail="Not Found")
+            return bearer_token(str(request.headers.get("Authorization") or ""))
+
         @app.post(
             "/api/internal/v1/model-responses",
             response_model=ModelGatewayResponse,
@@ -1327,14 +1230,7 @@ def create_app(
             payload: ModelGatewayRequest,
             request: Request,
         ) -> ModelGatewayResponse:
-            if not resolved.embedded_gateway_routes_enabled:
-                raise HTTPException(status_code=404, detail="Not Found")
-            authorization = str(request.headers.get("Authorization") or "")
-            token = (
-                authorization[7:].strip()
-                if authorization.casefold().startswith("bearer ")
-                else ""
-            )
+            token = internal_gateway_token(request)
             try:
                 result = await model_gateway.complete(
                     token,
@@ -1353,10 +1249,7 @@ def create_app(
             include_in_schema=False,
         )
         def internal_model_result(request_key: str, request: Request) -> ModelGatewayResultResponse:
-            if not resolved.embedded_gateway_routes_enabled:
-                raise HTTPException(status_code=404, detail="Not Found")
-            authorization = str(request.headers.get("Authorization") or "")
-            token = authorization[7:].strip() if authorization.casefold().startswith("bearer ") else ""
+            token = internal_gateway_token(request)
             try:
                 result = model_gateway.request_result(token, request_key=request_key)
             except ModelGatewayError as exc:
@@ -1369,10 +1262,7 @@ def create_app(
             include_in_schema=False,
         )
         def internal_model_delegation(payload: ModelGatewayRequest, request: Request) -> ModelDelegationResponse:
-            if not resolved.embedded_gateway_routes_enabled:
-                raise HTTPException(status_code=404, detail="Not Found")
-            authorization = str(request.headers.get("Authorization") or "")
-            token = authorization[7:].strip() if authorization.casefold().startswith("bearer ") else ""
+            token = internal_gateway_token(request)
             try:
                 result = model_gateway.delegate_text(
                     token, request_key=payload.request_key, stage=payload.stage,
@@ -1388,10 +1278,7 @@ def create_app(
             include_in_schema=False,
         )
         def internal_model_delegation_status(request_key: str, request: Request) -> ModelDelegationResponse:
-            if not resolved.embedded_gateway_routes_enabled:
-                raise HTTPException(status_code=404, detail="Not Found")
-            authorization = str(request.headers.get("Authorization") or "")
-            token = authorization[7:].strip() if authorization.casefold().startswith("bearer ") else ""
+            token = internal_gateway_token(request)
             try:
                 result = model_gateway.delegated_text_status(token, request_key=request_key)
             except ModelGatewayError as exc:
@@ -1407,14 +1294,7 @@ def create_app(
             payload: EmbeddingGatewayRequest,
             request: Request,
         ) -> EmbeddingGatewayResponse:
-            if not resolved.embedded_gateway_routes_enabled:
-                raise HTTPException(status_code=404, detail="Not Found")
-            authorization = str(request.headers.get("Authorization") or "")
-            token = (
-                authorization[7:].strip()
-                if authorization.casefold().startswith("bearer ")
-                else ""
-            )
+            token = internal_gateway_token(request)
             try:
                 result = await model_gateway.complete_embeddings(
                     token,
@@ -1435,14 +1315,7 @@ def create_app(
             payload: ImageGatewayRequest,
             request: Request,
         ) -> ImageGatewayResponse:
-            if not resolved.embedded_gateway_routes_enabled:
-                raise HTTPException(status_code=404, detail="Not Found")
-            authorization = str(request.headers.get("Authorization") or "")
-            token = (
-                authorization[7:].strip()
-                if authorization.casefold().startswith("bearer ")
-                else ""
-            )
+            token = internal_gateway_token(request)
             try:
                 result = await model_gateway.complete_image(
                     token,
@@ -1541,6 +1414,7 @@ def create_app(
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND)
 
     @app.get("/login", include_in_schema=False)
+    @app.get("/guide", include_in_schema=False)
     @app.get("/workspace", include_in_schema=False)
     @app.get("/settings", include_in_schema=False)
     @app.get("/admin", include_in_schema=False)
@@ -1551,6 +1425,7 @@ def create_app(
     @app.get("/images", include_in_schema=False)
     @app.get("/draft", include_in_schema=False)
     @app.get("/final", include_in_schema=False)
+    @app.get("/conversation", include_in_schema=False)
     def workflow_page(
         _workflow: None = Depends(require_native_workflow),
     ) -> Response:
@@ -1624,6 +1499,7 @@ def create_app(
         )
     if planning_service is not None and job_service is not None:
         register_planning_handlers(planning_service, job_service, native_handlers)
+        app.include_router(build_chapter_planning_router(current_principal, planning_service, job_service))
         app.include_router(
             build_planning_router(
                 current_principal,
@@ -1642,15 +1518,11 @@ def create_app(
         )
     if figures_service is not None and job_service is not None:
         register_figure_handlers(figures_service, job_service, native_handlers)
-        app.include_router(
-            build_figures_router(
-                current_principal,
-                figures_service,
-                job_service,
-            )
-        )
+        image_router = build_images_router(current_principal, figures_service, job_service)
+        app.include_router(image_router, prefix="/api/v1/projects/{project_id}/images")
+        app.include_router(image_router, prefix="/api/v1/projects/{project_id}/figures", include_in_schema=False)
     if drafts_service is not None and job_service is not None:
-        register_draft_handlers(drafts_service, job_service, native_handlers)
+        register_draft_handlers(drafts_service, job_service, native_handlers, planning_service)
         app.include_router(
             build_drafts_router(
                 current_principal,
@@ -1659,6 +1531,15 @@ def create_app(
                 final_service,
             )
         )
+    if sections_service is not None and job_service is not None:
+        from .routers.section_rewrites import build_section_rewrites_router
+        app.include_router(build_section_rewrites_router(current_principal, sections_service, job_service))
+    if planning_service is not None:
+        from .routers.planning_field_edits import build_planning_field_router
+        app.include_router(build_planning_field_router(current_principal, planning_service))
+    if drafts_service is not None:
+        from .routers.draft_sync import build_draft_sync_router
+        app.include_router(build_draft_sync_router(current_principal, drafts_service))
     if final_service is not None and job_service is not None:
         register_final_handlers(final_service, job_service, native_handlers)
         app.include_router(
@@ -1669,4 +1550,58 @@ def create_app(
                 library_service=library_service,
             )
         )
+    if job_service is not None:
+        from .application_operations import register_retry_validators
+        register_retry_validators(job_service, sections=sections_service, planning=planning_service,
+                                  discovery=discovery_service, figures=figures_service, final=final_service)
+    # Optional adapters depend on the workflow, never the reverse. No storage
+    # migration or stage mutation occurs during initialization.
+    from .conversation_feature import conversation_enabled
+    conversation_ready = False
+    if container is not None and conversation_enabled():
+        try:
+            from .domain_services.conversation import ConversationService
+            from .job_handlers.conversation import register_conversation_handler
+            from .routers.conversation import build_conversation_router
+            from .domain_services.conversation_actions import ConversationActions
+            from .job_handlers.conversation_actions import register_conversation_actions
+            from .domain_services.conversation_execution import ConversationExecution
+            from .job_handlers.conversation_execution import register_conversation_execution
+            conversation_service = ConversationService(workflow_repository, artifact_service, library_service)
+            conversation_service.actions = ConversationActions(conversation_service, container)
+            conversation_service.execution = ConversationExecution(conversation_service, conversation_service.actions, job_service)
+            router = build_conversation_router(current_principal, conversation_service, job_service)
+            register_conversation_actions(conversation_service.actions, job_service)
+            register_conversation_execution(conversation_service.execution, job_service)
+            register_conversation_handler(conversation_service, job_service, model_gateway,
+                                          model_call=native_overrides.get("conversation.model"))
+            from .domain_services.conversation_sessions import register_sessions
+            from .routers.conversation_sessions import build_sessions_router
+            register_sessions(conversation_service, job_service)
+            from .domain_services.conversation_attachments import register_attachments
+            from .routers.conversation_attachments import build_attachments_router
+            register_attachments(conversation_service, job_service)
+            app.include_router(build_attachments_router(current_principal, conversation_service, job_service))
+            app.include_router(build_sessions_router(current_principal, conversation_service))
+            app.include_router(build_sessions_router(current_principal, conversation_service, preparation=True))
+            app.state.conversation_service = conversation_service
+            app.include_router(router)
+            from .routers.conversation_preparation import build_preparation_router
+            app.include_router(build_preparation_router(current_principal, conversation_service, job_service))
+            conversation_ready = True
+        except Exception:
+            LOGGER.exception("Optional project conversation initialization failed; original stage services remain available.")
+
+    @app.get("/api/v1/conversation/config")
+    def conversation_config(_principal=Depends(current_principal)):
+        return {"enabled": conversation_ready and conversation_enabled(), "implementation": "scoped-execution-v2"}
+
+    if not conversation_ready:
+        @app.api_route("/api/v1/projects/{project_id}/conversation/{path:path}", methods=["GET", "POST"], include_in_schema=False)
+        def unavailable_conversation(project_id: str, path: str, _principal=Depends(current_principal)):
+            raise HTTPException(503, "Project conversation is unavailable. Stage pages remain available.")
+
+        @app.api_route("/api/v1/conversation/preparation/{path:path}", methods=["GET", "POST"], include_in_schema=False)
+        def unavailable_preparation(path: str, _principal=Depends(current_principal)):
+            raise HTTPException(503, "Conversation preparation is unavailable. Project creation remains available.")
     return app

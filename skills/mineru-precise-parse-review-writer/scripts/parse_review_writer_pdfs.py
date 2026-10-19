@@ -33,7 +33,9 @@ def default_review_root() -> Path:
 
 
 REVIEW_ROOT = default_review_root()
-DEFAULT_INPUT_DIR = REVIEW_ROOT / "Progargylic"
+# Never a paper-title folder: a caller relying on the default must still find a
+# real directory, otherwise single-file runs fail before parsing starts.
+DEFAULT_INPUT_DIR = REVIEW_ROOT / "review-library" / "uploads"
 DEFAULT_OUTPUT_DIR = REVIEW_ROOT / "mineru-outputs"
 DEFAULT_TIMEOUT_MINUTES = 30
 DEFAULT_POLL_INTERVAL_SECONDS = 5

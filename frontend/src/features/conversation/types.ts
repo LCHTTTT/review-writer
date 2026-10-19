@@ -1,0 +1,7 @@
+import type { Job } from "../../api/types";
+export type ResultCard = { id: string; label: string; stage: string; logical_name: string; current: boolean; created_at: string; format: string; url: string; sha256: string };
+export type Overview = { topic: string; model_tier: string; stages: Array<{ id: string; checkpoints: Array<{ id: string; status: string; revision: number }> }>; artifacts: ResultCard[]; jobs: Job[] };
+export type ActionProposal = { id: string; name: string; label: string; arguments: Record<string, unknown>; notice: string; preview?: { original_text?: string; candidate_text?: string; preview_truncated?: boolean; validation_errors?: unknown[] } };
+export type Turn = Job & { message: string; object_id: string; attachments?: Array<{id: string; name: string; status: string; kind: string; paper_id: string}>; result: { activity?: {phase: string; round?: number; completed_reads?: number}; reply?: string; tool_events?: Array<{ id: string; name: string; status: string }>; artifact_ids?: string[]; actions?: ActionProposal[]; executions?: Job[]; interrupted_by?: string; project_proposal?: { slug: string; topic: string; taxonomy_profile: string }; bound_project_id?: string } };
+export type History = { turns: Turn[]; next_cursor: string | null };
+export type ArtifactRead = { artifact_id: string; current: boolean; text: string; offset: number; next_offset: number | null; complete: boolean; total_chars: number };

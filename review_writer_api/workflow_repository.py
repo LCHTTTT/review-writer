@@ -11,7 +11,7 @@ from sqlalchemy import and_, case, delete, exists, func, or_, select, text, upda
 from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import aliased
+from sqlalchemy.orm import aliased, defer
 
 from review_writer_api.database import Project, User, database_session, utc_now
 from review_writer_api.errors import (
@@ -22,8 +22,7 @@ from review_writer_api.errors import (
 )
 from review_writer_api.workflow_contracts import (
     ARTIFACT_OWNER_STAGE_BY_PREFIX,
-    INTERNAL_STAGES,
-    current_user_stage,
+    WORKFLOW_CHECKPOINTS,
 )
 from review_writer_api.job_queues import INTERACTIVE_JOB_TYPES, queue_for_job_type
 from review_writer_core.workflow.artifacts import (
@@ -166,6 +165,7 @@ class OwnedProjectRecord:
     topic: str
     taxonomy_profile: str
     model_tier: str
+    storage_slug: str = ""
 
 
 @dataclass(frozen=True)
@@ -221,7 +221,13 @@ class WorkflowRepository:
         )
 
     @staticmethod
-    def _job_record(job: WorkflowJob) -> JobRecord:
+    def _job_record(job: WorkflowJob, *, include_payload: bool = True) -> JobRecord:
+        """Map one job row.
+
+        ``include_payload=False`` is for polling views that read only status and
+        progress: a chapter-planning payload can be several megabytes and is
+        never displayed.
+        """
         return JobRecord(
             id=str(job.id),
             user_id=str(job.user_id),
@@ -234,7 +240,7 @@ class WorkflowRepository:
             queue_reason=job.queue_reason,
             idempotency_scope_key=job.idempotency_scope_key,
             idempotency_key=job.idempotency_key,
-            payload=dict(job.payload_json or {}),
+            payload=dict(job.payload_json or {}) if include_payload else {},
             result=dict(job.result_json or {}),
             progress_current=job.progress_current,
             progress_total=job.progress_total,
@@ -348,6 +354,7 @@ class WorkflowRepository:
                 topic=project.topic,
                 taxonomy_profile=project.taxonomy_profile,
                 model_tier=project.model_tier,
+                storage_slug=project.storage_slug or project.slug,
             )
 
     def get_stage_state(
@@ -385,97 +392,14 @@ class WorkflowRepository:
         current Matrix and every later artifact therefore remain visible until the user
         explicitly confirms the new selection.
         """
-        user_uuid = self._uuid(user_id, not_found_message="Project not found.")
-        project_uuid = self._uuid(project_id, not_found_message="Project not found.")
-        artifact_uuid = self._uuid(artifact_id, not_found_message="Artifact not found.")
-        run_uuid = self._uuid(run_id, not_found_message="Stage run not found.")
-        with database_session(self.session_factory) as session:
-            project = session.scalar(
-                select(Project)
-                .where(
-                    Project.id == project_uuid,
-                    Project.user_id == user_uuid,
-                    Project.deleted_at.is_(None),
-                )
-                .with_for_update()
-            )
-            if project is None:
-                raise WorkflowNotFound("Project not found.")
-            artifact = session.scalar(
-                select(WorkflowArtifact).where(
-                    WorkflowArtifact.id == artifact_uuid,
-                    WorkflowArtifact.project_id == project_uuid,
-                    WorkflowArtifact.logical_name == "discovery/review.json",
-                    WorkflowArtifact.producer_stage == "discovery",
-                )
-            )
-            if artifact is None:
-                raise WorkflowNotFound("Artifact not found.")
-            run = session.scalar(
-                select(WorkflowStageRun).where(
-                    WorkflowStageRun.id == run_uuid,
-                    WorkflowStageRun.project_id == project_uuid,
-                    WorkflowStageRun.stage_id == "discovery",
-                )
-            )
-            if run is None:
-                raise WorkflowNotFound("Stage run not found.")
-            state = session.scalar(
-                select(WorkflowStageState)
-                .where(
-                    WorkflowStageState.project_id == project_uuid,
-                    WorkflowStageState.stage_id == "discovery",
-                )
-                .with_for_update()
-            )
-            actual = state.revision if state else 0
-            if actual != expected_revision:
-                raise WorkflowConflict(
-                    "Discovery changed since it was loaded.",
-                    details={
-                        "expected_revision": expected_revision,
-                        "actual_revision": actual,
-                    },
-                )
-            now = utc_now()
-            self._upsert_current_artifact(
-                session,
-                project_id=project_uuid,
-                logical_name="discovery/review.json",
-                artifact_id=artifact_uuid,
-            )
-            if state is None:
-                state = WorkflowStageState(
-                    project_id=project_uuid,
-                    stage_id="discovery",
-                    status="review",
-                    revision=1,
-                    current_run_id=run_uuid,
-                )
-                session.add(state)
-            else:
-                state.status = "review"
-                state.current_run_id = run_uuid
-                state.revision = actual + 1
-                state.error_code = ""
-                state.error_message = ""
-                state.updated_at = now
-            stored = dict(project.stage_states or {})
-            stored["discovery"] = {"status": state.status, "revision": state.revision}
-            project.stage_states = stored
-            project.current_stage = current_user_stage(
-                {
-                    key: (
-                        value.get("status", "pending")
-                        if isinstance(value, dict)
-                        else str(value)
-                    )
-                    for key, value in stored.items()
-                }
-            )
-            project.updated_at = now
-            session.flush()
-            return self._stage_record(state)
+        return self._promote_discovery_atomically(
+            user_id,
+            project_id,
+            artifact_id=artifact_id,
+            run_id=run_id,
+            expected_revision=expected_revision,
+            status="review",
+        )
 
     def approve_discovery_without_matrix_change_atomically(
         self,
@@ -546,21 +470,11 @@ class WorkflowRepository:
             }
             project.topic = str(topic)
             project.stage_states = stored
-            project.current_stage = current_user_stage(
-                {
-                    key: (
-                        value.get("status", "pending")
-                        if isinstance(value, dict)
-                        else str(value)
-                    )
-                    for key, value in stored.items()
-                }
-            )
             project.updated_at = now
             session.flush()
             return self._stage_record(discovery)
 
-    def save_discovery_atomically(
+    def _promote_discovery_atomically(
         self,
         user_id: str,
         project_id: str,
@@ -570,13 +484,9 @@ class WorkflowRepository:
         expected_revision: int,
         status: str,
     ) -> StageStateRecord:
-        """Promote one reviewed Discovery version with its stage revision in one commit."""
-
         user_uuid = self._uuid(user_id, not_found_message="Project not found.")
         project_uuid = self._uuid(project_id, not_found_message="Project not found.")
-        artifact_uuid = self._uuid(
-            artifact_id, not_found_message="Artifact not found."
-        )
+        artifact_uuid = self._uuid(artifact_id, not_found_message="Artifact not found.")
         run_uuid = self._uuid(run_id, not_found_message="Stage run not found.")
         with database_session(self.session_factory) as session:
             project = session.scalar(
@@ -598,6 +508,8 @@ class WorkflowRepository:
                     WorkflowArtifact.producer_stage == "discovery",
                 )
             )
+            if artifact is None:
+                raise WorkflowNotFound("Artifact not found.")
             run = session.scalar(
                 select(WorkflowStageRun).where(
                     WorkflowStageRun.id == run_uuid,
@@ -605,8 +517,6 @@ class WorkflowRepository:
                     WorkflowStageRun.stage_id == "discovery",
                 )
             )
-            if artifact is None:
-                raise WorkflowNotFound("Artifact not found.")
             if run is None:
                 raise WorkflowNotFound("Stage run not found.")
             state = session.scalar(
@@ -644,30 +554,37 @@ class WorkflowRepository:
                 session.add(state)
             else:
                 state.status = status
-                state.revision = actual + 1
                 state.current_run_id = run_uuid
+                state.revision = actual + 1
                 state.error_code = ""
                 state.error_message = ""
                 state.updated_at = now
             stored = dict(project.stage_states or {})
-            stored["discovery"] = {
-                "status": state.status,
-                "revision": state.revision,
-            }
+            stored["discovery"] = {"status": state.status, "revision": state.revision}
             project.stage_states = stored
-            project.current_stage = current_user_stage(
-                {
-                    key: (
-                        value.get("status", "pending")
-                        if isinstance(value, dict)
-                        else str(value)
-                    )
-                    for key, value in stored.items()
-                }
-            )
             project.updated_at = now
             session.flush()
             return self._stage_record(state)
+
+    def save_discovery_atomically(
+        self,
+        user_id: str,
+        project_id: str,
+        *,
+        artifact_id: str,
+        run_id: str,
+        expected_revision: int,
+        status: str,
+    ) -> StageStateRecord:
+        """Promote one reviewed Discovery version with its stage revision in one commit."""
+        return self._promote_discovery_atomically(
+            user_id,
+            project_id,
+            artifact_id=artifact_id,
+            run_id=run_id,
+            expected_revision=expected_revision,
+            status=status,
+        )
 
     def confirm_discovery_atomically(
         self,
@@ -756,8 +673,8 @@ class WorkflowRepository:
             )
             downstream = tuple(
                 stage
-                for stage in INTERNAL_STAGES
-                if INTERNAL_STAGES.index(stage) > INTERNAL_STAGES.index("matrix")
+                for stage in WORKFLOW_CHECKPOINTS
+                if WORKFLOW_CHECKPOINTS.index(stage) > WORKFLOW_CHECKPOINTS.index("matrix")
             )
             if matrix is None:
                 matrix = WorkflowStageState(
@@ -812,16 +729,6 @@ class WorkflowRepository:
                     "revision": stale.revision,
                 }
             project.stage_states = stored
-            project.current_stage = current_user_stage(
-                {
-                    key: (
-                        value.get("status", "pending")
-                        if isinstance(value, dict)
-                        else str(value)
-                    )
-                    for key, value in stored.items()
-                }
-            )
             project.updated_at = now
             session.flush()
             return self._stage_record(discovery), self._stage_record(matrix)
@@ -837,7 +744,7 @@ class WorkflowRepository:
         input_snapshot: Any = None,
         metadata: dict[str, Any] | None = None,
     ) -> StageRunRecord:
-        if stage_id not in INTERNAL_STAGES:
+        if stage_id not in WORKFLOW_CHECKPOINTS:
             raise WorkflowValidationError(f"Unknown workflow stage: {stage_id}")
         user_uuid = self._uuid(user_id, not_found_message="Project not found.")
         project_uuid = self._uuid(project_id, not_found_message="Project not found.")
@@ -851,7 +758,7 @@ class WorkflowRepository:
                 status=status,
                 attempt=max(1, int(attempt)),
                 input_snapshot=input_snapshot if input_snapshot is not None else {},
-                metadata_json=dict(metadata or {}),
+                metadata_json={**dict(metadata or {}), **({"_workflow_job_id": active_job_lease().job_id} if active_job_lease() else {})},
             )
             session.add(run)
             session.flush()
@@ -886,7 +793,7 @@ class WorkflowRepository:
     ) -> StageRunRecord | None:
         """Return the newest owned run for deterministic input-diff diagnostics."""
 
-        if stage_id not in INTERNAL_STAGES:
+        if stage_id not in WORKFLOW_CHECKPOINTS:
             raise WorkflowValidationError(f"Unknown workflow stage: {stage_id}")
         user_uuid = self._uuid(user_id, not_found_message="Stage run not found.")
         project_uuid = self._uuid(project_id, not_found_message="Stage run not found.")
@@ -914,7 +821,7 @@ class WorkflowRepository:
         expected_revision: int,
         **changes: Any,
     ) -> StageStateRecord:
-        if stage_id not in INTERNAL_STAGES:
+        if stage_id not in WORKFLOW_CHECKPOINTS:
             raise WorkflowValidationError(f"Unknown workflow stage: {stage_id}")
         unsupported = set(changes) - self.STAGE_CHANGE_FIELDS
         if unsupported:
@@ -980,16 +887,6 @@ class WorkflowRepository:
                 stored_states = dict(project.stage_states or {})
                 stored_states[stage_id] = {"status": state.status, "revision": state.revision}
                 project.stage_states = stored_states
-                project.current_stage = current_user_stage(
-                    {
-                        item_stage: (
-                            item_value.get("status", "pending")
-                            if isinstance(item_value, dict)
-                            else str(item_value)
-                        )
-                        for item_stage, item_value in stored_states.items()
-                    }
-                )
                 project.updated_at = now
                 session.flush()
                 return self._stage_record(state)
@@ -1015,14 +912,15 @@ class WorkflowRepository:
         expected_current_artifacts: dict[str, str] | None = None,
         expected_stage_states: dict[str, dict[str, Any]] | None = None,
         run_output_snapshot: Any = None,
+        advance_stages: tuple[str, ...] = (),
     ) -> StageStateRecord:
         """Promote one or more immutable outputs and advance their stage in one commit."""
 
-        if stage_id not in INTERNAL_STAGES:
+        if stage_id not in WORKFLOW_CHECKPOINTS:
             raise WorkflowValidationError(f"Unknown workflow stage: {stage_id}")
         if not artifact_ids:
             raise WorkflowValidationError("At least one staged artifact is required.")
-        invalid = sorted(set(invalidate_stages) - set(INTERNAL_STAGES))
+        invalid = sorted(set(invalidate_stages) - set(WORKFLOW_CHECKPOINTS))
         if invalid:
             raise WorkflowValidationError(
                 "Unknown downstream workflow stage.", details={"stages": invalid}
@@ -1047,13 +945,17 @@ class WorkflowRepository:
                 expected_stage_states or {}
             ).items()
         }
-        invalid_expected_states = sorted(set(expected_states) - set(INTERNAL_STAGES))
+        advances = set(advance_stages)
+        if (advances - set(expected_states) or stage_id in advances
+                or advances & (set(approvals) | set(invalidate_stages))):
+            raise WorkflowValidationError("Stage refresh requires disjoint, version-checked predecessors.")
+        invalid_expected_states = sorted(set(expected_states) - set(WORKFLOW_CHECKPOINTS))
         if invalid_expected_states:
             raise WorkflowValidationError(
                 "Unknown expected workflow stage.",
                 details={"stages": invalid_expected_states},
             )
-        invalid_approvals = sorted(set(approvals) - set(INTERNAL_STAGES))
+        invalid_approvals = sorted(set(approvals) - set(WORKFLOW_CHECKPOINTS))
         if invalid_approvals or stage_id in approvals:
             raise WorkflowValidationError(
                 "Invalid predecessor stage approval.",
@@ -1170,6 +1072,8 @@ class WorkflowRepository:
                                 "actual_status": actual_status,
                             },
                         )
+            if advances and any(stage not in actual_states for stage in advances):
+                raise WorkflowConflict("A refreshed predecessor stage is missing.")
             predecessor_states: dict[str, WorkflowStageState] = {}
             if approvals:
                 rows = session.scalars(
@@ -1265,6 +1169,11 @@ class WorkflowRepository:
                     "status": "approved",
                     "revision": row.revision,
                 }
+            for predecessor in advances:
+                row = actual_states[predecessor]
+                row.revision += 1
+                row.updated_at = now
+                stored[predecessor] = {"status": row.status, "revision": row.revision}
             if invalidate_stages:
                 # A figure edit invalidates approval, not the user's prose.
                 # Keep editable content visible; freshness still prevents stale
@@ -1316,19 +1225,79 @@ class WorkflowRepository:
                         "revision": stale.revision,
                     }
             project.stage_states = stored
-            project.current_stage = current_user_stage(
-                {
-                    key: (
-                        value.get("status", "pending")
-                        if isinstance(value, dict)
-                        else str(value)
-                    )
-                    for key, value in stored.items()
-                }
-            )
             project.updated_at = now
             session.flush()
             return self._stage_record(state)
+
+    def invalidate_stages(
+        self,
+        user_id: str,
+        project_id: str,
+        stages: tuple[str, ...],
+    ) -> None:
+        """Mark downstream stages stale and drop their current-artifact pointers.
+
+        Unlike ``promote_stage_artifacts_atomically`` this does not advance any
+        stage: it only records that the given stages must be re-run. Content is
+        preserved; the ``current`` pointers are removed so stale inputs are not
+        silently approved or used for publication.
+        """
+        if not stages:
+            return
+        invalid = sorted(set(stages) - set(WORKFLOW_CHECKPOINTS))
+        if invalid:
+            raise WorkflowValidationError(
+                "Unknown workflow stage.", details={"stages": invalid}
+            )
+        user_uuid = self._uuid(user_id, not_found_message="Project not found.")
+        project_uuid = self._uuid(project_id, not_found_message="Project not found.")
+        with database_session(self.session_factory) as session:
+            project = self._owned_project(session, user_uuid, project_uuid)
+            if project is None:
+                raise WorkflowNotFound("Project not found.")
+            now = utc_now()
+            artifact_owner_stage = case(
+                *(
+                    (
+                        WorkflowArtifact.logical_name.like(f"{prefix}/%"),
+                        owner_stage,
+                    )
+                    for prefix, owner_stage in ARTIFACT_OWNER_STAGE_BY_PREFIX.items()
+                ),
+                else_=WorkflowArtifact.producer_stage,
+            )
+            derived_artifacts = select(WorkflowArtifact.id).where(
+                WorkflowArtifact.project_id == project_uuid,
+                artifact_owner_stage.in_(stages),
+                WorkflowArtifact.logical_name.not_in(PERSISTENT_PUBLICATION_INPUTS),
+            )
+            session.execute(
+                delete(WorkflowCurrentArtifact).where(
+                    WorkflowCurrentArtifact.project_id == project_uuid,
+                    WorkflowCurrentArtifact.artifact_id.in_(derived_artifacts),
+                )
+            )
+            stale_states = session.scalars(
+                select(WorkflowStageState).where(
+                    WorkflowStageState.project_id == project_uuid,
+                    WorkflowStageState.stage_id.in_(stages),
+                )
+            ).all()
+            stored = dict(project.stage_states or {})
+            for stale in stale_states:
+                stale.status = "pending"
+                stale.current_run_id = None
+                stale.error_code = ""
+                stale.error_message = ""
+                stale.revision += 1
+                stale.updated_at = now
+                stored[stale.stage_id] = {
+                    "status": stale.status,
+                    "revision": stale.revision,
+                }
+            project.stage_states = stored
+            project.updated_at = now
+            session.flush()
 
     def create_or_get_job(
         self,
@@ -1341,6 +1310,7 @@ class WorkflowRepository:
         retry_of_job_id: str | None = None,
         operation_key: str = "",
         model_snapshot_override: dict[str, Any] | None = None,
+        model_snapshot_source_job_id: str | None = None,
     ) -> JobRecord:
         user_uuid = self._uuid(user_id, not_found_message="User not found.")
         normalized_scope = str(scope or "").strip().lower()
@@ -1464,6 +1434,14 @@ class WorkflowRepository:
                         previous_snapshot = (retry_source.payload_json or {}).get(SNAPSHOT_KEY) if retry_uuid else None
                         if normalized_job_type == "model.dispatch" and model_snapshot_override:
                             snapshot = dict(model_snapshot_override)
+                        elif model_snapshot_source_job_id:
+                            source = session.scalar(select(WorkflowJob).where(
+                                WorkflowJob.id == self._uuid(model_snapshot_source_job_id, not_found_message="Model source job not found."),
+                                WorkflowJob.user_id == user_uuid, WorkflowJob.project_id == project_uuid))
+                            source_snapshot = (source.payload_json or {}).get(SNAPSHOT_KEY) if source else None
+                            if not source_snapshot:
+                                raise WorkflowValidationError("The trusted source has no admitted model snapshot.")
+                            snapshot = snapshot_for_retry(session, source_snapshot, default_wire=self.default_text_wire_api)
                         elif previous_snapshot:
                             snapshot = snapshot_for_retry(
                                 session, previous_snapshot,
@@ -1600,6 +1578,7 @@ class WorkflowRepository:
         limit: int = 100,
         operation_key: str = "",
         idempotency_key: str = "",
+        include_payload: bool = True,
     ) -> list[JobRecord]:
         user_uuid = self._uuid(user_id, not_found_message="Project not found.")
         project_uuid = self._uuid(project_id, not_found_message="Project not found.")
@@ -1616,12 +1595,17 @@ class WorkflowRepository:
                 statement = statement.where(WorkflowJob.idempotency_scope_key == f"{project_uuid}:{operation_key}")
             if idempotency_key:
                 statement = statement.where(WorkflowJob.idempotency_key == idempotency_key)
+            if not include_payload:
+                # Skip the column entirely instead of loading and discarding it.
+                statement = statement.options(defer(WorkflowJob.payload_json))
             rows = session.scalars(
                 statement.order_by(WorkflowJob.created_at.desc()).limit(
                     max(1, min(int(limit), 500))
                 )
             ).all()
-            return [self._job_record(row) for row in rows]
+            return [
+                self._job_record(row, include_payload=include_payload) for row in rows
+            ]
 
     def list_library_jobs(
         self,
@@ -1705,7 +1689,7 @@ class WorkflowRepository:
                     status_count("cancel_requested").label("cancel_requested"),
                     status_count("succeeded").label("succeeded"),
                     func.sum(case(((WorkflowJob.status == "succeeded") &
-                        (WorkflowJob.result_json["status"].as_string() == "duplicate_file"), 1), else_=0)).label("duplicate_count"),
+                        (WorkflowJob.result_json["status"].as_string().in_(["duplicate_file", "duplicate_publication"])), 1), else_=0)).label("duplicate_count"),
                     status_count("failed").label("failed"),
                     status_count("cancelled").label("cancelled"),
                     status_count("interrupted").label("interrupted"),
@@ -1910,7 +1894,7 @@ class WorkflowRepository:
         artifact_uuid = self._uuid(artifact_id, not_found_message="Artifact not found.")
         with database_session(self.session_factory) as session:
             row = session.execute(
-                select(WorkflowArtifact, Project.slug)
+                select(WorkflowArtifact, func.coalesce(Project.storage_slug, Project.slug))
                 .join(Project, Project.id == WorkflowArtifact.project_id)
                 .where(
                     WorkflowArtifact.id == artifact_uuid,
@@ -2295,11 +2279,25 @@ class WorkflowRepository:
                 and_(earlier.created_at == WorkflowJob.created_at, earlier.id < WorkflowJob.id)),
         )))
 
+    @staticmethod
+    def _earlier_dialogue_job():
+        """One project dialogue loop; queued follow-ups do not hold a lease."""
+        earlier = aliased(WorkflowJob)
+        return and_(WorkflowJob.job_type.in_(("conversation.turn", "conversation.prepare")), exists(select(earlier.id).where(
+            or_(earlier.project_id == WorkflowJob.project_id, and_(earlier.project_id.is_(None), WorkflowJob.project_id.is_(None))),
+            earlier.user_id == WorkflowJob.user_id,
+            earlier.job_type == WorkflowJob.job_type,
+            func.coalesce(earlier.payload_json["session_id"].as_string(), "") == func.coalesce(WorkflowJob.payload_json["session_id"].as_string(), ""),
+            earlier.status.in_(("queued", "running", "cancel_requested")),
+            or_(earlier.created_at < WorkflowJob.created_at,
+                and_(earlier.created_at == WorkflowJob.created_at, earlier.id < WorkflowJob.id)),
+        )))
+
     def planning_job_blocked(self, job_id: str) -> bool:
         with database_session(self.session_factory) as session:
             return session.scalar(select(WorkflowJob.id).where(
                 WorkflowJob.id == self._uuid(job_id, not_found_message="Job not found."),
-                self._earlier_planning_job())) is not None
+                or_(self._earlier_planning_job(), self._earlier_dialogue_job()))) is not None
 
     def claim_job(
         self,
@@ -2322,6 +2320,7 @@ class WorkflowRepository:
                 or_(WorkflowJob.next_run_at.is_(None), WorkflowJob.next_run_at <= now),
                 active_job_project(),
                 ~self._earlier_planning_job(),
+                ~self._earlier_dialogue_job(),
             )
             if session.get_bind().dialect.name == "postgresql":
                 query = query.with_for_update(skip_locked=True)
@@ -2412,7 +2411,7 @@ class WorkflowRepository:
                 else_=1,
             )
             query = select(WorkflowJob).where(
-                eligible, active_job_project(), live_leases < lease_limit, ~self._earlier_planning_job()
+                eligible, active_job_project(), live_leases < lease_limit, ~self._earlier_planning_job(), ~self._earlier_dialogue_job()
             )
             if active_uploads >= self.mineru_max_concurrency:
                 query = query.where(WorkflowJob.job_type != "library.upload")

@@ -1,0 +1,61 @@
+.peer-review { color: var(--ink); min-width: 0; --review-tint: color-mix(in srgb, var(--green) 4%, var(--surface)); }
+.peer-review .button { border-radius: 8px; }
+.peer-review-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+.peer-review-toolbar label { display: flex; align-items: center; gap: 10px; font-size: 13px; min-width: 0; white-space: nowrap; }
+.peer-review-toolbar select { min-height: 36px; max-width: 280px; border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; color: var(--ink); background: var(--surface); }
+.peer-review .peer-review-cost-note { color: var(--muted); font-size: 12px; margin: 10px 0 16px; line-height: 1.6; }
+.peer-review-steps { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; list-style: none; padding: 16px; margin: 0 0 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--surface); }
+.peer-review-step { display: flex; align-items: center; gap: 9px; min-width: 0; padding: 6px 0; }
+.peer-review-step-mark { display: grid; place-items: center; flex: 0 0 28px; height: 28px; border: 1px solid var(--line); border-radius: 50%; color: var(--muted); font-size: 12px; }
+.peer-review-step strong, .peer-review-step small { display: block; }
+.peer-review-step strong { font-size: 12px; font-weight: 600; }
+.peer-review-step small { color: var(--muted); font-size: 11px; margin-top: 4px; line-height: 1.5; }
+.peer-review-step.running .peer-review-step-mark { border-color: var(--green); color: var(--green); box-shadow: 0 0 0 3px var(--green-soft); }
+.peer-review-step.running strong { color: var(--green); }
+.peer-review-step.complete .peer-review-step-mark { color: var(--green); background: var(--green-soft); border-color: transparent; }
+.peer-review-step.paused .peer-review-step-mark, .peer-review-step.incomplete .peer-review-step-mark { color: var(--warning); border-color: var(--warning); }
+.peer-review-step.skipped { opacity: .65; }
+.peer-review-run { display: flex; align-items: center; gap: 8px 16px; flex-wrap: wrap; padding: 0 2px 16px; }
+.peer-review-run p { margin: 0; font-size: 12px; line-height: 1.7; }
+.peer-review-run [role="status"] { font-weight: 500; margin-right: auto; }
+.peer-review-run .peer-review-cost-note { flex-basis: 100%; margin: 0; }
+.peer-review .peer-review-note { color: var(--muted); font-size: 12px; line-height: 1.7; }
+.peer-review-saved { color: var(--green); }
+.peer-review-window-head { background: var(--surface); padding: 14px 18px; border: 1px solid var(--line); border-bottom: 0; border-radius: 12px 12px 0 0; font-size: 14px; }
+.peer-review-window { height: clamp(360px, 65vh, 680px); display: grid; grid-template-columns: minmax(170px, .75fr) minmax(0, 2fr); overflow: hidden; border: 1px solid var(--line); border-radius: 0 0 12px 12px; }
+.peer-review-queue { background: var(--review-tint); min-height: 0; overflow-y: auto; border-right: 1px solid var(--line); padding: 8px; }
+.peer-review-queue button { display: block; width: 100%; text-align: left; color: var(--ink); border: 1px solid transparent; background: transparent; border-radius: 8px; padding: 12px; margin-bottom: 6px; cursor: pointer; overflow-wrap: anywhere; }
+.peer-review-queue button:hover { background: var(--surface); }
+.peer-review-queue button[aria-current="true"] { background: var(--surface); border-color: var(--line); box-shadow: inset 3px 0 var(--green); }
+.peer-review-queue span, .peer-review-queue small { display: block; line-height: 1.6; }
+.peer-review-queue span { font-size: 13px; }
+.peer-review-queue small { color: var(--muted); margin-top: 4px; font-size: 11px; }
+.peer-review-resolution { min-height: 0; min-width: 0; overflow: auto; padding: 24px; background: var(--surface); }
+.peer-review-resolution h4 { margin: 0 0 12px; font-size: 16px; overflow-wrap: anywhere; }
+.peer-review-resolution p { font-size: 13px; line-height: 1.8; overflow-wrap: anywhere; }
+.peer-review blockquote { margin: 12px 0; padding: 12px 14px; background: var(--review-tint); border-left: 2px solid var(--line); overflow-wrap: anywhere; font-size: 13px; line-height: 1.8; }
+.peer-review-help-label { display: flex; flex-direction: column; gap: 8px; font-size: 13px; margin: 16px 0; }
+.peer-review-help-label textarea { width: 100%; box-sizing: border-box; min-height: 96px; max-height: 200px; resize: vertical; padding: 10px; color: var(--ink); background: var(--surface); border: 1px solid var(--line); border-radius: 8px; }
+.peer-review-inline-edit { border-top: 1px solid var(--line); padding: 12px 0; }
+.peer-review-inline-edit .draft-inline-text { min-height: 60px; padding: 10px; border: 1px solid var(--line); border-radius: 8px; }
+.peer-review-inline-edit small { color: var(--muted); font-size: 12px; }
+.peer-review details { border-top: 1px solid var(--line); padding: 12px 0; min-width: 0; }
+.peer-review summary { cursor: pointer; font-size: 13px; overflow-wrap: anywhere; }
+.peer-review-comparison { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 12px 0; }
+.peer-review-comparison > section { padding: 0 12px 12px; background: var(--review-tint); border: 1px solid var(--line); border-radius: 8px; overflow: auto; }
+.peer-review-comparison .markdown-view { font-size: 13px; }
+.peer-review-limitations { max-height: 240px; overflow: auto; padding: 12px 4px; font-size: 13px; line-height: 1.8; }
+.peer-review-legacy-scratch { max-height: 360px; overflow: auto; padding: 12px; border: 1px solid var(--line); }
+.peer-review-report > details, .peer-review > details { max-height: 360px; overflow: auto; }
+.peer-review-resolution blockquote { white-space: pre-wrap; }
+.peer-review button:focus-visible, .peer-review summary:focus-visible { outline: 2px solid var(--green); outline-offset: 3px; }
+@media (max-width: 900px) { .peer-review-comparison { grid-template-columns: 1fr; } }
+@media (max-width: 650px) {
+  .peer-review-steps { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; padding: 10px; }
+  .peer-review-step { gap: 7px; }
+  .peer-review-step-mark { flex-basis: 24px; height: 24px; }
+  .peer-review-resolution { padding: 16px; }
+  .peer-review-toolbar label, .peer-review-toolbar select { width: 100%; max-width: none; }
+  .peer-review-window { grid-template-columns: minmax(0, 1fr); grid-template-rows: 130px minmax(0, 1fr); height: clamp(360px, 72vh, 680px); }
+  .peer-review-queue { border-right: 0; border-bottom: 1px solid var(--line); }
+}

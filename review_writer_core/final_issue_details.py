@@ -105,7 +105,16 @@ def final_issue_details(validation: dict[str, Any]) -> list[dict[str, Any]]:
     for paragraph_id in validation.get("unverified_manual_paragraph_ids") or []:
         add("paragraph", paragraph_id, ["unverified_manual_claims_exported"])
 
+    voice_findings = [finding for finding in validation.get("publication_voice_issues") or [] if isinstance(finding, dict)]
+    paper_labels = list(dict.fromkeys(str(finding.get("phrase") or "") for finding in voice_findings
+        if finding.get("code") == "internal_paper_identifier" and finding.get("phrase")))
+    for label in paper_labels:
+        add("manuscript", "current_final", ["internal_paper_identifier"])
+        rows[-1]["title"] = label
+
     covered = {issue for row in rows for issue in row.get("issues") or []}
+    if paper_labels and all(finding.get("code") == "internal_paper_identifier" for finding in voice_findings):
+        covered.add("publication_voice_leakage")
     target_types = {str(row.get("target_type") or "") for row in rows}
     if "figure" in target_types:
         covered.update(

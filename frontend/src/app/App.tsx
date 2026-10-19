@@ -17,6 +17,9 @@ const AdminPage = lazy(async () => ({
 const AuthPage = lazy(async () => ({
   default: (await loadLazyModule(() => import("../features/auth/AuthPage"))).AuthPage,
 }));
+const ConversationPage = lazy(async () => ({
+  default: (await loadLazyModule(() => import("../features/conversation/ConversationPage"))).ConversationPage,
+}));
 const DiscoveryPage = lazy(async () => ({
   default: (await loadLazyModule(() => import("../features/discovery/DiscoveryPage"))).DiscoveryPage,
 }));
@@ -25,6 +28,9 @@ const DraftPage = lazy(async () => ({
 }));
 const FinalPage = lazy(async () => ({
   default: (await loadLazyModule(() => import("../features/final/FinalPage"))).FinalPage,
+}));
+const GuidePage = lazy(async () => ({
+  default: (await loadLazyModule(() => import("../features/guide/GuidePage"))).GuidePage,
 }));
 const ImagesPage = lazy(async () => ({
   default: (await loadLazyModule(() => import("../features/images/ImagesPage"))).ImagesPage,
@@ -101,6 +107,7 @@ function AppRoutes() {
           path="/"
           element={<LandingPage authConfig={authConfig.data} identity={principal} />}
         />
+        <Route path="/guide" element={<GuidePage authConfig={authConfig.data} identity={principal} />} />
         <Route
           path="/login"
           element={
@@ -123,6 +130,7 @@ function AppRoutes() {
           }
         >
           <Route path="/workspace" element={<ProjectsPage />} />
+          <Route path="/conversation" element={<ConversationPage />} />
           <Route path="/library" element={<LibraryPage />} />
           <Route path="/discovery" element={<DiscoveryPage />} />
           <Route path="/planning" element={<PlanningPage />} />

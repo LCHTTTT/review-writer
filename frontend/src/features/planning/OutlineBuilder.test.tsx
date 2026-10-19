@@ -8,6 +8,13 @@ import { displayFigureLabel, replacePaperIdsForDisplay } from "../../utils/paper
 afterEach(cleanup);
 
 describe("visual outline format", () => {
+  it("preserves explicit supporting routes when a recommended hierarchy is edited and saved", () => {
+    const draft = parseOutlineMarkdown("## Strategies\n### Comparison\nSupporting papers: P001, P002.\nPurpose: Compare approaches.\n### Method\nAssigned papers: P001.\n");
+    draft.sections[1].title = "Updated comparison";
+    const saved = parseOutlineMarkdown(serializeOutlineMarkdown(draft));
+    expect(saved.sections[1]).toMatchObject({ headingLevel: 3, title: "Updated comparison", supportingPaperIds: ["P001", "P002"], paperIds: [] });
+    expect(saved.sections[2].paperIds).toEqual(["P001"]);
+  });
   it("keeps IDs and nested headings when editing and reordering", () => {
     const draft = parseOutlineMarkdown("## Methods\n<!-- section_id: S-methods -->\n### Details\n<!-- section_id: S-details -->\n");
     draft.sections[1].title = "Updated details";

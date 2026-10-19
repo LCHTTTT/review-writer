@@ -26,11 +26,51 @@ afterEach(() => { cleanup(); vi.resetAllMocks(); localStorage.clear(); });
 function RouteProbe() { const location = useLocation(); const navigate = useNavigate();
   return <><output data-testid="route">{location.pathname}{location.search}</output><button onClick={() => navigate(-1)}>Browser back</button></>;
 }
-function mount(url = "/draft?project=p") {
+function mount(url = "/draft?project=p&tab=preview") {
   return render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false }, mutations: { retry: false } } })}>
     <MemoryRouter initialEntries={[url]}><DraftPage /><RouteProbe /></MemoryRouter>
   </QueryClientProvider>);
 }
+it("opens chapter dialogue alongside the manuscript by default without generating content", async () => {
+  mount("/draft?project=p");
+  expect(await screen.findByRole("button", { name: "Chapter versions" })).toBeVisible();
+  expect(screen.getByText("Full manuscript text")).toBeVisible();
+  const discuss = screen.getByRole("button", { name: "Discuss current chapter" });
+  expect(discuss).toHaveAttribute("aria-expanded", "true");
+  expect(discuss.closest(".draft-reader-toolbar")).not.toBeNull();
+  expect(vi.mocked(apiRequest).mock.calls.every(([, options]) => !options?.method)).toBe(true);
+  fireEvent.click(screen.getByRole("button", { name: "Back to manuscript" }));
+  expect(screen.queryByRole("button", { name: "Chapter versions" })).toBeNull();
+  expect(screen.getByRole("button", { name: "Discuss current chapter" })).toHaveAttribute("aria-expanded", "false");
+  fireEvent.click(screen.getByRole("button", { name: "Discuss current chapter" }));
+  expect(await screen.findByRole("button", { name: "Chapter versions" })).toBeVisible();
+});
+it("refreshes overview source readiness after reassembling upstream content", async () => {
+  HTMLDialogElement.prototype.showModal = function () { this.setAttribute("open", ""); };
+  HTMLDialogElement.prototype.close = function () { this.removeAttribute("open"); };
+  let assembled = false;
+  vi.mocked(apiRequest).mockImplementation(async (path, options) => {
+    if (path === "/api/v1/me") return { user_id: "u" };
+    if (path.endsWith("/assemble") && options?.method === "POST") { assembled = true; return { revision: 2 }; }
+    if (path.endsWith("/draft")) return { ...draft, revision: assembled ? 2 : 1,
+      freshness: { upstream_stale: !assembled } };
+    if (path.endsWith("/overview")) return { revision: assembled ? 2 : 1, draft_available: true,
+      draft_source_stale: !assembled, history: [] };
+    if (path.includes("section-dialogues")) return { turns: [] };
+    throw new Error("Unexpected request: " + path);
+  });
+  mount();
+  fireEvent.click(await screen.findByRole("button", { name: "Overview" }));
+  await waitFor(() => expect(screen.getByText(/Manuscript or figure sources changed/)).toBeInTheDocument());
+  expect(screen.getByRole("button", { name: "Generate new version" })).toBeDisabled();
+  fireEvent.click(screen.getByRole("button", { name: "Close" }));
+  fireEvent.click(screen.getByRole("button", { name: "Reassemble from upstream" }));
+  await waitFor(() => expect(screen.queryByRole("button", { name: "Reassemble from upstream" })).not.toBeInTheDocument());
+  fireEvent.click(screen.getByRole("button", { name: "Overview" }));
+  await waitFor(() => expect(screen.getByRole("button", { name: "Generate new version" })).toBeEnabled());
+  expect(screen.queryByText(/Manuscript or figure sources changed/)).not.toBeInTheDocument();
+  expect(apiRequest).not.toHaveBeenCalledWith(expect.stringContaining("/overview-jobs"), expect.anything());
+});
 it("places editable keywords after the abstract and before the overview without duplication", async () => {
   const abstract = { ...paragraph, paragraph_id: "SABS-p1", paragraph_key: "abstract", text: "Abstract text" };
   vi.mocked(apiRequest).mockImplementation(async path => {
@@ -96,9 +136,9 @@ it("starts with the manuscript and opens optional tools without a numbered wizar
   const readerToolbar = screen.getByRole("button", { name: "Hide contents" }).closest(".draft-reader-toolbar")!;
   expect(within(readerToolbar as HTMLElement).getByRole("group", { name: "Complete manuscript" })).toBeVisible();
   expect(document.querySelector(".draft-document-tools")).toBeNull();
-  expect(screen.queryByRole("button", { name: "Start batch revision" })).toBeNull();
-  fireEvent.click(within(nav).getByRole("button", { name: "Batch revision" }));
-  expect(screen.getByRole("button", { name: "Start batch revision" })).toBeEnabled();
+  expect(screen.queryByRole("button", { name: "Review and revise manuscript" })).toBeNull();
+  fireEvent.click(within(nav).getByRole("button", { name: "Review-style revision" }));
+  expect(screen.getByRole("button", { name: "Review and revise manuscript" })).toBeEnabled();
   fireEvent.click(within(nav).getByRole("button", { name: "Manuscript" }));
   fireEvent.click(screen.getByRole("button", { name: "Discuss current chapter" }));
   expect(await screen.findByRole("button", { name: "Chapter versions" })).toBeTruthy();
@@ -110,6 +150,25 @@ it("starts with the manuscript and opens optional tools without a numbered wizar
   expect(screen.getByRole("heading", { name: "Waiting for human approval" })).toBeVisible();
   fireEvent.click(screen.getByRole("button", { name: "History" }));
   expect(screen.getByText("No historical versions yet.")).toBeTruthy();
+});
+it("removes auxiliary wording clues from peer review without launching tasks or blocking approval", async () => {
+  vi.mocked(apiRequest).mockImplementation(async path => {
+    if (path === "/api/v1/me") return { user_id: "u" };
+    if (path.endsWith("/draft")) return { ...draft, narrative_repetition: {
+      status: "complete", method: "surface_clues_v1", covered_paragraph_count: 1,
+      total_paragraph_count: 1, hints: [{ kind: "repeated_closing", paragraph_ids: ["S1-p1"],
+        phrase: "taken together", basis: "surface_wording_only" }],
+    } };
+    if (path.includes("section-dialogues")) return { turns: [] };
+    throw new Error("Unexpected request: " + path);
+  });
+  mount();
+  const nav = await screen.findByRole("navigation", { name: "Draft workspace" });
+  fireEvent.click(within(nav).getByRole("button", { name: "Review-style revision" }));
+  expect(screen.queryByText("Manuscript writing notes")).not.toBeInTheDocument();
+  expect(screen.queryByText(/1 possible wording repetitions/)).not.toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "Approve and enter Final" })).toBeEnabled();
+  expect(vi.mocked(apiRequest).mock.calls.every(([, options]) => !options || options.method !== "POST")).toBe(true);
 });
 it("keeps Final approval in the bottom action bar and blocks stale manuscripts", async () => {
   vi.mocked(apiRequest).mockImplementation(async path => {
@@ -152,30 +211,47 @@ it("groups batch actions and suggestions without duplicating the full manuscript
     throw new Error("Unexpected request: " + path);
   });
   mount("/draft?project=p&tab=batch");
-  expect(await screen.findByRole("heading", { name: "Batch analysis and revision" })).toBeVisible();
-  expect(screen.getByText("Analysis complete")).toBeVisible();
+  expect(await screen.findByRole("heading", { name: "Review-style revision", level: 2 })).toBeVisible();
+  expect(screen.getByRole("button", { name: "Review and revise manuscript" })).toBeEnabled();
   expect(screen.getByRole("region", { name: "Revision suggestions" })).toBeVisible();
   expect(screen.queryByText("Preview combined paragraphs (not saved)")).toBeNull();
   fireEvent.click(screen.getByRole("checkbox", { name: "Select" }));
   expect(screen.getByRole("button", { name: "Save selected (1)" })).toBeEnabled();
 });
-it("labels a partially complete batch and resumes only its unfinished paragraphs", async () => {
+it("preserves old reports as read-only without restoring per-finding paid actions", async () => {
+  vi.mocked(apiRequest).mockImplementation(async path => {
+    if (path === "/api/v1/me") return { user_id: "u" };
+    if (path.endsWith("/draft")) return { ...draft, peer_review_job: { id: "review-edit", status: "succeeded",
+      source_draft_artifact_id: "draft1", result: { issues: [{ issue_id: "i", paragraph_id: "S1-p1", excerpt: "Saved paragraph",
+        diagnosis: "Needs clarification", instruction: "Qualify this paragraph", route: "manual", status: "open", basis: "suggestion" }] } } };
+    if (path.includes("section-dialogues")) return { turns: [] };
+    throw new Error("Unexpected request: " + path);
+  });
+  mount("/draft?project=p&tab=batch");
+  expect(await screen.findByText('Historical review (read-only)')).toBeVisible();
+  fireEvent.click(screen.getByText('Read original report'));
+  expect(screen.getByText('Needs clarification')).toBeVisible();
+  expect(screen.queryByRole('button', {name:'Repair this finding'})).not.toBeInTheDocument();
+  expect(screen.queryByRole('button', {name:'Check this finding'})).not.toBeInTheDocument();
+  expect(screen.queryByRole('button', {name:'Edit paragraph'})).not.toBeInTheDocument();
+  expect(screen.getByTestId('route')).toHaveTextContent('tab=batch');
+  expect(vi.mocked(apiRequest).mock.calls.every(([, options]) => !options?.method)).toBe(true);
+});
+it("resumes an interrupted peer review without submitting the old batch route", async () => {
   const requests: string[] = [];
   vi.mocked(apiRequest).mockImplementation(async (path, init) => {
     if (path === "/api/v1/me") return { user_id: "u" };
-    if (path.endsWith("/draft")) return { ...draft, dialogue_batch_job: {
-      id: "batch1", status: "succeeded", progress_current: 1, progress_total: 1,
-      result: { paragraph_results: { k: { paragraph_id: "S1-p1", status: "failed", reason: "The model cited an unknown source passage; the candidate was not saved." } } },
+    if (path.endsWith("/draft")) return { ...draft, peer_review_job: {
+      id: "review1", status: "failed", progress_current: 0, progress_total: 1,
+      source_draft_artifact_id: "draft1", result: { policy: "review-revision/2", phase: "audit" },
     } };
     if (init?.method === "POST") { requests.push(path); return { id: "batch2" }; }
     throw new Error("Unexpected request: " + path);
   });
   mount("/draft?project=p&tab=batch");
-  expect(await screen.findByText("Partially complete")).toBeVisible();
-  fireEvent.click(screen.getByText("View 1 unfinished items"));
-  expect(screen.getByText(/The source citation could not be verified/)).toBeVisible();
-  fireEvent.click(screen.getByRole("button", { name: "Resume unfinished paragraphs" }));
-  await waitFor(() => expect(requests).toEqual(["/api/v1/projects/p/draft/dialogue-batch/batch1/resume"]));
+  expect(await screen.findByText(/Revision did not finish/)).toBeVisible();
+  fireEvent.click(screen.getByRole("button", { name: "Resume unfinished revision" }));
+  await waitFor(() => expect(requests).toEqual(["/api/v1/jobs/review1/retry"]));
 });
 it("restores the selected column from the URL and preserves paragraph deep links", async () => {
   const view = mount("/draft?project=p&tab=history");
@@ -205,11 +281,11 @@ it("expands and restores dialogue without losing the input or remounting the rea
 it("late batch submission does not pull the user away from another column", async () => {
   const original = vi.mocked(apiRequest).getMockImplementation()!;
   let finish!: (value: unknown) => void;
-  vi.mocked(apiRequest).mockImplementation((path, init) => path.endsWith("/dialogue-batch")
+  vi.mocked(apiRequest).mockImplementation((path, init) => path.endsWith("/review-jobs")
     ? new Promise(resolve => { finish = resolve; }) : original(path, init));
   mount();
-  fireEvent.click(await screen.findByRole("button", { name: "Batch revision" }));
-  fireEvent.click(await screen.findByRole("button", { name: "Start batch revision" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Review-style revision" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Review and revise manuscript" }));
   await waitFor(() => expect(finish).toBeDefined());
   fireEvent.click(screen.getByRole("button", { name: "Manuscript" }));
   await act(async () => { finish({ id: "batch" }); });

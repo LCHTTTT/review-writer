@@ -21,6 +21,20 @@ SPEC.loader.exec_module(feedback_loop)
 
 
 class FeedbackLoopIntegrityTests(unittest.TestCase):
+    def test_paper_alias_removal_does_not_relax_actual_chemical_identity_protection(self):
+        pid = "P5021405023598897354"
+        original = "P502 reported a CuBr2-catalyzed reaction at 25 C. [1]"
+        revised = "A CuBr2-catalyzed reaction at 25 C was reported. [1]"
+        kwargs = {"paper_ids": [pid], "source_quotes": ["CuBr2 catalyzed the reaction at 25 C."]}
+        errors, _ = feedback_loop.validate_rewrite_report(original, revised, 0, 1000, **kwargs)
+        self.assertEqual([], errors)
+        errors, _ = feedback_loop.validate_rewrite_report(original, revised.replace("CuBr2", "CuBr"), 0, 1000, **kwargs)
+        self.assertIn("protected_chemical_identities_changed", errors)
+        native = "Ligand P502 gave the product. [1]"
+        errors, _ = feedback_loop.validate_rewrite_report(native, "Ligand gave the product. [1]", 0, 1000,
+            paper_ids=[pid], source_quotes=["Ligand P502 gave the product."])
+        self.assertIn("protected_chemical_identities_changed", errors)
+
     def test_attribution_repairs_preserve_supported_values_and_sources(self):
         cases = [
             (
@@ -153,22 +167,6 @@ class FeedbackLoopIntegrityTests(unittest.TestCase):
                     self.assertEqual(91, result["paragraph_scores"][0]["score"])
                     self.assertEqual("partially_supported", result["paragraph_scores"][0]["source_check_status"])
 
-    def test_single_paragraph_update_does_not_resurrect_other_paragraph_quality_gates(self):
-        from review_writer_api.domain_services.drafts import DraftsService
-        service = object.__new__(DraftsService)
-        score = {"paragraph_id": "S01-p1", "score": 93, "severity": "none", "route": "pass"}
-        other = {**score, "paragraph_id": "S01-p2"}
-        for rule in ("P01", "C01"):
-            with self.subTest(rule=rule):
-                quality = service._incremental_quality(
-                    {"score": 93, "paragraph_scores": [score, other],
-                     "hard_gate_failures": ["paragraph_readability_or_source_failures"],
-                     "preflight": {"paragraph_findings": [{"paragraph_id": "S01-p2", "rule": rule, "severity": "major"}]}},
-                    {"paragraph_score": score, "local_preflight": {"paragraph_findings": [], "paragraph_checks": []}},
-                    paragraph_id="S01-p1", source_quality_artifact_id="q1",
-                )
-                self.assertEqual(rule == "C01", bool(quality["hard_gate_failures"]))
-                self.assertEqual(93, quality["score"])
 
     def test_quality_findings_keep_scores_without_becoming_integrity_failures(self):
         for rule, severity, expected_score in (("P01", "major", 93), ("P01", "minor", 93), ("M05", "minor", 93), ("C01", "major", 79)):

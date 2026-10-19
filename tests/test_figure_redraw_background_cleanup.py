@@ -17,6 +17,16 @@ SPEC.loader.exec_module(REDRAW)
 
 
 class FigureRedrawBackgroundCleanupTests(unittest.TestCase):
+    def test_user_presentation_request_is_carried_with_chemical_fidelity_lock(self):
+        text = "布局紧凑，字体一致，保留结构"
+        prompt = REDRAW.append_user_edit_instructions("original scientific constraints", text)
+        self.assertIn(text, prompt)
+        self.assertIn("original scientific constraints", prompt)
+        self.assertIn("stereochemistry", prompt)
+        self.assertEqual("base", REDRAW.append_user_edit_instructions("base", ""))
+        with self.assertRaises(ValueError):
+            REDRAW.append_user_edit_instructions("base", "x" * 4001)
+
     def test_chemistry_cleanup_removes_gray_halo_and_preserves_scientific_ink(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "mechanism.png"

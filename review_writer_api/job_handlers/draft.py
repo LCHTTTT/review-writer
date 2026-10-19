@@ -40,7 +40,13 @@ class DraftJobHandlers:
         if not str(payload.get("draft_text") or "").strip():
             raise WorkflowValidationError("The rewrite task did not receive the current Draft content.")
         staging, _workspace, project = self._compatibility_workspace(context, payload, name="draft-workspace")
-        normal, secrets = self._text_gateway_environment(context)
+        review=(payload.get('dialogue') or {}).get('review_revision') or {}
+        stage=review.get('stage')
+        local=stage in ('prepare','validate_sources') or 'model_response' in review
+        normal, secrets = ({}, {}) if local else self._text_gateway_environment(context)
+        if (stage and not local and getattr(self,'model_gateway',None) is not None
+                and getattr(context,'job_type','')=='draft.optimize'):
+            normal['REVIEW_WRITER_DELEGATE_MODEL_CALLS']='1'
         first = project / "04_first_draft"
         self._write_json(first / "paragraph_revision_request.json", payload["dialogue"])
         output = first / "paragraph_revision_result.json"

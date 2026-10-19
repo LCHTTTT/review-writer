@@ -38,6 +38,18 @@ def job_service_class():
 
 
 class JobServiceTests(unittest.TestCase):
+    def test_linked_retry_with_operation_key_is_idempotent_after_completion(self):
+        original = self.repository.create_or_get_job(self.principal.user_id, self.project_id,
+            "project", "retryable", "original", {"value": 7})
+        self.repository.claim_job(original.id)
+        self.service.register_handler("retryable", lambda context, payload: {"value": payload["value"]})
+        self.service.start()
+        first = self.service.retry_interrupted(self.principal, original.id, idempotency_key="conversation-action")
+        self.assertEqual("succeeded", self._wait_for(first.id).status)
+        again = self.service.retry_interrupted(self.principal, original.id, idempotency_key="conversation-action")
+        self.assertEqual(first.id, again.id)
+        self.assertEqual(original.id, again.retry_of_job_id)
+
     def test_compatibility_executor_wakes_delayed_job_without_busy_loop(self) -> None:
         calls = 0
 

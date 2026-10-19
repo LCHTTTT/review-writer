@@ -7,9 +7,28 @@ import { diagnosticText } from "../i18n/diagnostics";
 import { uiLocale } from "../i18n/locale";
 
 afterEach(() => { cleanup(); usePreferences.getState().setLanguage("zh-CN"); });
+it("explains stale retries without suggesting the same old task again", () => {
+  const error = Object.assign(new Error("Workflow inputs changed. Start a new task with current inputs."), { code: "WORKFLOW_CONFLICT" });
+  expect(diagnosticText(error, "zh-CN")).toContain("旧任务不能直接续跑");
+  expect(diagnosticText(error, "en")).toContain("instead of retrying the old task");
+});
+it("explains comparison source gaps without calling them provider failures", () => {
+  const message = "综合比较章节尚未取得关联章节的原文证据，请先恢复来源章节或补齐章节关联；已完成章节保留。";
+  expect(diagnosticText(message, "zh-CN")).toContain("已完成章节保留");
+  expect(diagnosticText(message, "en")).toContain("linked chapters");
+  expect(diagnosticText(message, "en")).not.toContain("provider");
+});
 it("explains translation failures without exposing a technical code", () => {
   expect(diagnosticText("QUERY_TRANSLATION_FAILED: timeout", "zh-CN")).toContain("本次检索未开始");
   expect(diagnosticText("QUERY_TRANSLATION_FAILED: timeout", "en")).toContain("Search has not started");
+});
+it("explains empty model replies and historical delegated failures without inventing a state change", () => {
+  const empty = Object.assign(new Error("模型仅返回推理过程，没有可用答案。"), { code: "PROVIDER_EMPTY_RESPONSE" });
+  expect(diagnosticText(empty, "zh-CN")).toContain("推理过程");
+  expect(diagnosticText(empty, "en")).toContain("reasoning only");
+  const legacy = Object.assign(new Error("The delegated model task did not finish. No model call was replayed automatically."), { code: "STATE_CONFLICT" });
+  expect(diagnosticText(legacy, "zh-CN")).toContain("模型任务未完成");
+  expect(diagnosticText(legacy, "en")).not.toContain("version changed");
 });
 it("explains bibliography resolution failures as recoverable actions", () => {
   expect(diagnosticText("Selected bibliography candidate is unavailable or stale.", "zh-CN"))

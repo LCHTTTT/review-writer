@@ -1,4 +1,4 @@
-"""Missing topic recommendations use persisted jobs, never mutate selected outlines."""
+"""Topic recommendations use persisted jobs, never mutate selected outlines."""
 import hashlib
 import json
 import uuid
@@ -8,7 +8,10 @@ from review_writer_api.database import AIModelRequest, database_session
 
 from review_writer_api.job_service import job_payload
 from review_writer_api.errors import WorkflowConflict
-from review_writer_core.stages.planning.topic_recommendation import normalize_recommended_outline
+from review_writer_core.stages.planning.topic_recommendation import (
+    RECOMMENDATION_VERSION, normalize_recommended_outline, recommendation_paper_context, recommendation_inputs_match,
+)
+from review_writer_core.stages.planning.topic import _topic_outline_intent
 
 
 class TopicRecommendationMixin:
@@ -17,10 +20,17 @@ class TopicRecommendationMixin:
         project = self._owned_project(principal, project_id)
         rows = matrix.get("rows") or []
         per_paper = max(300, min(6000, 120000 // max(1, len(rows))))
-        papers = [{"paper_id": r["paper_id"], "title": r.get("title"),
-                   "evidence": "\n".join(filter(None, [self._matrix_abstract(r), str(r.get("main_content") or "")]))[:per_paper]}
-                  for r in rows]
-        data = {"topic": matrix.get("review_topic") or project.topic, "papers": papers}
+        topic = matrix.get("review_topic") or project.topic
+        papers = [recommendation_paper_context(r, abstract=self._matrix_abstract(r), topic=topic, budget=per_paper) for r in rows]
+        intent = _topic_outline_intent(topic, None, list(matrix.get("classification_axes") or []))
+        organization = {key: intent[key] for key in (
+            "primary_axis", "primary_axis_label", "secondary_axes", "required_partitions", "partitions",
+            "comparison_dimensions", "focus_dimensions") if intent.get(key)}
+        data = {"topic": topic, "papers": papers, "input_contract_version": RECOMMENDATION_VERSION,
+                "organization_instructions": organization}
+        scope = {"topic": topic, "paper_ids": sorted(r["paper_id"] for r in rows),
+                 "organization": organization, "version": RECOMMENDATION_VERSION}
+        data["source_scope_fingerprint"] = hashlib.sha256(json.dumps(scope, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
         fingerprint = hashlib.sha256(json.dumps(data, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
         return {**data, "input_fingerprint": fingerprint}
 
@@ -32,6 +42,10 @@ class TopicRecommendationMixin:
         current = current or next((j for j in jobs if j.status in {"queued", "running", "cancel_requested"}), None)
         ready = next((j for j in jobs if j.status == "succeeded" and j.result.get("outline_md")
                       and j.payload.get("input_fingerprint") == inputs["input_fingerprint"]), None)
+        ready = ready or next((j for j in jobs if j.status == "succeeded" and j.result.get("outline_md")
+            and recommendation_inputs_match(j.payload, inputs)), None)
+        current = current or ready or next((j for j in jobs if j.status in {"failed", "cancelled", "interrupted"}
+            and recommendation_inputs_match(j.payload, inputs)), None)
         previous = next((j for j in jobs if j.status == "succeeded" and j.result.get("outline_md")), None)
         model_progress = None
         if current and current.status in {"queued", "running", "cancel_requested"}:
@@ -44,6 +58,7 @@ class TopicRecommendationMixin:
                     model_progress = {"attempt": request.attempt_count,
                                       "status": request.status, "model": request.model_name}
         return {"input_fingerprint": inputs["input_fingerprint"],
+                "additional_evidence_available": bool(ready and ready.payload.get("input_fingerprint") != inputs["input_fingerprint"]),
                 "model_progress": model_progress,
                 "status": current.status if current else "not_started" if inputs["papers"] else "waiting_for_papers",
                 "job": job_payload(current) if current else None,

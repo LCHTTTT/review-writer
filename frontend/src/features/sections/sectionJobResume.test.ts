@@ -63,6 +63,14 @@ describe("findResumableSectionJob", () => {
     expect(findResumableSectionJob([job], tasks)).toBeUndefined();
   });
 
+  it("does not resume old input versions even when every heading and ID still matches", () => {
+    const job = { ...failedJob({ task_ids: ["S01", "S02"], entries: { S01: { heading: "Introduction" } } }),
+      retry_inputs_current: false };
+    expect(findResumableSectionJob([job], tasks)).toBeUndefined();
+    expect(findSectionJobForDisplay([job], tasks, false)).toBeUndefined();
+    expect(findResumableSectionJob([{ ...job, retry_inputs_current: true }], tasks)?.id).toBe(job.id);
+  });
+
   it("shows the newer successful job when current section outputs exist", () => {
     const failed = failedJob({
       task_ids: ["S01", "S02"],

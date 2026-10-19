@@ -13,10 +13,12 @@ import json
 import re
 import shutil
 import threading
+import time
 import uuid
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
+from review_writer_core.atomic_io import atomic_write_json
 from typing import Any
 
 from PIL import UnidentifiedImageError
@@ -34,7 +36,7 @@ from review_writer_api.figure_rules import image_size
 from review_writer_api.job_service import job_payload as _job_payload
 from review_writer_api.mineru_artifacts import mineru_storage_paths
 from review_writer_api.security import Permission, Principal, Role
-from review_writer_api.workflow_models import LibraryArtifact, LibraryPaper
+from review_writer_api.workflow_models import LibraryArtifact, LibraryPaper, WorkflowJob
 from review_writer_api.workflow_repository import ArtifactRecord, WorkflowRepository
 from review_writer_core.review_structure import (
     assign_primary_paper_sections,
@@ -48,9 +50,12 @@ from review_writer_core.claim_contracts import (
     argument_projection,
     claim_is_executable,
 )
-from review_writer_core.section_narrative_contracts import apply_single_paper_policy, resolve_section_depth_contract
+from review_writer_core.section_narrative_contracts import apply_single_paper_policy, resolve_section_depth_contract, build_section_writing_guidance
 from review_writer_core.evidence_integrity import normalize_retrieval_mode
 from review_writer_core.writing_contracts import derive_writing_scope_contract
+from review_writer_core.review_fact_readiness import REVIEW_READING_STRATEGY
+from review_writer_core.source_attribution import navigation_source_refs
+from review_writer_api.domain_services.library_index import EvidenceHit
 from review_writer_core.scientific_facts import (
     attach_fact_to_evidence, claim_assertion_ceiling, fact_identity, fact_is_usable, fact_usage,
     registered_fact_bindings, writable_evidence_keys, fact_claim_issues,
@@ -64,65 +69,9 @@ from review_writer_core.stages.sections.coverage import (
 from review_writer_core.stages.sections.fact_routing import route_fact_questions
 
 
-_SUPPORT_LEVEL_RANK = {
-    "coverage_only": 0,
-    "context_only": 1,
-    "abstract_limited": 2,
-    "direct": 3,
-}
-
-
-def strongest_support_level(*levels: str) -> str:
-    values = [str(value or "coverage_only") for value in levels]
-    return max(values, key=lambda item: _SUPPORT_LEVEL_RANK.get(item, -1))
-
-
-def _merge_evidence_registry_row(
-    registry: dict[str, dict[str, Any]], hit: dict[str, Any]
-) -> None:
-    """Merge section-scoped identities for one canonical evidence key."""
-
-    evidence_key = str(hit.get("evidence_key") or "")
-    if not evidence_key:
-        return
-    existing = registry.get(evidence_key)
-    if existing is None:
-        registry[evidence_key] = dict(hit)
-        return
-
-    for field in (
-        "fact_ids",
-        "question_ids",
-        "retrieval_passes",
-        "asset_refs",
-        "mechanism_evidence_types",
-        "normalized_fact_values",
-    ):
-        existing[field] = list(
-            dict.fromkeys(
-                str(value)
-                for value in [
-                    *(existing.get(field) or []),
-                    *(hit.get(field) or []),
-                ]
-                if str(value)
-            )
-        )
-    existing["support_level"] = strongest_support_level(
-        str(existing.get("support_level") or "coverage_only"),
-        str(hit.get("support_level") or "coverage_only"),
-    )
-    existing["claim_eligible"] = bool(
-        existing.get("claim_eligible") or hit.get("claim_eligible")
-    )
-    existing["counts_as_evidence"] = bool(
-        existing.get("counts_as_evidence") or hit.get("counts_as_evidence")
-    )
-    if existing.get("normalized_fact_values"):
-        existing["normalized_fact_value"] = "\n".join(existing["normalized_fact_values"])
-    existing["fact_bindings"] = list({binding["fact_id"]: binding for binding in [
-        *(existing.get("fact_bindings") or []), *(hit.get("fact_bindings") or [])
-    ]}.values())
+from review_writer_core.stages.sections.evidence_registry import (
+    _SUPPORT_LEVEL_RANK, strongest_support_level, merge_evidence_registry_row as _merge_evidence_registry_row,
+)
 
 
 from review_writer_api.domain_services.library_index import LibraryIndexService
@@ -133,6 +82,7 @@ from review_writer_core.academic_contracts import (
     mechanism_evidence_types,
 )
 from review_writer_core.evidence_queries import (
+    boolean_query,
     build_question_query_plans,
     normalize_targeted_fact_gaps,
     registered_fact_field_ids,
@@ -182,22 +132,12 @@ class SectionsService(ArtifactBackedService):
         *,
         required: bool = True,
     ) -> tuple[dict[str, Any] | None, ArtifactRecord | None]:
-        self._owned_project(principal, project_id)
-        artifact = self.repository.get_current_artifact(
-            principal.user_id, project_id, logical_name
+        return self._read_json_optional(
+            principal,
+            project_id,
+            logical_name,
+            required=required,
         )
-        if artifact is None:
-            if required:
-                raise self._stage_not_ready(principal, project_id, logical_name)
-            return None, None
-        resolved = self.artifacts.resolve_owned_artifact(principal.user_id, artifact.id)
-        try:
-            payload = json.loads(resolved.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise WorkflowConflict("The current workflow artifact is unreadable.") from exc
-        if not isinstance(payload, dict):
-            raise WorkflowConflict("The current workflow artifact is invalid.")
-        return payload, artifact
 
     @staticmethod
     def tasks_from_blueprint(blueprint: dict[str, Any]) -> list[dict[str, Any]]:
@@ -210,6 +150,11 @@ class SectionsService(ArtifactBackedService):
         policy_mode = (
             str(policy.get("mode") or "") if isinstance(policy, dict) else ""
         )
+        scope_gap_ids = {
+            str(gap.get("section_id") or "")
+            for gap in blueprint.get("scope_coverage_gaps") or []
+            if isinstance(gap, dict) and str(gap.get("section_id") or "")
+        }
         normalized_sections = sections
         if policy_mode not in {"single_primary_section_with_supporting_cross_references", "argument_based"}:
             legacy_input: list[dict[str, Any]] = []
@@ -247,6 +192,8 @@ class SectionsService(ArtifactBackedService):
         tasks: list[dict[str, Any]] = []
         for section in normalized_sections:
             if not isinstance(section, dict) or not str(section.get("section_id") or ""):
+                continue
+            if str(section.get("section_id") or "") in scope_gap_ids:
                 continue
             if section.get("organizing_only"):
                 continue
@@ -320,6 +267,7 @@ class SectionsService(ArtifactBackedService):
                     "heading": str(section.get("title") or section["section_id"]),
                     "section_role": str(section.get("section_role") or "body"),
                     "core_argument": core_argument,
+                    "review_problem": section.get("review_problem"),
                     "organizing_thread": str(section.get("organizing_thread") or ""),
                     "paragraph_tasks": [v for v in section.get("paragraph_tasks", []) if isinstance(v, str)]
                         if isinstance(section.get("paragraph_tasks"), list) else [],
@@ -360,7 +308,13 @@ class SectionsService(ArtifactBackedService):
                         )
                     ),
                     "depth_contract": resolve_section_depth_contract(section),
+                    "requested_length": build_section_writing_guidance(section).get("requested_length"),
+                    "target_words": section.get("target_words"),
+                    "target_words_source": section.get("target_words_source"),
+                    "notes": section.get("notes"),
                     "evidence_mode": SOURCE_CONTRACT,
+                    **({"reading_strategy": REVIEW_READING_STRATEGY}
+                       if blueprint.get("reading_strategy") == REVIEW_READING_STRATEGY else {}),
                     "writing_objective": section.get("writing_objective") or section.get("section_thesis"),
                     "questions_to_answer": section.get("questions_to_answer") or [],
                     "retrieval_directions": section.get("retrieval_directions") or [],
@@ -414,6 +368,7 @@ class SectionsService(ArtifactBackedService):
             review_topic=review_topic,
             heading=str(task.get("heading") or ""),
             core_argument=str(task.get("core_argument") or ""),
+            review_problem=str(task.get("review_problem") or ""),
             research_questions=list(task.get("questions_to_answer") or []) + list(task.get("retrieval_directions") or []),
             section_role=str(task.get("section_role") or "body"),
             must_cover_points=list(task.get("must_cover_points") or []),
@@ -434,17 +389,92 @@ class SectionsService(ArtifactBackedService):
         return " ".join(str(abstract or "").split()).strip()
 
     def _evidence_package(
+        self, principal, project_id, tasks, catalog, matrix_rows=None,
+        *, prepared_sections=None, on_section=None, on_progress=None,
+    ):
+        """Batch query vectors once; keep scoped retrieval and ranking unchanged."""
+        warm = getattr(self.library_index, "query_embedding_session", None)
+        if not callable(warm) or not self.library_index.enabled or not getattr(self.library_index, "vector_enabled", False):
+            return self._retrieve_evidence_package(principal, project_id, tasks, catalog, matrix_rows,
+                prepared_sections=prepared_sections, on_section=on_section, on_progress=on_progress)
+        project = self._owned_project(principal, project_id)
+        queries = []
+        for task in tasks:
+            if ((prepared_sections or {}).get(str(task.get("section_id") or "")) is not None
+                    or task.get("synthesis_contract") or not task.get("allowed_papers")):
+                continue
+            for plan in self._evidence_queries(task, review_topic=str(getattr(project, "topic", "") or "")):
+                queries.append(str(plan["websearch_query"]))
+                if plan.get("question_term_groups"):
+                    if plan.get("question_id") == "section_focus":
+                        queries.append(boolean_query(plan["required_concept_groups"]))
+                    else:
+                        queries.append("(" + " OR ".join(f'"{term}"' if " " in term else term
+                            for term in plan["question_term_groups"][0]) + ")")
+        def progress(ready, total):
+            if on_progress:
+                on_progress({"prepared_section_count": len(prepared_sections or {}), "preparation_total": len(tasks),
+                    "query_embedding_ready": ready, "query_embedding_total": total,
+                    "preparation_step": "query_embeddings"})
+        with warm(principal, queries, progress=progress) as vectors:
+            def retrieval_progress(state):
+                if on_progress:
+                    on_progress({**state, "semantic_status": "degraded" if vectors.get("unavailable") else "ready"})
+            return self._retrieve_evidence_package(principal, project_id, tasks, catalog, matrix_rows,
+                prepared_sections=prepared_sections, on_section=on_section, on_progress=retrieval_progress)
+
+    def _retrieve_evidence_package(
         self,
         principal: Principal,
         project_id: str,
         tasks: list[dict[str, Any]],
         catalog: dict[str, LibraryPaper],
         matrix_rows: dict[str, dict[str, Any]] | None = None,
+        *, prepared_sections=None, on_section=None, on_progress=None,
     ) -> dict[str, Any]:
         project = self._owned_project(principal, project_id)
         review_topic = str(getattr(project, "topic", "") or "")
         sections: list[dict[str, Any]] = []
+        # These caches live only inside one owned, versioned preparation. Share
+        # repeated source requests across chapters, never across users or runs.
+        navigation_cache: dict[tuple[str, str, tuple[str, ...]], list] = {}
+        retrieval_cache: dict[str, list] = {}
+        ensured_papers = set()
+        retrieval_count = 0
+        current_task = {}
+
+        def notify():
+            if on_progress:
+                on_progress({"current_section_id": current_task.get("section_id", ""),
+                             "current_heading": current_task.get("heading", ""),
+                             "prepared_section_count": len(sections),
+                             "preparation_total": len(tasks), "retrieval_count": retrieval_count})
+
+        def retrieve(query, **kwargs):
+            nonlocal retrieval_count
+            notify()
+            key = json.dumps([query, kwargs], ensure_ascii=False, sort_keys=True)
+            if key not in retrieval_cache:
+                retrieval_cache[key] = self.library_index.retrieve(principal, query, **kwargs)
+                retrieval_count += 1
+                notify()
+            return retrieval_cache[key]
+
         for task in tasks:
+            current_task = task
+            notify()
+            cached_section = (prepared_sections or {}).get(str(task.get("section_id") or ""))
+            if cached_section is not None:
+                sections.append(deepcopy(cached_section))
+                notify()
+                continue
+            if task.get("synthesis_contract"):
+                from review_writer_core.stages.sections.synthesis_inputs import synthesis_evidence
+                sections.append(synthesis_evidence(task, sections))
+                if on_section:
+                    on_section(sections[-1])
+                notify()
+                continue
             allowed = [str(item) for item in task.get("allowed_papers") or []]
             si_parent_by_id = self._supporting_source_parents(catalog, allowed)
             retrieval_allowed = list(
@@ -505,7 +535,11 @@ class SectionsService(ArtifactBackedService):
                 and bool(getattr(self.library_index, "vector_enabled", False))
                 and allowed
             ):
-                self.library_index.ensure_embeddings(principal, retrieval_allowed)
+                pending = [pid for pid in retrieval_allowed if pid not in ensured_papers]
+                if pending:
+                    ready = self.library_index.ensure_embeddings(principal, pending)
+                    if isinstance(ready, dict):
+                        ensured_papers.update(pid for pid, state in ready.items() if state == "ready")
             index_summaries = (
                 self.library_index.summaries(principal, retrieval_allowed)
                 if self.library_index is not None
@@ -526,17 +560,23 @@ class SectionsService(ArtifactBackedService):
                 for plan in query_plans
             }
             relaxed_recovery_anchors: set[tuple[str, str]] = set()
+            contribution_recovery_anchors: set[tuple[str, str]] = set()
+            reading_anchors: set[tuple[str, str]] = set()
 
             def add_hits(found, *, question_id: str, retrieval_pass: str) -> None:
                 for hit in found:
                     key = (hit.paper_id, hit.chunk_id)
                     current = merged_hits.get(key)
-                    if current is None or (current["hit"].is_neighbor and not hit.is_neighbor):
+                    if current is None:
                         merged_hits[key] = {
                             "hit": hit,
                             "question_ids": set(),
                             "retrieval_passes": set(),
                         }
+                    elif current["hit"].is_neighbor and not hit.is_neighbor:
+                        # Promoting a neighbor to a direct hit must not erase
+                        # the other question memberships for this same source.
+                        current["hit"] = hit
                     merged_hits[key]["question_ids"].add(question_id)
                     merged_hits[key]["retrieval_passes"].add(retrieval_pass)
                     canonical_id = citation_paper_id(hit.paper_id)
@@ -568,8 +608,7 @@ class SectionsService(ArtifactBackedService):
                         )
                     for paper_id in per_paper_targets:
                         add_hits(
-                            self.library_index.retrieve(
-                                principal,
+                            retrieve(
                                 str(plan["websearch_query"]),
                                 allowed_papers=retrieval_ids_for(paper_id),
                                 top_k=2,
@@ -581,6 +620,18 @@ class SectionsService(ArtifactBackedService):
                             question_id=question_id,
                             retrieval_pass="per_paper_targeted",
                         )
+                        if (question_id == "section_focus" and plan.get("question_term_groups")
+                                and not question_direct[question_id][paper_id]):
+                            # A more specific review question is navigation,
+                            # not a new admission gate. Retain the original
+                            # topic route when it cannot locate a direct hit.
+                            groups = plan["required_concept_groups"]
+                            add_hits(retrieve(boolean_query(groups),
+                                allowed_papers=retrieval_ids_for(paper_id), top_k=2,
+                                per_paper_limit=2, include_neighbors=True,
+                                term_groups=groups, exact_phrases=[term for group in groups
+                                    for term in group if " " in term]),
+                                question_id=question_id, retrieval_pass="section_scope_fallback")
                         if (
                             question_id != "section_focus"
                             and not question_direct[question_id][paper_id]
@@ -592,8 +643,7 @@ class SectionsService(ArtifactBackedService):
                                 f'"{term}"' if " " in term else term
                                 for term in relaxed_terms
                             ) + ")"
-                            relaxed_hits = self.library_index.retrieve(
-                                principal,
+                            relaxed_hits = retrieve(
                                 relaxed_query,
                                 allowed_papers=retrieval_ids_for(paper_id),
                                 top_k=1,
@@ -619,8 +669,7 @@ class SectionsService(ArtifactBackedService):
                                     if not hit.is_neighbor
                                 )
                     add_hits(
-                        self.library_index.retrieve(
-                            principal,
+                        retrieve(
                             str(plan["websearch_query"]),
                             allowed_papers=retrieval_allowed,
                             top_k=global_limit,
@@ -631,6 +680,66 @@ class SectionsService(ArtifactBackedService):
                         question_id=question_id,
                         retrieval_pass="global_comparison",
                     )
+
+                # A primary paper can be marked "covered" by its introduction
+                # even when all extracted fact cards describe prior work.  Add
+                # a tiny sample from its own indexed body before the evidence
+                # budget; the writer must still verify what those pages claim.
+                recover_contribution = getattr(self.library_index, "primary_contribution_hits", None)
+                if callable(recover_contribution):
+                    for paper_id in primary:
+                        matrix_row = (matrix_rows or {}).get(paper_id) or {}
+                        if any(
+                            isinstance(fact, dict)
+                            and fact.get("study_ownership") == "own_results"
+                            and fact_is_usable(fact, purpose="detail")
+                            for fact in matrix_row.get("scientific_facts") or []
+                        ):
+                            continue
+                        analysis = matrix_row.get("paper_analysis") or {}
+                        contribution = str(analysis.get("contribution") or "") if isinstance(analysis, dict) else ""
+                        found = recover_contribution(
+                            principal, paper_id=paper_id,
+                            contribution=contribution or str(catalog[paper_id].title),
+                            limit=2,
+                        )
+                        add_hits(found, question_id="primary_contribution",
+                                 retrieval_pass="primary_contribution_recovery")
+                        contribution_recovery_anchors.update(
+                            (hit.paper_id, hit.chunk_id) for hit in found
+                        )
+
+                # A reading candidate is a location hint, not a verified fact.
+                # Resolve the full registered chunk independently of its value,
+                # ownership or model confidence. Never attach it as a fact binding.
+                resolver = getattr(self.library_index, "resolve_source_chunks", None)
+                if task.get("reading_strategy") == REVIEW_READING_STRATEGY and callable(resolver):
+                    for paper_id in allowed:
+                        groups: dict[tuple[str, str], set[str]] = {}
+                        for ref in navigation_source_refs((matrix_rows or {}).get(paper_id) or {}):
+                            source_id = str(ref.get("source_file_id") or paper_id)
+                            lineage = str(ref.get("source_lineage_hash") or "")
+                            chunk_id = str(ref.get("chunk_id") or "")
+                            if (source_id not in retrieval_ids_for(paper_id) or chunk_id == "abstract"
+                                    or not lineage or lineage != str((index_summaries.get(source_id) or {}).get("source_lineage_hash") or "")
+                                    or ref.get("evidence_key") != academic_evidence_key(source_id, chunk_id, lineage)):
+                                continue
+                            groups.setdefault((source_id, lineage), set()).add(chunk_id)
+                        for (source_id, lineage), chunks in groups.items():
+                            key = (source_id, lineage, tuple(sorted(chunks)))
+                            if key not in navigation_cache:
+                                navigation_cache[key] = resolver(principal, source_id, list(key[2]), expected_lineage=lineage)
+                            found = [EvidenceHit(
+                                paper_id=source_id, chunk_id=row["chunk_id"], content=row["content"],
+                                page_start=row.get("page_start"), page_end=row.get("page_end"),
+                                section_path=tuple(row.get("section_path") or []), content_type=row.get("content_type") or "text",
+                                asset_refs=(), score=0.0, match_reason="reading_source_navigation", is_neighbor=False,
+                                index_id="", source_lineage_hash=lineage,
+                            ) for row in navigation_cache[key]
+                                if row.get("chunk_id") in chunks and row.get("content")
+                                and row.get("source_lineage_hash") == lineage and row.get("paper_id") == source_id]
+                            add_hits(found, question_id="section_focus", retrieval_pass="reading_source_navigation")
+                            reading_anchors.update((hit.paper_id, hit.chunk_id) for hit in found)
 
                 # Dynamic evidence budget: preserve one real anchor for every
                 # matched primary paper, then spend the remaining budget on
@@ -653,7 +762,7 @@ class SectionsService(ArtifactBackedService):
                 # the dynamic budget with those recovered anchors before
                 # spending the remaining budget on general comparison hits.
                 selected_direct: set[tuple[str, str]] = set(
-                    relaxed_recovery_anchors
+                    relaxed_recovery_anchors | contribution_recovery_anchors | reading_anchors
                 )
                 for paper_id in primary:
                     best = next(
@@ -866,7 +975,7 @@ class SectionsService(ArtifactBackedService):
                         ):
                             continue
                         fact_claim_eligible = fact_is_usable(fact, purpose="detail")
-                        abstract_fact = fact_usage(fact) == "background"
+                        abstract_fact = fact_usage(fact) in {"background", "navigation"}
                         # Usage outranks legacy labels: an abstract-only card
                         # may still carry support_level=direct in old Matrix
                         # data. Repetition must not strengthen that evidence.
@@ -993,7 +1102,7 @@ class SectionsService(ArtifactBackedService):
                         routes[fact_route["fact_id"]] = fact_route
                         existing["fact_routes"] = list(routes.values())
                         existing["background_eligible"] = any(
-                            fact_usage(binding) == "background" for binding in existing.get("fact_bindings") or []
+                            fact_usage(binding) in {"background", "navigation"} for binding in existing.get("fact_bindings") or []
                         )
                         if fact_claim_eligible:
                             for question_id in mapped_questions:
@@ -1374,6 +1483,13 @@ class SectionsService(ArtifactBackedService):
                         (index_summaries.get(pid) or {}).get("fulltext") == "ready" for pid in allowed
                     ),
                     "hit_count": len(hit_rows),
+                    **({"source_manifest": {
+                        source_id: {"paper_id": citation_paper_id(source_id),
+                                    "source_lineage_hash": summary["source_lineage_hash"]}
+                        for source_id, summary in index_summaries.items()
+                        if source_id in retrieval_allowed and summary.get("fulltext") == "ready"
+                        and summary.get("source_lineage_hash")
+                    }} if task.get("reading_strategy") == REVIEW_READING_STRATEGY else {}),
                     "claim_eligible_hit_count": len(usable_hits),
                     "paper_count": len(evidence_papers),
                     "primary_paper_count": len(primary),
@@ -1418,6 +1534,9 @@ class SectionsService(ArtifactBackedService):
                     "hits": hit_rows,
                 }
             )
+            if on_section:
+                on_section(sections[-1])
+            notify()
         registry: dict[str, dict[str, Any]] = {}
         for section in sections:
             for hit in section.get("hits") or []:
@@ -1565,7 +1684,7 @@ class SectionsService(ArtifactBackedService):
                     "evidence_role_changes": downgraded,
                     "writing_mode": (
                         task.get("writing_mode")
-                        if writeable
+                        if task.get("synthesis_contract") or writeable
                         or str(task.get("section_role") or "body")
                         == "introduction"
                         else "bounded_context_synthesis"
@@ -1606,8 +1725,11 @@ class SectionsService(ArtifactBackedService):
         project_id: str,
         tasks: list[dict[str, Any]],
         matrix_rows: list[dict[str, Any]],
+        *, preparation_options=None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, LibraryPaper]]:
         """Build the one task/evidence projection used before and during jobs."""
+        from review_writer_core.stages.sections.synthesis_inputs import link_synthesis_tasks
+        tasks = link_synthesis_tasks(tasks)
         matrix_by_id, catalog = self._generation_catalog(principal, tasks, matrix_rows)
         evidence_package = self._evidence_package(
             principal,
@@ -1615,6 +1737,7 @@ class SectionsService(ArtifactBackedService):
             tasks,
             catalog,
             matrix_by_id,
+            **(preparation_options or {}),
         )
         evidence_by_section = {
             str(item.get("section_id") or ""): item
@@ -1640,7 +1763,8 @@ class SectionsService(ArtifactBackedService):
         return hydrated, evidence_package, catalog
 
     def generation_payload(
-        self, principal: Principal, project_id: str, *, defer_evidence: bool = False
+        self, principal: Principal, project_id: str, *, defer_evidence: bool = False,
+        preparation_options=None,
     ) -> dict[str, Any]:
         principal.require(Permission.PROJECT_WRITE)
         project = self._owned_project(principal, project_id)
@@ -1692,7 +1816,8 @@ class SectionsService(ArtifactBackedService):
                 "evidence_preparation_pending": True,
             }
         tasks, evidence_package, catalog = self.hydrate_tasks_with_evidence(
-            principal, project_id, tasks, matrix_rows
+            principal, project_id, tasks, matrix_rows,
+            **({"preparation_options": preparation_options} if preparation_options is not None else {}),
         )
         assigned = list(
             dict.fromkeys(
@@ -1777,7 +1902,12 @@ class SectionsService(ArtifactBackedService):
         summaries = self.library_index.summaries(principal, sorted(catalog)) if indexed else {}
         project = self._owned_project(principal, project_id)
         manifest = {
-            "version": 1,
+            "version": 2,
+            "retrieval": {
+                "tuning": getattr(getattr(self.library_index, "tuning", None), "__dict__", {}),
+                "embedding": (self.library_index._current_embedding_profile()
+                              if callable(getattr(self.library_index, "_current_embedding_profile", None)) else None),
+            },
             "project_id": project_id,
             "topic": project.topic,
             "taxonomy_profile": project.taxonomy_profile,
@@ -1914,7 +2044,53 @@ class SectionsService(ArtifactBackedService):
             fingerprint = self._preparation_fingerprint(principal, project_id, payload)
             prepared = self._retry_prepared_input(context, payload, fingerprint)
             if prepared is None:
-                prepared = self.generation_payload(principal, project_id)
+                directories = [directory]
+                source_id = getattr(context, "retry_of_job_id", None)
+                seen = set()
+                for _ in range(16):
+                    if not source_id or source_id in seen:
+                        break
+                    seen.add(source_id)
+                    source = self.repository.get_job(context.user_id, source_id)
+                    if source is None or str(source.project_id) != project_id or source.job_type != "sections.generate":
+                        break
+                    directories.append(self.artifacts.workspace_manager.trusted_user_directory(
+                        context.user_id, ".review-writer", "job-staging", str(uuid.UUID(source_id))))
+                    source_id = source.retry_of_job_id
+                valid_ids = {str(task["section_id"]) for task in payload.get("tasks") or []}
+                ready_sections = {}
+                for saved_directory in reversed(directories):
+                    for file in saved_directory.glob("evidence-section-*.json"):
+                        try:
+                            saved = json.loads(file.read_text(encoding="utf-8"))
+                            section = saved.get("section")
+                            sid = str(section.get("section_id")) if isinstance(section, dict) else ""
+                            expected_name = "evidence-section-" + hashlib.sha256(sid.encode()).hexdigest() + ".json"
+                            if (saved.get("schema_version") == 1 and saved.get("fingerprint") == fingerprint
+                                    and isinstance(section, dict) and sid in valid_ids and file.name == expected_name
+                                    and isinstance(section.get("hits"), list) and isinstance(section.get("query_plans"), list)):
+                                ready_sections[str(section["section_id"])] = section
+                        except (OSError, ValueError, TypeError, AttributeError):
+                            continue
+                last = {"at": 0.0, "cursor": None}
+                def progress(state):
+                    context.checkpoint()
+                    cursor = (state.get("current_section_id"), state.get("prepared_section_count"), state.get("query_embedding_ready"))
+                    now = time.monotonic()
+                    if cursor == last["cursor"] and now - last["at"] < 5:
+                        return
+                    last.update(at=now, cursor=cursor)
+                    context.report_partial_result({**preview, "section_progress": {
+                        **preview["section_progress"], **state,
+                        "reused_prepared_sections": len(ready_sections)}})
+                def save_section(section):
+                    context.checkpoint()
+                    filename = hashlib.sha256(str(section["section_id"]).encode()).hexdigest()
+                    atomic_write_json(directory / f"evidence-section-{filename}.json",
+                                      {"schema_version": 1, "fingerprint": fingerprint, "section": section})
+                prepared = self.generation_payload(principal, project_id, preparation_options={
+                    "prepared_sections": ready_sections, "on_section": save_section,
+                    "on_progress": progress})
                 # Index preparation can change index state. Only mark the cache reusable
                 # when its dependencies remained stable over the complete retrieval.
                 after = self._preparation_fingerprint(principal, project_id, payload)
@@ -1925,6 +2101,14 @@ class SectionsService(ArtifactBackedService):
             temporary = directory / f"prepared-section-input-{uuid.uuid4().hex}.tmp"
             temporary.write_text(json.dumps(prepared, ensure_ascii=False), encoding="utf-8")
             temporary.replace(cache)
+        from review_writer_core.stages.sections.synthesis_inputs import repair_prepared_synthesis
+        synthesis_version = prepared.get("synthesis_inputs_version")
+        prepared = repair_prepared_synthesis(prepared)
+        if prepared.get("synthesis_inputs_version") != synthesis_version:
+            atomic_write_json(cache, prepared)
+        if payload.get("_rewrite_scope"):
+            from .section_rewrites import SectionRewrites
+            return SectionRewrites(self).hydrate(principal, project_id, payload, prepared)
         return {**payload, **prepared,
                 "expected_sections_revision": payload.get("expected_sections_revision", prepared.get("expected_sections_revision", 0)),
                 "evidence_preparation_pending": False}
@@ -2174,6 +2358,10 @@ class SectionsService(ArtifactBackedService):
                     if not valid_source_claim(claim, fact_sources, text=realization.get("text", "")):
                         raise WorkflowValidationError("A Claim source passage or checked wording has changed.",
                             details={"section_id": section_id, "claim_id": claim_id})
+                    if (task_by_section.get(section_id, {}).get("reading_strategy") == REVIEW_READING_STRATEGY
+                            and (claim.get("source_verification") or {}).get("status") != "supported"):
+                        raise WorkflowValidationError("Review-reading prose requires an actual source audit.",
+                            details={"section_id": section_id, "claim_id": claim_id})
                 if not planned_fact_ids.issubset(ref_fact_ids):
                     raise WorkflowValidationError(
                         "A Claim references fact identities outside its evidence keys.",
@@ -2366,6 +2554,7 @@ class SectionsService(ArtifactBackedService):
         built: dict[str, Any],
         *,
         attempts: int,
+        validate_only: bool = False,
     ) -> dict[str, Any]:
         self.validate_generation_inputs(principal, project_id, payload)
         expected_tasks = {task["section_id"]: task for task in payload["tasks"]}
@@ -2406,7 +2595,7 @@ class SectionsService(ArtifactBackedService):
         # An incomplete new audit must not replace a still-valid saved section
         # with a smaller subset. Revalidate against this request's actual sources.
         previous, _ = self._read_json_artifact(principal, project_id, SECTION_INDEX_LOGICAL_NAME, required=False)
-        if previous and all(previous.get(key) == payload.get(key) for key in (
+        if not validate_only and previous and all(previous.get(key) == payload.get(key) for key in (
                 "source_blueprint_artifact_id", "source_matrix_artifact_id", "source_outline_artifact_id")):
             old_plan, _ = self._read_json_artifact(principal, project_id, WRITING_PLAN_LOGICAL_NAME, required=False)
             old_synthesis, _ = self._read_json_artifact(principal, project_id, SYNTHESIS_STATE_LOGICAL_NAME, required=False)
@@ -2629,6 +2818,8 @@ class SectionsService(ArtifactBackedService):
         paper_candidates = deepcopy(built.get("paper_figure_candidates")) if isinstance(built, dict) else None
         figure_candidates = deepcopy(built.get("figure_candidates")) if isinstance(built, dict) else None
         default_reviews = deepcopy(built.get("default_figure_reviews")) if isinstance(built, dict) else None
+        if validate_only:
+            return {"validated_only": True, "section_ids": list(expected_tasks)}
         with self._write_lock:
             run = self.repository.create_stage_run(
                 principal.user_id,
@@ -2962,7 +3153,8 @@ class SectionsService(ArtifactBackedService):
                     metadata={
                         "source_blueprint_artifact_id": payload[
                             "source_blueprint_artifact_id"
-                        ]
+                        ],
+                        **({"adopted_rewrite_candidate_artifact_id": payload["_adopted_rewrite_candidate_id"]} if payload.get("_adopted_rewrite_candidate_id") else {}),
                     },
                 )
             state = self.repository.promote_stage_artifacts_atomically(
@@ -2975,6 +3167,7 @@ class SectionsService(ArtifactBackedService):
                 },
                 run_id=run.id,
                 expected_revision=int(payload["expected_sections_revision"]),
+                expected_current_artifacts=payload.get("_rewrite_expected_artifacts"),
                 status="review",
                 invalidate_stages=(
                     "figure-review",
@@ -2987,7 +3180,7 @@ class SectionsService(ArtifactBackedService):
                         artifact.logical_name: artifact.id
                         for artifact in [*source_artifacts.values(), *published.values()]
                     },
-                    "recomputed_object_ids": list(expected_tasks),
+                    "recomputed_object_ids": [payload["_rewrite_scope"]] if payload.get("_rewrite_scope") else list(expected_tasks),
                     "academic_bundle": [
                         SYNTHESIS_STATE_LOGICAL_NAME,
                         WRITING_PLAN_LOGICAL_NAME,
@@ -3014,6 +3207,64 @@ class SectionsService(ArtifactBackedService):
                 or []
             ),
             "recomputed_object_ids": list(expected_tasks),
+        }
+
+    def enter_chapter_writing(self, principal: Principal, project_id: str) -> dict[str, Any]:
+        """Invalidate chapter writing and later stages when the outline changed.
+
+        Saving an outline no longer invalidates downstream stages eagerly; that
+        happens here, when the user actually enters chapter writing. Content is
+        preserved (only current pointers and stage status change), so an
+        unchanged outline leaves existing sections, figures and drafts intact.
+        """
+        principal.require(Permission.PROJECT_WRITE)
+        blueprint, blueprint_artifact = self._read_json_artifact(
+            principal, project_id, BLUEPRINT_LOGICAL_NAME
+        )
+        matrix, matrix_artifact = self._read_json_artifact(
+            principal, project_id, MATRIX_LOGICAL_NAME
+        )
+        _outline, outline_artifact = self._read_json_artifact(
+            principal, project_id, OUTLINE_LOGICAL_NAME
+        )
+        index, _index_artifact = self._read_json_artifact(
+            principal, project_id, SECTION_INDEX_LOGICAL_NAME, required=False
+        )
+        stale = bool(index) and (
+            index.get("source_blueprint_artifact_id") != blueprint_artifact.id
+            or not self._matrix_dependency_matches(
+                principal, project_id,
+                index.get("source_matrix_artifact_id"), matrix_artifact,
+            )
+            or (
+                index.get("source_outline_artifact_id")
+                or blueprint.get("source_outline_artifact_id")
+            )
+            != outline_artifact.id
+        )
+        if stale:
+            self.repository.invalidate_stages(
+                principal.user_id,
+                project_id,
+                ("sections", "figure-review", "figures", "draft", "final"),
+            )
+        return {"project_id": project_id, "invalidated": bool(stale)}
+
+    def status(self, principal: Principal, project_id: str) -> dict[str, Any]:
+        """Cheap change notification: no manuscript, evidence, or checkpoint payload."""
+        self._owned_project(principal, project_id)
+        names = (BLUEPRINT_LOGICAL_NAME, MATRIX_LOGICAL_NAME, OUTLINE_LOGICAL_NAME, SECTION_INDEX_LOGICAL_NAME)
+        artifacts = {name: self.repository.get_current_artifact(principal.user_id, project_id, name) for name in names}
+        with database_session(self.repository.session_factory) as session:
+            job = session.execute(select(WorkflowJob.id, WorkflowJob.status).where(
+                WorkflowJob.user_id == uuid.UUID(principal.user_id),
+                WorkflowJob.project_id == uuid.UUID(project_id),
+                WorkflowJob.job_type == "sections.generate",
+            ).order_by(WorkflowJob.created_at.desc(), WorkflowJob.id.desc()).limit(1)).first()
+        return {
+            "artifact_ids": {name: item.id if item else "" for name, item in artifacts.items()},
+            "job_id": str(job.id) if job else "",
+            "job_status": job.status if job else "",
         }
 
     def get(self, principal: Principal, project_id: str) -> dict[str, Any]:
@@ -3132,9 +3383,14 @@ class SectionsService(ArtifactBackedService):
                     current = False
                     synthesis_state = None
                     writing_plan = None
-        jobs = self.repository.list_project_jobs(
+        jobs = [job for job in self.repository.list_project_jobs(
             principal.user_id, project_id, job_type="sections.generate"
-        )
+        ) if not job.payload.get("_rewrite_scope")]
+        current_sources = {
+            "source_blueprint_artifact_id": blueprint_artifact.id,
+            "source_matrix_artifact_id": matrix_artifact.id,
+            "source_outline_artifact_id": outline_artifact.id,
+        }
         state = self.repository.get_stage_state(
             principal.user_id, project_id, "sections"
         )
@@ -3157,6 +3413,7 @@ class SectionsService(ArtifactBackedService):
             if current
             else "",
             "revision": state.revision if state else 0,
+            "section_index_artifact_id": index_artifact.id if index_artifact else "",
             "handoff": {
                 "drafts_stale": bool(index_artifact and not current),
                 "has_existing_drafts": bool(index_artifact),
@@ -3166,7 +3423,9 @@ class SectionsService(ArtifactBackedService):
                 "current_task_count": len(tasks),
                 "current_output_count": sum(s.get("generation_mode") != "pending_evidence" for s in (index or {}).get("sections") or []) if current else 0,
                 "pending_section_count": sum(s.get("generation_mode") == "pending_evidence" for s in (index or {}).get("sections") or []) if current else 0,
-                "jobs": [_job_payload(job) for job in jobs],
+                "jobs": [{**_job_payload(job), "retry_inputs_current": all(
+                    job.payload.get(key) == value for key, value in current_sources.items()
+                )} for job in jobs],
             },
             "workspace": {
                 "active_stage": "sections",

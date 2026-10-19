@@ -1,15 +1,12 @@
 from __future__ import annotations
 
 import json
-import re
-import time
 import uuid
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
 from review_writer_api.domain_services.drafts import (
-    DRAFT_DOCUMENT,
-    DRAFT_QUALITY,
     SECTION_EVIDENCE,
     DraftsService,
 )
@@ -19,6 +16,62 @@ from review_writer_api.workflow_models import WorkflowApproval
 
 
 class DraftsV1Tests(NativeFigureApiTestCase):
+    def test_saved_draft_paper_label_is_advisory_and_does_not_mutate_manuscript(self):
+        with TestClient(self.app) as client:
+            self.prepare_draft(client)
+            service = self.app.state.drafts_service
+            before = service.get(self.first, self.project_id)
+            paragraph = before["paragraphs"][0]
+            value = "P001 reported the reaction. [1]"
+            saved = client.put(f"/api/v1/projects/{self.project_id}/draft/paragraphs/{paragraph['paragraph_id']}",
+                json={"revision": before["revision"], "text": value, "base_text_sha256": paragraph["text_sha256"]})
+            self.assertEqual(200, saved.status_code, saved.text)
+            after = service.get(self.first, self.project_id)
+            self.assertIn(value, after["first_draft_md"])
+            self.assertEqual(["P001"], [r["phrase"] for r in after["publication_voice"]["issues"]
+                if r["code"] == "internal_paper_identifier"])
+            self.assertFalse(after["freshness"]["editing_blocked"])
+
+    def test_writer_records_survive_assembly_but_not_manual_changes(self):
+        from review_writer_core.manuscript_coherence import paragraph_records, assembly_records
+
+        # Inject source records at the assembly boundary, without touching real
+        # accounts or requiring any provider request.
+        def with_records(paragraphs, sections):
+            for section in sections:
+                section['content_records'] = paragraph_records(section['paragraphs'], {
+                    'paragraphs': [dict(p, reader_takeaway='Bounded source result', evidence_uses=[])
+                                   for p in section['paragraphs']]})
+            return assembly_records(paragraphs, sections)
+
+        with TestClient(self.app) as client:
+            with patch('review_writer_api.domain_services.drafts.assembly_records', side_effect=with_records):
+                self.prepare_draft(client)
+            base = f'/api/v1/projects/{self.project_id}/draft'
+            before = client.get(base).json()
+            self.assertTrue(before['content_records'])
+            pid = next(iter(before['content_records']))
+            paragraph = next(p for p in before['paragraphs'] if p['paragraph_id'] == pid)
+            changed = client.put(base + '/paragraphs/' + pid, json={
+                'revision': before['revision'], 'text': paragraph['text'] + ' User clarification.',
+                'base_text_sha256': paragraph['text_sha256']})
+            self.assertEqual(200, changed.status_code, changed.text)
+            after = client.get(base).json()
+            self.assertNotIn(pid, after['content_records'])
+            self.assertEqual(set(before['content_records']) - {pid}, set(after['content_records']))
+
+    def test_draft_exposes_nonblocking_repetition_clues_for_current_paragraphs(self):
+        with TestClient(self.app) as client:
+            self.prepare_draft(client)
+            payload = client.get(f"/api/v1/projects/{self.project_id}/draft").json()
+        report = payload["narrative_repetition"]
+        self.assertEqual("complete", report["status"])
+        self.assertEqual("surface_clues_v1", report["method"])
+        self.assertEqual(len(payload["paragraphs"]), report["total_paragraph_count"])
+        self.assertEqual(len(payload["paragraphs"]), report["covered_paragraph_count"])
+        self.assertIsInstance(report["hints"], list)
+        self.assertNotIn("narrative_repetition", payload.get("quality") or {})
+
     def test_empty_paragraph_deletes_only_prose_and_preserves_history(self):
         with TestClient(self.app) as client:
             self.prepare_draft(client)
@@ -40,6 +93,36 @@ class DraftsV1Tests(NativeFigureApiTestCase):
             old = client.get(f"/api/v1/artifacts/{before['draft_artifact_id']}/content")
             self.assertIn(paragraph["text"], old.text)
             self.assertEqual(404, client.put(url, json=payload).status_code)
+
+    def test_localized_fact_change_keeps_prose_editable_and_blocks_only_stale_paragraphs(self):
+        with TestClient(self.app) as client:
+            self.prepare_draft(client)
+            base = f'/api/v1/projects/{self.project_id}/draft'
+            before = client.get(base).json()
+            paragraphs = before['paragraphs']
+            self.assertGreaterEqual(len(paragraphs), 2)
+            stale_pid = paragraphs[0]['paragraph_id']
+            other_pid = paragraphs[1]['paragraph_id']
+            # Simulate a Matrix change localized to one paragraph: the whole
+            # matrix is stale but only ``stale_pid`` depends on the changed fact.
+            with patch.object(DraftsService, '_matrix_dependency_matches', return_value=False), \
+                 patch.object(DraftsService, '_matrix_stale_paragraphs', return_value=[stale_pid]):
+                payload = client.get(base).json()
+                self.assertEqual([stale_pid], payload['freshness']['stale_paragraph_ids'])
+                self.assertFalse(payload['freshness']['editing_blocked'])
+                self.assertTrue(payload['freshness']['upstream_stale'])
+                # Editing the paragraph whose fact changed is rejected.
+                stale = next(p for p in payload['paragraphs'] if p['paragraph_id'] == stale_pid)
+                blocked = client.put(f'{base}/paragraphs/{stale_pid}', json={
+                    'revision': payload['revision'], 'text': stale['text'] + ' Changed.',
+                    'base_text_sha256': stale['text_sha256']})
+                self.assertEqual(409, blocked.status_code, blocked.text)
+                # Editing an unaffected paragraph still succeeds.
+                other = next(p for p in payload['paragraphs'] if p['paragraph_id'] == other_pid)
+                saved = client.put(f'{base}/paragraphs/{other_pid}', json={
+                    'revision': payload['revision'], 'text': other['text'] + ' Clarified.',
+                    'base_text_sha256': other['text_sha256']})
+                self.assertEqual(200, saved.status_code, saved.text)
 
     def test_figure_only_change_allows_manual_save_without_approving_stale_draft(self):
         with TestClient(self.app) as client:

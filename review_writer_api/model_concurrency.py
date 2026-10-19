@@ -14,6 +14,20 @@ from review_writer_api.workflow_models import WorkflowSystemState
 
 STATE_KEY = "model_concurrency_limits"
 BOUNDS = {"text": (32, 8), "image": (8, 4), "embedding": (16, 8)}
+DEFAULT_FACT_PAPER_CONCURRENCY = 5
+MAX_FACT_PAPER_CONCURRENCY = BOUNDS["text"][1]
+
+
+def fact_paper_limit(settings=None, session_factory=None) -> int:
+    if settings is not None and session_factory is not None:
+        return load(session_factory, settings).get("fact_paper_concurrency", DEFAULT_FACT_PAPER_CONCURRENCY)
+    return DEFAULT_FACT_PAPER_CONCURRENCY
+
+
+def _validate_fact_paper_limit(value):
+    if type(value) is not int or not 1 <= value <= MAX_FACT_PAPER_CONCURRENCY:
+        raise ValueError("Fact extraction papers per task must be an integer between 1 and 8.")
+    return value
 
 
 def text_parallelism(settings=None, session_factory=None) -> int:
@@ -73,12 +87,16 @@ def load(session_factory, settings) -> dict:
         value = dict(stored.value_json or {}) if stored else {}
     configured = value.get("limits")
     limits = validate(configured) if isinstance(configured, dict) else validate(defaults(settings))
-    return {"limits": limits, "version": int(value.get("version") or 0),
+    return {"limits": limits, "fact_paper_concurrency": _validate_fact_paper_limit(
+                value.get("fact_paper_concurrency", DEFAULT_FACT_PAPER_CONCURRENCY)),
+            "version": int(value.get("version") or 0),
             "updated_at": value.get("updated_at"), "updated_by": value.get("updated_by")}
 
 
-def save(session_factory, limits: dict, actor: str) -> dict:
+def save(session_factory, limits: dict, actor: str, *, fact_paper_concurrency: int | None = None) -> dict:
     validated = validate(limits)
+    if fact_paper_concurrency is not None:
+        _validate_fact_paper_limit(fact_paper_concurrency)
     with database_session(session_factory) as session:
         query = select(WorkflowSystemState).where(WorkflowSystemState.key == STATE_KEY)
         if session.get_bind().dialect.name == "postgresql":
@@ -89,6 +107,9 @@ def save(session_factory, limits: dict, actor: str) -> dict:
             session.add(state)
         previous = dict(state.value_json or {})
         value = {"limits": validated, "version": int(previous.get("version") or 0) + 1,
+                 "fact_paper_concurrency": _validate_fact_paper_limit(
+                     fact_paper_concurrency if fact_paper_concurrency is not None else
+                     previous.get("fact_paper_concurrency", DEFAULT_FACT_PAPER_CONCURRENCY)),
                  "updated_at": datetime.now(timezone.utc).isoformat(), "updated_by": actor}
         state.value_json = value
     return value

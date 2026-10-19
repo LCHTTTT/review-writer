@@ -6,6 +6,15 @@ export function diagnosticText(error: unknown, language: Language): string {
   const code = typeof error === "object" && error ? String((error as { code?: string }).code || "") : "";
   const value = `${code} ${raw}`;
   const rules: [RegExp, string, string][] = [
+    [/Every selected paper needs a reviewed assignment|Some selected papers still need a chapter assignment/i, "部分论文尚未确定章节归属或不使用原因。请点击“继续生成”补充规划，已完成的章节方案会保留。", "Some paper assignments or exclusion reasons are unresolved. Continue planning; completed chapter plans are retained."],
+    [/综合比较章节尚未取得关联章节的原文证据/, "综合比较章节尚未取得关联章节的原文证据，请先恢复来源章节或补齐章节关联；已完成章节保留。", "The comparison chapter lacks source passages from its linked chapters. Resume the source chapters or correct their links; completed chapters are retained."],
+    [/模型仅返回推理过程|reasoning.only/i, "模型仅返回推理过程，没有可用答案。已有结果已保留，可重试未完成部分；重试可能产生模型费用。", "The model returned reasoning only, without a usable answer. Existing results are retained. Retry unfinished work; model costs may apply."],
+    [/PROVIDER_EMPTY_RESPONSE|Model provider returned an empty response/i, "模型未返回有效答案。已有结果已保留，可重试未完成部分；重试可能产生模型费用。", "The model returned no usable answer. Existing results are retained. Retry unfinished work; model costs may apply."],
+    [/The delegated model task did not finish|MODEL_TASK_FAILED/i, "模型任务未完成，系统没有自动重发请求。已有结果已保留，请重试未完成部分。", "The model task did not finish and was not resent automatically. Existing results are retained. Retry unfinished work."],
+    [/PROVIDER_OUTPUT_LIMIT/i, "模型回答达到输出上限，结果不完整。已有结果已保留，请重试未完成部分。", "The model reached its output limit before completing the answer. Existing results are retained. Retry unfinished work."],
+    [/CONVERSATION_MODEL_FAILED.*(?:未返回有效回复|empty response)/i, "模型请求已结束，但未返回有效回复。问题和已完成操作已保留；可从未完成轮次重试，重试可能产生模型费用。", "The model request ended without a usable reply. Your question and completed operations are retained. Resume the unfinished round; retrying may incur model costs."],
+    [/CONVERSATION_MODEL_FAILED.*(?:总等待时限|结果尚不确定|超时)/i, "模型未能在等待时限内完成回复；问题和已完成操作已保留，未自动重发请求。", "The model did not complete its reply in time. Your question and completed operations are retained; the request was not resent automatically."],
+    [/CONVERSATION_MODEL_FAILED.*(?:格式|不完整)/i, "模型回复格式不完整，未执行其中的操作；你的问题已保留。", "The model response was incomplete. Its operations were not executed; your question is retained."],
     [/Encrypted ZIP/i, "不支持加密 ZIP，请先解压，再选择文件夹或 PDF 导入。", "Encrypted ZIPs are not supported. Extract them and import the folder or PDFs."],
     [/No PDF files were found in the ZIP/i, "压缩包内没有 PDF，嵌套压缩包不会展开。", "No PDFs found; nested archives are not expanded."],
     [/ZIP.*(unsafe path|linked file|compression ratio|safety limits|unsupported format)/i, "压缩包未通过安全检查，请先在本机解压，再选择文件夹导入。", "ZIP safety checks failed. Extract it locally and import the folder."],
@@ -34,7 +43,11 @@ export function diagnosticText(error: unknown, language: Language): string {
     [/forbidden|permission denied|没有权限|无权访问/i, "没有权限执行此操作，请联系管理员。", "You do not have permission for this action. Contact an administrator."],
     [/selected bibliography candidate is unavailable or stale/i, "候选书目已经更新，请重新自动核验。", "The bibliography candidate changed. Run automatic verification again."],
     [/bibliography record is missing required fields/i, "候选书目信息不完整，现有结果已保留，请重新自动核验。", "The bibliography candidate is incomplete. Existing results were retained; run automatic verification again."],
+    [/Another paper is being downloaded/i, "另一篇论文正在获取全文，请等待完成后重试。", "Another paper is being acquired. Wait for it to finish, then retry."],
+    [/Discovery candidate not found/i, "这篇候选已不在当前检索结果中，请刷新页面后重试。", "This candidate is no longer in the current search results. Refresh and try again."],
+    [/This result has no downloadable source/i, "这篇候选暂无可自动下载的来源，请打开原文或自行上传 PDF。", "No automatic download source is available. Open the article or upload a PDF."],
     [/Manual bibliography resolution requires/i, "书目核验依据不完整，请补充来源位置后再保存。", "Bibliography evidence is incomplete. Add the source location before saving."],
+    [/Workflow inputs changed\. Start a new task/i, "本阶段使用的内容已更新，旧任务不能直接续跑。请回到对应阶段，使用当前内容重新发起；历史成果仍保留。", "This stage's inputs changed. Start a new task from the stage page using current inputs instead of retrying the old task; historical outputs are retained."],
     [/WORKFLOW_CONFLICT|STATE_CONFLICT|Workflow stage changed|stale|版本.*变化|changed.*(?:running|waiting)|revision/i, "内容或版本已更新，请刷新后重试。", "The content or version changed. Refresh and try again."],
     [/The outline could not be loaded/i, "无法载入该大纲，请检查内容后重试。", "The outline could not be loaded. Check its content and retry."],
     [/ARTIFACT_FILE_MISSING/, "文件暂时不可用，请刷新或联系管理员检查存储。", "The file is unavailable. Refresh or ask an administrator to check storage."],

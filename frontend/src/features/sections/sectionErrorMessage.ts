@@ -2,6 +2,8 @@ import type { UiText } from "./sectionStatusLabels";
 
 /** User-facing summary only; task records retain the original diagnostic. */
 export function sectionErrorMessage(message: string, text: UiText): string {
+  if (/Planning changed while sections|Workflow inputs changed/i.test(message)) return text("大纲或章节规划已更新，旧任务不能直接续跑。请按当前规划生成章节正文，历史成果仍保留。", "The outline or chapter plan changed. Generate drafts from the current plan instead of retrying the old task; historical outputs are retained.");
+  if (/Current section drafts are already complete/i.test(message)) return text("章节正文已完成，已刷新当前成果，无需重复生成。如需重写，请使用“重新生成全部章节”。", "The drafts are complete and have been refreshed. Use explicit regeneration only if you want to rewrite them.");
   if (/conclusion deferred/i.test(message)) return text("等待正文完成后生成总结。", "The conclusion will follow the unfinished body sections.");
   if (/source checking is incomplete|source_check_incomplete/i.test(message)) return text("该章部分论断尚未通过原文核对；已保存中间结果，可检查证据后继续生成。", "Some claims in this section have not passed source checking. The intermediate work is saved; review the evidence before resuming.");
   if (/quota|insufficient.credit|额度|余额/i.test(message)) return text("模型服务额度不足，请联系管理员处理后继续。", "Model service credit is insufficient. Contact the administrator before continuing.");

@@ -15,7 +15,7 @@ from review_writer_api.job_service import JobService
 from review_writer_api.routers.jobs import _job_response
 from review_writer_api.security import Principal
 from review_writer_api.workflow_schemas import (
-    DraftApprovalRequest,
+    DraftApprovalRequest, DraftPeerReviewRequest,
     DraftDialogueRequest,
     DraftSectionDialogueRequest,
     DraftParagraphSaveRequest,
@@ -23,6 +23,7 @@ from review_writer_api.workflow_schemas import (
     DraftTextSaveRequest,
     FinalOverviewTextRequest,
     DraftManuscriptFieldsRequest,
+    DraftPublicationRequest,
     DraftOverviewGenerateRequest, DraftOverviewAdoptRequest, DraftSynthesisAdoptRequest,
 )
 
@@ -52,11 +53,9 @@ def build_drafts_router(
     def generate_overview(project_id: str, payload: DraftOverviewGenerateRequest = DraftOverviewGenerateRequest(), idempotency_key: str = Header(default="", alias="Idempotency-Key"),
                           principal: Principal = Depends(principal_dependency)):
         # Keep the existing persisted job name for gateway/queue compatibility; one implementation.
-        return _job_response(job_service.submit(principal, scope="project", project_id=project_id,
-            job_type="final.overview", idempotency_key=idempotency_key.strip() or str(uuid.uuid4()),
-            payload={**final_service.overview_payload(principal, project_id),
-                     "preview_only": True, "generation_instructions": payload.instructions,
-                     "structure_references": [ref.model_dump() for ref in payload.structure_references]}))
+        from review_writer_api.application_operations import generate_overview
+        return _job_response(generate_overview(final_service, job_service, principal, project_id, payload,
+            idempotency_key.strip() or str(uuid.uuid4())))
 
     @router.post("/overview/adopt")
     def adopt_overview(project_id: str, payload: DraftOverviewAdoptRequest,
@@ -68,6 +67,18 @@ def build_drafts_router(
                         principal: Principal = Depends(principal_dependency)):
         return drafts_service.decide_synthesis(principal, project_id, candidate_id, decision="accept",
             expected_base_text_sha256=payload.base_text_sha256, edited_text=payload.text)
+
+    @router.get("/publication")
+    def publication_metadata(project_id: str, principal: Principal = Depends(principal_dependency)):
+        # Publication metadata is authored in Draft and only assembled by Final.
+        return final_service.publication_metadata(principal, project_id)
+
+    @router.put("/publication")
+    def save_publication(project_id: str, payload: DraftPublicationRequest,
+                        principal: Principal = Depends(principal_dependency)):
+        return final_service.save_publication_metadata(principal, project_id,
+            revision=payload.revision, authors=list(payload.authors),
+            affiliations=list(payload.affiliations))
 
     @router.put("/overview-text")
     def caption(project_id: str, payload: FinalOverviewTextRequest,
@@ -145,6 +156,27 @@ def build_drafts_router(
         return drafts_service.decide_dialogue(principal, project_id, candidate_id, decision=decision,
             expected_base_text_sha256=if_match)
 
+    @router.post("/review-jobs", status_code=status.HTTP_202_ACCEPTED)
+    def start_review(project_id: str, payload: DraftPeerReviewRequest,
+                     idempotency_key: str = Header(default="", alias="Idempotency-Key"),
+                     principal: Principal = Depends(principal_dependency)):
+        from review_writer_api.domain_services.draft_review import review_payload
+        from review_writer_api.errors import WorkflowConflict
+        key = idempotency_key.strip() or str(uuid.uuid4())
+        existing = drafts_service.repository.list_project_jobs(principal.user_id, project_id,
+            job_type="draft.optimize", operation_key="peer-review", idempotency_key=key, limit=1)
+        if existing:
+            from review_writer_core.review_revision import POLICY
+            if (existing[0].payload.get('flow_policy') != POLICY
+                    or existing[0].payload.get('guidance', '') != payload.guidance
+                    or existing[0].payload.get('standard', '') != payload.standard
+                    or existing[0].payload.get('source_draft_artifact_id') != payload.expected_draft_artifact_id):
+                raise WorkflowConflict("该请求标识已用于不同审稿范围。")
+            return _job_response(existing[0])
+        prepared = review_payload(drafts_service, principal, project_id, **payload.model_dump())
+        return _job_response(job_service.submit(principal, scope="project", project_id=project_id,
+            job_type="draft.optimize", operation_key="peer-review", idempotency_key=key, payload=prepared))
+
     @router.post("/dialogue-batch", status_code=status.HTTP_202_ACCEPTED)
     def start_dialogue_batch(project_id: str, idempotency_key: str = Header(default="", alias="Idempotency-Key"),
                              principal: Principal = Depends(principal_dependency)):
@@ -161,7 +193,8 @@ def build_drafts_router(
         return _job_response(job_service.submit(principal, scope="project", project_id=project_id,
             job_type="draft.optimize", idempotency_key=key, payload={"project_id": project_id,
                 "revision_mode": "dialogue_batch", "paragraphs": current["paragraphs"],
-                "manuscript_snapshot": manuscript_snapshot(current["paragraphs"], current.get("sections", [])),
+                "manuscript_snapshot": manuscript_snapshot(current["paragraphs"], current.get("sections", []),
+                    records=current.get("content_records"), repetition=current.get("narrative_repetition")),
                 "message": "Analyze and improve this paragraph using the available original-source evidence. Keep the original when no defensible improvement is needed."}))
 
     @router.post("/dialogue-batch/{job_id}/resume", status_code=status.HTTP_202_ACCEPTED)
@@ -200,24 +233,8 @@ def build_drafts_router(
         project_id: str,
         principal: Principal = Depends(principal_dependency),
     ) -> dict:
-        from review_writer_core.workflow.artifacts import DRAFT_MANUSCRIPT
-        had_draft = bool(drafts_service.repository.list_artifacts(principal.user_id, project_id, DRAFT_MANUSCRIPT))
-        result = drafts_service.assemble(principal, project_id)
-        previous_initial = drafts_service.repository.list_project_jobs(principal.user_id, project_id,
-            job_type="draft.optimize", idempotency_key="draft-initial-synthesis", limit=1)
-        if not had_draft and not previous_initial:
-            payload = drafts_service.synthesis_payload(principal, project_id, "initial", initial=True)
-            if payload["roles"]:
-                from review_writer_api.errors import WorkflowError
-                try:
-                    job = job_service.submit(principal, scope="project", project_id=project_id,
-                        job_type="draft.optimize", operation_key="synthesis:initial",
-                        idempotency_key="draft-initial-synthesis", payload=payload)
-                    result["synthesis_job_id"] = job.id
-                except WorkflowError:
-                    # Assembly has committed. Do not misreport or roll back saved prose.
-                    result["synthesis_warning"] = "正文已保存；摘要/结论尚未补齐，请在完整正文中按需生成。"
-        return result
+        from review_writer_api.application_operations import assemble_draft
+        return assemble_draft(drafts_service, job_service, principal, project_id)
 
     @router.post("/synthesis/{role}", status_code=status.HTTP_202_ACCEPTED)
     def start_synthesis(project_id: str, role: str,
@@ -257,15 +274,9 @@ def build_drafts_router(
     @router.put("/manuscript-fields")
     def save_manuscript_fields(project_id: str, payload: DraftManuscriptFieldsRequest,
                                principal: Principal = Depends(principal_dependency)):
-        from review_writer_core.draft_composition import replace_manuscript_fields
-        from review_writer_core.workflow.artifacts import DRAFT_MANUSCRIPT
-        from review_writer_api.errors import WorkflowValidationError
-        if not payload.title.strip():
-            raise WorkflowValidationError("Manuscript title cannot be blank.")
-        text, artifact = drafts_service._read_text(principal, project_id, DRAFT_MANUSCRIPT)
-        return drafts_service.save_text(principal, project_id,
-            text=replace_manuscript_fields(text, payload.title, payload.keywords),
-            revision=payload.revision, expected_draft_artifact_id=artifact.id, operation="manuscript-fields-edit")
+        from review_writer_api.application_operations import save_manuscript_fields
+        return save_manuscript_fields(drafts_service, principal, project_id,
+                title=payload.title, keywords=payload.keywords, revision=payload.revision)
 
     @router.put("/paragraphs/{paragraph_id}")
     def save_paragraph(

@@ -5,10 +5,10 @@ import { PublicHeader } from "../../components/PublicHeader";
 import { useUiText } from "../../i18n/useUiText";
 
 const workflowStages = [
-  ["01–02", "文献准备与检索", "Literature preparation & discovery", "批量上传PDF，经MinerU精确解析和全文索引后，与联网结果、书目信息及项目领域规则共同完成召回和文献分析确认。", "Upload PDFs in batches, parse them precisely with MinerU, build full-text indexes, and combine local evidence, web results, bibliographic data, and project-specific rules before paper selection."],
-  ["03–04", "证据规划与章节写作", "Evidence planning & section writing", "从已确认文献分析生成综述大纲、章节规划与写作任务，使论点、段落和主要论文保持明确绑定。", "Turn the confirmed papers into an outline, section blueprints, and writing tasks that keep claims, paragraphs, and primary papers explicitly linked."],
-  ["05–06", "图像与初稿优化", "Figures & draft optimization", "人工选择源图后进行AI重绘和可编辑SVG修订，在初稿中完善摘要、结论和可选总览图，并按需修改正文。", "Select source figures for AI redraw and editable SVG refinement; complete the abstract, conclusion and optional overview in Draft, and revise the text as needed."],
-  ["07", "审计与交付", "Audit & delivery", "组装已确认的初稿，检查引用、格式与版本，并交付排版后的 Word 和 PDF。", "Assemble the approved draft, check references, formatting and versions, and export Word and PDF."],
+  ["01–02", "准备与筛选文献", "Prepare and select papers", "上传论文到文献库，或联网寻找候选文献。围绕研究主题筛选，确认本次综述采用的论文。", "Upload papers to your library or find candidates online. Screen them against your topic and confirm the papers for this review."],
+  ["03–04", "分析证据与章节写作", "Analyze evidence and draft sections", "整理论文贡献、关键结果与来源证据，选择综述大纲和章节主线，再生成可核对的正文。", "Organize contributions, key results, and source evidence. Choose an outline and section narrative, then generate drafts you can verify."],
+  ["05–06", "配图与初稿修订", "Figures and draft revision", "按需保留原图或重绘；直接编辑完整正文，也可通过章节对话和批量优化修订，完善摘要、结论与可选总览图。", "Keep original figures or redraw them as needed. Edit the manuscript directly, use chapter dialogue or batch revision, and refine the abstract, conclusion, and optional overview."],
+  ["07", "检查与导出终稿", "Review and export", "组装已确认的初稿，补全必要书目信息、检查引用和配图，导出 Word 与 LaTeX 排版 PDF。", "Assemble the approved draft, complete necessary bibliography details, check citations and figures, and export Word or a LaTeX-typeset PDF."],
 ] as const;
 
 export function LandingPage({ authConfig, identity }: { authConfig: AuthConfig; identity: Principal | null }) {
@@ -16,26 +16,36 @@ export function LandingPage({ authConfig, identity }: { authConfig: AuthConfig; 
   const workspaceHref = identity ? "/workspace" : "/login";
 
   return (
-    <div className="public-page">
+    <div className="public-page chemistry-landing">
       <PublicHeader authConfig={authConfig} identity={identity} />
       <main>
         <section className="product-hero">
+          <svg className="hero-chemistry-pattern" viewBox="0 0 1400 760" fill="none" aria-hidden="true" focusable="false">
+            <g stroke="currentColor" strokeWidth="2">
+              <path d="M40 180l52-30 52 30v60l-52 30-52-30zM51 187l41-24M133 187v45M51 233l41 24M144 180l52-30 52 30M248 180l52-30 52 30v60l-52 30-52-30z" />
+              <path d="M1120 560l52-30 52 30v60l-52 30-52-30zM1131 567l41-24M1213 567v45M1131 613l41 24M1224 560l52-30 52 30M1276 530v-60M1284 530v-60" />
+              <path d="M790 80h150m-18-10 18 10-18 10M380 650h120m-18-10 18 10-18 10" />
+              <circle cx="1050" cy="150" r="10" /><circle cx="1090" cy="120" r="7" /><circle cx="1120" cy="165" r="9" />
+              <path d="M1058 144l27-19m10 1 20 31m-55-5 51 11" />
+            </g>
+          </svg>
           <div className="product-hero-copy">
-            <p className="eyebrow">{text("面向科研团队的可追溯综述生产系统", "Traceable review production for research teams")}</p>
-            <h1>{text("从文献证据到可交付终稿，始终保持可追溯。", "From literature evidence to a deliverable review—fully traceable.")}</h1>
-            <p className="lead">{text("Review Writer 把PDF精确解析、混合检索、证据矩阵、章节写作、科研图像处理、质量评估、人工确认和Word/PDF交付组织在同一个持久工作流中。", "Review Writer brings precise PDF parsing, hybrid retrieval, evidence matrices, section writing, scientific figure processing, quality evaluation, human approval, and Word/PDF delivery into one persistent workflow.")}</p>
+            <p className="eyebrow">{text("面向化学研究的综述写作工作台", "A review-writing workspace for chemistry research")}</p>
+            <h1>{text("从化学文献到综述，读得清楚，写得有据。", "From chemistry papers to a clear, evidence-grounded review.")}</h1>
+            <p className="lead">{text("围绕研究问题整理文献证据，规划章节、比较研究与修订正文。Review Writer 将文献筛选、化学配图、初稿讨论和 Word / PDF 导出连成一条清晰的工作流，关键判断始终由你掌握。", "Organize evidence around research questions, plan sections, compare studies, and revise your manuscript. Review Writer connects paper selection, chemistry figures, draft dialogue, and Word / PDF export in one clear workflow—with you in control of the key decisions.")}</p>
+            <p className="product-domain-note">{text("以化学综述为重点，也支持通用学术写作。", "Built with chemistry reviews in mind, with support for general academic writing.")}</p>
             <div className="product-hero-actions">
               <Link className="button button-primary product-cta" to={workspaceHref}>{identity ? text("进入工作台", "Open workspace") : text("登录后开始", "Sign in to start")}</Link>
               <a className="button button-quiet product-cta" href="#workflow">{text("查看完整流程", "Explore the workflow")}</a>
             </div>
             <div className="product-trust-row" aria-label={text("产品特性", "Product qualities")}>
               <span>{text("证据驱动", "Evidence-grounded")}</span>
-              <span>{text("人在回路", "Human-in-the-loop")}</span>
+              <span>{text("可编辑、可讨论", "Editable and conversational")}</span>
               <span>{text("版本可追溯", "Version-traceable")}</span>
             </div>
           </div>
           <div className="product-hero-visual" aria-label={text("综述工作流预览", "Review workflow preview")}>
-            <div className="hero-status-line"><span>{text("当前项目", "Current project")}</span><strong>{text("科研基础设施综述", "Research infrastructure review")}</strong><em>{text("阶段 06", "Stage 06")}</em></div>
+            <div className="hero-status-line"><span>{text("项目示意", "Example project")}</span><strong>{text("不对称催化与合成策略综述", "Asymmetric catalysis and synthetic strategies")}</strong><em>{text("阶段 06", "Stage 06")}</em></div>
             <div className="hero-flow-map">
               <article className="complete"><b>01</b><span>{text("文献库", "Library")}</span><small>{text("30 篇已解析", "30 parsed")}</small></article>
               <article className="complete"><b>03</b><span>{text("大纲", "Outline")}</span><small>{text("11 节已确认", "11 confirmed")}</small></article>
@@ -45,7 +55,7 @@ export function LandingPage({ authConfig, identity }: { authConfig: AuthConfig; 
             <div className="hero-document-preview">
               <div><span /><span /><span /></div>
               <p /><p /><p className="short" />
-              <section><i /><i /><i /></section>
+              <section className="hero-chemistry-scheme" aria-hidden="true"><svg viewBox="0 0 360 100" fill="none" focusable="false"><g stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M35 30l26-15 26 15v30L61 75 35 60zM42 34l19-11m19 11v22M42 56l19 11M87 30l27-15 27 15M218 30l26-15 26 15v30l-26 15-26-15zM225 34l19-11m19 11v22m-38 0 19 11M270 30l27-15 27 15M155 45h48m-10-7 10 7-10 7" /></g></svg></section>
               <p /><p className="short" />
             </div>
           </div>
@@ -54,19 +64,19 @@ export function LandingPage({ authConfig, identity }: { authConfig: AuthConfig; 
         <section className="product-section" id="capabilities">
           <header className="product-section-heading">
             <p className="eyebrow">{text("核心能力", "Core capabilities")}</p>
-            <h2>{text("不只是生成文本，而是管理一套科研生产流程。", "More than text generation: a managed research production system.")}</h2>
+            <h2>{text("让文献、论证与配图，成为一篇完整综述。", "Bring papers, arguments, and figures into one review.")}</h2>
           </header>
           <div className="capability-grid">
-            <article><span>01</span><h3>{text("解析与混合检索", "Parsing and hybrid retrieval")}</h3><p>{text("MinerU结构化内容、本地全文索引、书目信息与联网结果进入统一候选池；领域规则只在项目分类匹配时参与扩展。", "MinerU structure, local full-text indexes, bibliographic data, and web results enter one candidate pool, while domain rules expand queries only for matching project profiles.")}</p></article>
-            <article><span>02</span><h3>{text("确认后生效的阶段依赖", "Confirmation-aware dependencies")}</h3><p>{text("重新检索只产生待确认候选；确认采用文献分析后，系统才根据主题和论文集合的实际变化判断后续产物是否过期。", "A rerun creates pending candidates only; downstream artifacts are evaluated for staleness after you confirm the selected papers and its topic or paper set has actually changed.")}</p></article>
-            <article><span>03</span><h3>{text("证据绑定的写作与图像", "Evidence-bound writing and figures")}</h3><p>{text("章节规划、章节论点和段落绑定主要论文；源图经人工选择后再重绘，并保留完整性审核、SVG与Ketcher编辑。", "Section plans, section claims, and paragraphs stay linked to primary papers; source figures are selected by people before redraw, integrity review, SVG editing, and Ketcher refinement.")}</p></article>
-            <article><span>04</span><h3>{text("质量闭环与双格式交付", "Quality loop and dual-format delivery")}</h3><p>{text("段落评分、安全优化、人工版本确认、引用与格式审计共同约束终稿，并输出排版后的Word和PDF。", "Paragraph scoring, safe optimization, human version approval, and reference and format audits govern the final formatted Word and PDF outputs.")}</p></article>
+            <article><span>01</span><h3>{text("找到相关文献", "Find relevant papers")}</h3><p>{text("批量解析 PDF，结合本地全文与联网检索筛选文献。可用的语义索引按需参与召回，不必重复整理原文。", "Parse PDFs in batches and select papers through local full-text and online discovery. Available semantic indexes can assist retrieval without reorganizing the source papers.")}</p></article>
+            <article><span>02</span><h3>{text("围绕问题组织证据", "Organize evidence around questions")}</h3><p>{text("从论文贡献与关键结果出发，调整综述范围、大纲和章节主线；写作时按需回读来源，便于核对论点与引用。", "Start with contributions and key results, then refine the scope, outline, and section narrative. Revisit source passages during writing to check arguments and citations.")}</p></article>
+            <article><span>03</span><h3>{text("化学配图与结构编辑", "Chemistry figures and structure editing")}</h3><p>{text("保留原图或按需重绘，通过 SVG 与 Ketcher 编辑配图；在初稿中生成、比较并保存总览图版本。", "Keep source figures or redraw them, refine figures with SVG and Ketcher, and generate, compare, and save overview versions in Draft.")}</p></article>
+            <article><span>04</span><h3>{text("边讨论，边完成稿件", "Discuss and refine your manuscript")}</h3><p>{text("直接修改完整正文，用章节对话或批量优化获得建议，再完善摘要、结论和书目，导出 Word / PDF。", "Edit the manuscript directly, use chapter dialogue or batch revision for suggestions, then refine the abstract, conclusion, and bibliography before Word / PDF export.")}</p></article>
           </div>
         </section>
 
         <section className="product-section workflow-showcase" id="workflow">
           <header className="product-section-heading split">
-            <div><p className="eyebrow">{text("七阶段核心工作流", "Seven-stage core workflow")}</p><h2>{text("每一步都有输入、产物与下一步依赖。", "Every step has inputs, artifacts, and explicit downstream dependencies.")}</h2></div>
+            <div><p className="eyebrow">{text("七阶段核心工作流", "Seven-stage core workflow")}</p><h2>{text("从选好论文，到交付完整稿件。", "From selecting papers to delivering your manuscript.")}</h2></div>
             <p>{text("可以在任意阶段暂停、审核或返回修订；系统根据当前产物版本判断后续内容是否仍然有效。", "Pause, review, or revise at any stage while artifact versions determine whether downstream content remains current.")}</p>
           </header>
           <div className="workflow-stage-grid">
@@ -80,21 +90,21 @@ export function LandingPage({ authConfig, identity }: { authConfig: AuthConfig; 
           <div>
             <p className="eyebrow">{text("可信与隔离", "Trust and isolation")}</p>
             <h2>{text("面向真实项目，而不是一次性演示。", "Designed for real projects, not one-off demos.")}</h2>
-            <p>{text("账户、项目、文献权限、任务与用量按用户隔离；文本模型按项目选择，文本、图像和MinerU凭据由服务器统一加密管理，浏览器不会取得API Key。", "Accounts, projects, library permissions, jobs, and usage are isolated per user. Text models are selected per project, while text, image, and MinerU credentials are encrypted and managed centrally without exposing API keys to the browser.")}</p>
+            <p>{text("文献、项目、任务与用量按账号隔离。已有成果保留版本，修改上游内容时提示哪些结果需要更新；服务配置由后台统一管理，你只需选择可用模型，专注研究与写作。", "Papers, projects, tasks, and usage are isolated by account. Artifacts keep their versions, and upstream changes flag results that need updating. Service configuration stays in the administration area; select an available model and focus on research and writing.")}</p>
           </div>
           <ul>
-            <li><strong>{text("持久任务状态", "Persistent job state")}</strong><span>{text("跨页面与刷新保持上传、解析和生成进度", "Uploads, parsing, and generation survive navigation and refreshes")}</span></li>
+            <li><strong>{text("持久任务状态", "Persistent job state")}</strong><span>{text("已提交的后台任务持续执行，返回后可查看进度和成果", "Submitted background tasks continue; return to view progress and results")}</span></li>
             <li><strong>{text("服务端模型网关", "Server-side model gateway")}</strong><span>{text("按项目锁定模型、记录Token和实际结算成本", "Lock models per project and track tokens and settled usage costs")}</span></li>
-            <li><strong>{text("人工门控与审计", "Human gates and audits")}</strong><span>{text("关键论文、图像、重写和最终产物均可检查确认", "Review and approve critical papers, figures, rewrites, and final artifacts")}</span></li>
+            <li><strong>{text("修改由你决定", "You decide what to keep")}</strong><span>{text("比较修改候选、核对引用与配图，再采用满意的版本", "Compare revisions, check citations and figures, and keep the version you prefer")}</span></li>
           </ul>
         </section>
 
         <section className="product-final-cta">
-          <div><p className="eyebrow">Review Writer</p><h2>{text("把综述项目放进一条清晰、连续、可审核的生产线。", "Put your review into a clear, continuous, reviewable production line.")}</h2></div>
+          <div><p className="eyebrow">Review Writer</p><h2>{text("把时间留给化学问题，让综述写作更有条理。", "Spend more time on chemistry, with a clearer writing workflow.")}</h2></div>
           <Link className="button button-primary product-cta" to={workspaceHref}>{identity ? text("继续当前工作", "Continue your work") : text("登录工作台", "Sign in to workspace")}</Link>
         </section>
       </main>
-      <footer className="product-footer"><span>Review Writer</span><p>{text("证据驱动的科学综述工作台", "Evidence-grounded scientific review workspace")}</p></footer>
+      <footer className="product-footer"><span>Review Writer</span><p>{text("证据驱动的化学综述工作台", "Evidence-grounded chemistry review workspace")}</p></footer>
     </div>
   );
 }

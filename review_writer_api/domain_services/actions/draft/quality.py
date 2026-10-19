@@ -160,7 +160,7 @@ class DraftQualityActionsMixin:
         }
 
     def compatibility_payload(
-        self, principal: Principal, project_id: str
+        self, principal: Principal, project_id: str, *, include_figure_files: bool = True
     ) -> dict[str, Any]:
         project = self.repository.get_owned_project(principal.user_id, project_id)
         matrix, matrix_artifact = self._read_json(
@@ -200,7 +200,7 @@ class DraftQualityActionsMixin:
                 sections = {**sections, "sections": [s for s in sections.get("sections") or []
                                                      if s.get("section_id") not in deferred]}
         artifact_paths: dict[str, str] = {}
-        for row in figures.get("figures") or []:
+        for row in ((figures.get("figures") or []) if include_figure_files else []):
             if not isinstance(row, dict):
                 continue
             artifact_id = str(row.get("output_artifact_id") or "")

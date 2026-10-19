@@ -1,0 +1,11 @@
+import {cleanup,render,screen} from '@testing-library/react';
+import {afterEach,beforeEach,expect,it} from 'vitest';
+import {usePreferences} from '../../state/preferences';
+import {PeerReviewProgress} from './PeerReviewProgress';
+import {REVIEW_REVISION_POLICY as policy} from './peerReviewTypes';
+beforeEach(()=>usePreferences.getState().setLanguage('en'));afterEach(cleanup);
+it('starts with four pending steps without triggering work',()=>{render(<PeerReviewProgress/>);expect(screen.getAllByRole('listitem')).toHaveLength(4);expect(screen.getAllByText('Pending')).toHaveLength(4);});
+it('does not call a failed verification complete',()=>{render(<PeerReviewProgress job={{id:'j',status:'failed',progress_current:1,progress_total:2,result:{policy,phase:'audit'}}}/>);expect(screen.getByText('Paused')).toBeInTheDocument();expect(screen.getAllByText('Complete')).toHaveLength(2);});
+it('shows delivery finished separately from saved outcome',()=>{render(<PeerReviewProgress job={{id:'j',status:'succeeded',progress_current:1,progress_total:1,result:{policy,phase:'completed',publication:{changed:false}}}}/>);expect(screen.getAllByText('Complete')).toHaveLength(4);expect(screen.queryByText('Saved')).not.toBeInTheDocument();});
+it('shows processed units without labelling a failed unit reviewed',()=>{render(<PeerReviewProgress job={{id:'j',status:'running',progress_current:0,progress_total:0,result:{policy,phase:'plan',progress:{groups_completed:0,groups_total:0,verified_groups:0,planning_processed:2,planning_completed:1,planning_failed:1,planning_total:4}}}}/>);expect(screen.getByRole('status')).toHaveTextContent('Processed 2/4 units; 1 incomplete');expect(screen.getByRole('status')).toHaveTextContent('up to 2 units in parallel');});
+it('does not turn an unresolved revision into an all-green delivery',()=>{render(<PeerReviewProgress job={{id:'j',status:'succeeded',progress_current:1,progress_total:1,result:{policy,phase:'completed',outcome:'limited',publication:{changed:false}}}}/>);expect(screen.getAllByText('Partial')).toHaveLength(2);});

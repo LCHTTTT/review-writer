@@ -7,21 +7,32 @@ from collections.abc import Callable
 from typing import Any
 
 from fastapi import APIRouter, Depends, Header, Query, status
+from pydantic import BaseModel, Field
 
 from review_writer_api.domain_services.discovery import DiscoveryService
 from review_writer_api.domain_services.planning import PlanningService
-from review_writer_api.errors import WorkflowConflict
+from review_writer_api.errors import WorkflowConflict, WorkflowValidationError
 from review_writer_api.job_service import JobService
 from review_writer_api.planning_jobs import queue_matrix_enrichment
 from review_writer_api.routers.jobs import _job_response
 from review_writer_api.security import Principal
 from review_writer_api.workflow_schemas import (
     DiscoveryConfirmRequest,
+    DiscoveryDownloadRequest,
+    DiscoveryFulltextCheckRequest,
     DiscoveryReviewSaveRequest,
     DiscoverySearchRequest,
-    DiscoverySelectionRequest,
-    DiscoveryTopSelectionRequest,
 )
+
+
+# One request covers a page of candidates; the probe pool bounds concurrency.
+MAX_FULLTEXT_CHECK_CANDIDATES = 50
+
+
+class ProjectPaperSelectionRequest(BaseModel):
+    revision: int = Field(ge=0)
+    add_ids: list[str] = Field(default_factory=list, max_length=200)
+    remove_ids: list[str] = Field(default_factory=list, max_length=200)
 
 
 def build_discovery_router(
@@ -31,6 +42,19 @@ def build_discovery_router(
     planning_service: PlanningService | None = None,
 ) -> APIRouter:
     router = APIRouter(prefix="/api/v1/projects/{project_id}/discovery", tags=["discovery"])
+    @router.get("/papers")
+    def project_papers(project_id: str, query: str = Query(default="", max_length=200),
+                       offset: int = Query(default=0, ge=0), limit: int = Query(default=50, ge=1, le=100),
+                       principal: Principal = Depends(principal_dependency)):
+        from review_writer_api.domain_services.project_papers import library_choices
+        return library_choices(discovery_service, principal, project_id, query=query, offset=offset, limit=limit)
+
+    @router.patch("/papers")
+    def save_project_papers(project_id: str, payload: ProjectPaperSelectionRequest,
+                           principal: Principal = Depends(principal_dependency)):
+        from review_writer_api.domain_services.project_papers import patch_selection
+        return patch_selection(discovery_service, principal, project_id, **payload.model_dump())
+
     @router.post("/jobs", status_code=status.HTTP_202_ACCEPTED)
     def run_discovery(
         project_id: str,
@@ -108,13 +132,36 @@ def build_discovery_router(
     ) -> dict[str, Any]:
         return discovery_service.get(principal, project_id)
 
-    @router.get("/fulltext-check")
+    @router.post("/fulltext-check")
     def check_fulltext(
         project_id: str,
-        candidate_id: str = Query(min_length=1, max_length=2048),
+        payload: DiscoveryFulltextCheckRequest,
         principal: Principal = Depends(principal_dependency),
     ) -> dict[str, Any]:
-        return discovery_service.check_fulltext(principal, project_id, candidate_id)
+        """Probe open-PDF availability for the listed candidates.
+
+        This is a POST because it may perform bounded outbound network work; a
+        GET must stay a pure read. One request covers a page of candidates.
+        """
+        candidate_ids = [
+            item.strip() for item in payload.candidate_ids
+            if item.strip()
+        ][:MAX_FULLTEXT_CHECK_CANDIDATES]
+        if not candidate_ids:
+            raise WorkflowValidationError("At least one candidate is required.")
+        return {"checks": discovery_service.check_fulltext_many(principal, project_id, candidate_ids)}
+
+    @router.post("/download-jobs", status_code=status.HTTP_202_ACCEPTED)
+    def download_discovery_candidate(
+        project_id: str,
+        payload: DiscoveryDownloadRequest,
+        idempotency_key: str = Header(default="", alias="Idempotency-Key"),
+        principal: Principal = Depends(principal_dependency),
+    ):
+        from review_writer_api.application_operations import acquire_discovery_candidate
+        job = acquire_discovery_candidate(discovery_service, job_service, principal, project_id,
+            payload.candidate_id, payload.revision, idempotency_key.strip() or str(uuid.uuid4()))
+        return _job_response(job)
 
     @router.put("")
     def save_discovery(
@@ -130,31 +177,7 @@ def build_discovery_router(
             coverage_decision=payload.coverage_decision,
         )
 
-    @router.put("/selection/{paper_id}")
-    def select_paper(
-        project_id: str,
-        paper_id: str,
-        payload: DiscoverySelectionRequest,
-        principal: Principal = Depends(principal_dependency),
-    ) -> dict[str, Any]:
-        return discovery_service.select_one(
-            principal, project_id, paper_id, payload.selected
-        )
-
-    @router.post("/selection/top")
-    def select_top(
-        project_id: str,
-        payload: DiscoveryTopSelectionRequest,
-        principal: Principal = Depends(principal_dependency),
-    ) -> dict[str, Any]:
-        return discovery_service.select_top(principal, project_id, payload.count)
-
-    @router.delete("/selection")
-    def clear_selection(
-        project_id: str,
-        principal: Principal = Depends(principal_dependency),
-    ) -> dict[str, Any]:
-        return discovery_service.clear(principal, project_id)
+    # Both modes edit the same versioned Discovery review; confirmation is separate.
 
     @router.post("/confirm")
     def confirm(
@@ -162,12 +185,8 @@ def build_discovery_router(
         payload: DiscoveryConfirmRequest,
         principal: Principal = Depends(principal_dependency),
     ) -> dict[str, Any]:
-        result = discovery_service.confirm(
-            principal, project_id, payload.revision
-        )
-        if planning_service is not None:
-            job = queue_matrix_enrichment(planning_service, job_service, principal, project_id)
-            result["matrix_analysis_job"] = _job_response(job).model_dump()
-        return result
+        from review_writer_api.application_operations import confirm_discovery
+        return confirm_discovery(discovery_service, planning_service, job_service,
+                                 principal, project_id, payload.revision)
 
     return router

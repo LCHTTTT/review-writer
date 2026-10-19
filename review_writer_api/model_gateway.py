@@ -38,12 +38,34 @@ from .model_catalog import ModelTier, resolve_model_tier, SNAPSHOT_KEY, model_di
 from .text_routing import TextChannelPool
 from .model_concurrency import AdjustableLimiter, defaults as concurrency_defaults, load as load_concurrency
 from .job_lifecycle import active_job_project
-from .job_queues import DELEGATED_TEXT_PARENT_JOB_TYPES
+from .job_queues import DELEGATED_TEXT_PARENT_JOB_TYPES, delegated_text_parent
 from .server_providers import ServerProviderRuntime, ServerProviderSettingsService
 from .workflow_models import WorkflowJob
 
 
 from review_writer_core.provider_errors import normalize_provider_error
+
+
+def text_provider_request(*, tier, runtime, prompt, response_format="json", idempotency_key,
+                          stage="", confirmed_no_thinking_models=()):
+    """Build the hosted wire request once, also usable by isolated diagnostics.
+
+    Do not opt providers into JSON mode or reasoning/output limits implicitly.
+    Keep request construction separate from retries, metering and transport.
+    """
+    wire = tier.wire_api or runtime.wire_api
+    if wire in {"chat", "chat-completion", "chat-completions"}:
+        endpoint = f"{runtime.base_url}/chat/completions"
+        payload = {"model": tier.model, "messages": [{"role": "user", "content":
+            prompt + "\nReturn only one valid JSON object." if response_format == "json" else prompt}]}
+    else:
+        endpoint = f"{runtime.base_url}/responses"
+        payload = {"model": tier.model, "input": [{"role": "user", "content": prompt}]}
+    from review_writer_core.verification_policy import verification_options
+    payload.update(verification_options(tier.model, wire, stage, confirmed_no_thinking_models))
+    headers = {"Authorization": f"Bearer {runtime.api_key}", "Content-Type": "application/json",
+               "Accept": "application/json", "Idempotency-Key": idempotency_key}
+    return endpoint, payload, headers, wire
 
 
 class ModelGatewayError(RuntimeError):
@@ -105,11 +127,12 @@ class TaskClaims:
 TEXT_GATEWAY_JOB_TYPES = frozenset(
     {
         "model.dispatch",
+        "conversation.turn",
+        "conversation.prepare",
         "discovery.search",
         "library.bibliography-audit",
         "matrix.enrich",
         "sections.generate",
-        "planning.reference-analyze",
         "planning.blueprint",
         "planning.topic-outline",
         "draft.evaluate",
@@ -642,6 +665,14 @@ class ModelGatewayService:
                 if row.status == "succeeded" else None,
             }
 
+    def _validate_review_delegation(self, claims):
+        if claims.job_type!='draft.optimize':
+            return
+        with database_session(self.session_factory) as session:
+            job=session.get(WorkflowJob,uuid.UUID(claims.job_id))
+            if job is None or not delegated_text_parent(job.job_type,job.payload_json or {}):
+                raise GatewayRequestConflict('Only current review-style revision supports delegated Draft calls.')
+
     def delegate_text(
         self, token: str, *, request_key: str, stage: str,
         prompt: str, response_format: str,
@@ -658,6 +689,7 @@ class ModelGatewayService:
         self._validate_live_job(claims)
         if claims.job_type not in DELEGATED_TEXT_PARENT_JOB_TYPES or not claims.project_id:
             raise GatewayRequestConflict("This task does not support delegated text calls.")
+        self._validate_review_delegation(claims)
         key = str(request_key or "").strip()
         normalized_stage = str(stage or "").strip()[:96]
         normalized_format = str(response_format or "").strip().casefold()
@@ -690,7 +722,8 @@ class ModelGatewayService:
             "model_job_id": str(child.id),
             "status": child.status,
             "output_text": str(result.get("output_text") or "") if child.status == "succeeded" else "",
-            "error": "模型执行失败，请在任务详情中查看。" if child.status in {"failed", "interrupted", "cancelled"} else "",
+            "error": (str(getattr(child, "error_message", "") or "模型任务未完成，系统没有自动重发请求。")
+                      if child.status in {"failed", "interrupted", "cancelled"} else ""),
         }
 
     def delegated_text_status(self, token: str, *, request_key: str) -> dict[str, Any]:
@@ -700,6 +733,7 @@ class ModelGatewayService:
         self._validate_live_job(claims)
         if claims.job_type not in DELEGATED_TEXT_PARENT_JOB_TYPES or not claims.project_id:
             raise GatewayRequestConflict("This task does not support delegated text calls.")
+        self._validate_review_delegation(claims)
         key = str(request_key or "").strip()
         if not key or len(key) > 128:
             raise GatewayRequestConflict("A valid model request key is required.")
@@ -799,7 +833,7 @@ class ModelGatewayService:
                 budget_job = session.get(WorkflowJob, parent_id)
                 if (budget_job is None or budget_job.user_id != job.user_id
                         or budget_job.project_id != job.project_id
-                        or budget_job.job_type not in DELEGATED_TEXT_PARENT_JOB_TYPES
+                        or not delegated_text_parent(budget_job.job_type,budget_job.payload_json or {})
                         or budget_job.status not in {"queued", "running"}
                         or budget_job.cancellation_requested):
                     raise GatewayRequestConflict("The parent writing task is no longer eligible for model calls.")
@@ -851,31 +885,10 @@ class ModelGatewayService:
         runtime = self._text_runtime(tier)
         if not runtime.enabled:
             raise GatewayConfigurationError("The server text provider is not configured.")
-        wire = tier.wire_api or runtime.wire_api
-        if wire in {"chat", "chat-completion", "chat-completions"}:
-            endpoint = f"{runtime.base_url}/chat/completions"
-            payload = {
-                "model": tier.model,
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": (
-                            prompt + "\nReturn only one valid JSON object."
-                            if response_format == "json"
-                            else prompt
-                        ),
-                    }
-                ],
-            }
-        else:
-            endpoint = f"{runtime.base_url}/responses"
-            payload = {"model": tier.model, "input": [{"role": "user", "content": prompt}]}
-        headers = {
-            "Authorization": f"Bearer {runtime.api_key}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "Idempotency-Key": idempotency_key,
-        }
+        endpoint, payload, headers, wire = text_provider_request(
+            tier=tier, runtime=runtime, prompt=prompt,
+            response_format=response_format, idempotency_key=idempotency_key, stage=stage,
+            confirmed_no_thinking_models=getattr(getattr(self, "settings", None), "text_verification_no_thinking_models", ()))
         stream_deadline = asyncio.get_running_loop().time() + (300 if stage == "overview-visual-brief" else 900)
         attempt_limit = 1 if stage == "overview-visual-brief" else 3
         for attempt in range(1, attempt_limit + 1):
@@ -931,19 +944,24 @@ class ModelGatewayService:
         body = {**payload, "stream": True}
         if chat:
             body["stream_options"] = {"include_usage": True}
-        text, usage, provider_id, finished = "", {}, "", False
+        text, usage, provider_id, finished, finish_reason = "", {}, "", False, ""
         last_update = last_check = 0.0
         published_length = 0
         started = asyncio.get_running_loop().time()
         diagnostics = {"transport": "sse", "chunks": 0, "first_chunk_ms": None, "last_chunk_ms": None,
                        "events": 0, "reasoning_events": 0, "heartbeats": 0,
                        "first_event_ms": None, "last_event_ms": None, "first_reasoning_ms": None}
+        from .stream_diagnostics import observe_event, request_options
+        diagnostics["wire_diagnostics_version"] = 1
+        diagnostics["request_options"] = request_options(body)
         def publish():
             with database_session(self.session_factory) as session:
                 row = session.get(AIModelRequest, uuid.UUID(request_id))
                 if row is not None and row.status == "running":
+                    row.provider_request_id = provider_id or row.provider_request_id
                     row.response_json = {**(row.response_json or {}), "partial_reply": partial_reply(text),
-                                         "stream_diagnostics": dict(diagnostics)}
+                                         "stream_diagnostics": dict(diagnostics),
+                                         "provider_request_id": provider_id, "provider_usage": dict(usage)}
         await asyncio.to_thread(publish)  # Reset an interrupted attempt without blocking the event loop.
         async with self._provider_client.stream("POST", endpoint, json=body, headers={**headers, "Accept": "text/event-stream"}) as response:
             if response.status_code >= 400:
@@ -986,6 +1004,7 @@ class ModelGatewayService:
                     continue
                 data = line[5:].strip()
                 if data == "[DONE]":
+                    diagnostics["done_received"] = True
                     finished = True
                     break
                 if not data:
@@ -996,6 +1015,7 @@ class ModelGatewayService:
                     raise GatewayProviderError("Model stream returned invalid JSON.") from exc
                 if not isinstance(event, dict):
                     raise GatewayProviderError("Model stream returned an invalid event.")
+                observe_event(diagnostics, event)
                 if event.get("error") or event.get("type") in {"error", "response.failed", "response.incomplete"}:
                     failure = event.get("error") or (event.get("response") or {}).get("error")
                     raise GatewayProviderError("Model stream failed before completion.",
@@ -1007,6 +1027,8 @@ class ModelGatewayService:
                     usage = event.get("usage") or usage
                     for choice in event.get("choices") or []:
                         if choice.get("index", 0) == 0:
+                            finish_reason = str(choice.get("finish_reason") or finish_reason)
+                            diagnostics["finish_reason"] = finish_reason
                             reasoning = reasoning or bool((choice.get("delta") or {}).get("reasoning_content") or (choice.get("delta") or {}).get("reasoning"))
                             delta = (choice.get("delta") or {}).get("content")
                             if isinstance(delta, str):
@@ -1033,8 +1055,15 @@ class ModelGatewayService:
                     last_update = asyncio.get_running_loop().time()
         if not finished or not chat:
             raise GatewayProviderError("Model stream ended before completion.")
+        if finish_reason in {"length", "max_tokens"}:
+            raise GatewayProviderError(
+                "Model provider stopped at its output limit before completing the answer.",
+                provider_error={"category": "output_limit", "code": "PROVIDER_OUTPUT_LIMIT",
+                                "provider_status": None, "retryable": False},
+            )
         await asyncio.to_thread(publish)
-        return {"id": provider_id, "choices": [{"message": {"content": text}}], "usage": usage}
+        return {"id": provider_id, "choices": [{"message": {"content": text}}], "usage": usage,
+                "_gateway_stream_diagnostics": dict(diagnostics)}
 
     async def _provider_embedding_call(
         self,
@@ -1261,7 +1290,7 @@ class ModelGatewayService:
                     request_id=request_id,
                     claims=claims,
                     stream=True,
-                    **({"stage": normalized_stage} if normalized_stage == "overview-visual-brief" else {}),
+                    stage=normalized_stage,
                 )
             usage = self._usage(provider_data)
             cost = calculate_provider_cost(tier, **{
@@ -1284,8 +1313,16 @@ class ModelGatewayService:
                 "cached": False,
                 **dict(provider_data.get("_gateway_metering") or {}),
             }
-            if not response["output_text"]:
-                raise GatewayProviderError("Model provider returned an empty response.")
+            if not response["output_text"].strip():
+                diagnostics = provider_data.get("_gateway_stream_diagnostics") or {}
+                reasoning_only = bool(diagnostics.get("reasoning_events")) and not diagnostics.get("chunks")
+                category = "reasoning_only" if reasoning_only else "empty_response"
+                raise GatewayProviderError("Model provider returned an empty response.", provider_error={
+                    "category": category, "code": "PROVIDER_" + category.upper(), "provider_status": None,
+                    "retryable": False, "message": "Model provider returned an empty response.",
+                    "reasoning_only": reasoning_only,
+                    "finish_reason": diagnostics.get("finish_reason", ""),
+                })
             self._finish_request(request_id, response_payload=response)
             provider_completed = True
             if self.billing_service is not None and reservation_id is not None:

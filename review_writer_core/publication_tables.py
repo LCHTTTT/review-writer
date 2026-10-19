@@ -23,9 +23,6 @@ _COLUMNS = (
 
 _MAX_TABLE_ROWS = 8
 _MAX_ROWS_PER_PAPER = 1
-_MAX_VALUES_PER_CELL = 2
-_MAX_CELL_UNITS = 120
-_MAX_LABEL_UNITS = 56
 
 _GENERATED_TABLE_BLOCK = re.compile(
     r"^Table (?P<number>\d+)\.[^\n]*\n\n"
@@ -146,29 +143,6 @@ _CONDITION_PREFIXES = (
     ),
 )
 
-_RESULT_VERB = re.compile(
-    r"\b(?:gave|giving|afforded|affording|yielded|yielding|produced|producing|"
-    r"furnish|furnished|furnishing|achieved|reached|increased|decreased)\b",
-    re.I,
-)
-_RESULT_METRIC = re.compile(
-    r"%|\b(?:yield|yields|conversion|selectivity|ee|de|dr|er|accuracy|precision|recall|auc)\b",
-    re.I,
-)
-
-_FIELD_PREFERENCES = {
-    "object_input": ("substrate", "input", "aldehyde", "ketone", "alkyne", "sample", "dataset"),
-    "method_conditions": ("catalyst", "condition", "temperature", "solvent", "time", "equiv", "mol%"),
-    "intervention_role": ("role", "catal", "promot", "mediate", "ligand"),
-    "quantitative_results": ("yield", "conversion", "selectivity", " ee", " de", " dr", "accuracy", "%"),
-    "specialized_metrics": ("yield", "conversion", "selectivity", " ee", " de", " dr", "metric", "%"),
-    "mechanism": ("mechan", "intermediate", "pathway", "transition", "transfer", "proposed"),
-    "validation_evidence": ("control", "kie", "dft", "nmr", "evidence", "experiment"),
-    "scope": ("scope", "toler", "substrate", "applicable", "functional group"),
-    "limitations": ("limit", "failed", "trace", "low", "not", "require"),
-    "scale_reproducibility": ("scale", "gram", "reproduc", "repeat"),
-    "safety_cost_sustainability": ("safety", "toxic", "cost", "waste", "sustain"),
-}
 
 _QUALIFIER_FIELD_TERMS = {
     "object_input": ("substrate", "input", "reagent", "reactant", "product", "object"),
@@ -203,8 +177,6 @@ def _cell_text(value: Any) -> str:
     return text.replace("<", "‹").replace(">", "›").replace("|", r"\|").replace("`", "′").replace("*", "∗")
 
 
-def _display_units(value: Any) -> int:
-    return sum(2 if ord(character) > 0xFF else 1 for character in str(value or ""))
 
 
 def _strip_boilerplate(value: Any) -> str:
@@ -220,109 +192,15 @@ def _strip_boilerplate(value: Any) -> str:
     return text
 
 
-def _bounded_words(value: str, limit: int) -> str:
-    if _display_units(value) <= limit:
-        return value.strip(" .;,：:")
-    tokens = re.findall(r"\$[^$\n]*\$|\\\(.+?\\\)|\S+", value)
-    kept: list[str] = []
-    used = 0
-    for token in tokens:
-        extra = _display_units(token) + (1 if kept else 0)
-        if kept and used + extra > limit:
-            break
-        kept.append(token)
-        used += extra
-    result = " ".join(kept).strip(" .;,：:")
-    if len(kept) < len(tokens):
-        while kept and _display_units(result) + 1 > limit:
-            kept.pop()
-            result = " ".join(kept).strip(" .;,：:")
-        result += "…"
-    return result
-
-
-def _bounded_tail(value: str, limit: int) -> str:
-    """Keep a complete metric-bearing tail instead of a dangling sentence prefix."""
-
-    tokens = re.findall(r"\$[^$\n]*\$|\\\(.+?\\\)|\S+", value)
-    kept: list[str] = []
-    used = 0
-    for token in reversed(tokens):
-        extra = _display_units(token) + (1 if kept else 0)
-        if kept and used + extra > limit:
-            break
-        kept.append(token)
-        used += extra
-    return " ".join(reversed(kept)).strip(" .;,：:")
-
-
-def _compact_phrase(value: Any, *, field_id: str = "", limit: int = _MAX_CELL_UNITS) -> str:
-    """Project source text into a short exact phrase without inventing content."""
-
+def _compact_phrase(value: Any, *, field_id: str = "") -> str:
+    """Remove only introductory boilerplate; preserve every scientific clause."""
     text = _strip_boilerplate(value)
     if field_id in {"method_conditions", "intervention_role"}:
         for pattern in _CONDITION_PREFIXES:
             focused = pattern.sub("", text).strip(" .;,：:")
             if focused != text:
-                text = focused
-                break
-    elif field_id in {"quantitative_results", "specialized_metrics"}:
-        result_clauses = [
-            clause.strip(" .;,：:")
-            for clause in re.split(
-                r"\s*[;；]\s*|,\s+(?=(?:and\s+)?[^,]{1,45}\b"
-                r"(?:gave|afforded|yielded|produced|furnished)\b)",
-                text,
-                flags=re.I,
-            )
-            if clause.strip(" .;,：:")
-        ]
-        metric_clauses = [clause for clause in result_clauses if _RESULT_METRIC.search(clause)]
-        if len(metric_clauses) >= 2:
-            text = "; ".join(metric_clauses[:2])
-        result_match = _RESULT_VERB.search(text)
-        # Long fact-card prose often states the procedure before its result.
-        # Keep the exact result clause, while the method remains available in
-        # its own comparison column and in the full evidence package.
-        if result_match and result_match.start() > 28:
-            text = text[result_match.start():].strip(" .;,：:")
-        if _display_units(text) > limit and _RESULT_METRIC.search(text):
-            text = _bounded_tail(text, limit)
-    if not text or _display_units(text) <= limit:
-        return text
-    fragments = [
-        fragment.strip(" .;,：:")
-        for fragment in re.split(r"(?<=[.!?。！？])\s+|\s*[;；]\s*", text)
-        if fragment.strip(" .;,：:")
-    ]
-    if len(fragments) == 1:
-        fragments = [
-            fragment.strip(" ,，")
-            for fragment in re.split(r"\s*[,，]\s*", text)
-            if fragment.strip(" ,，")
-        ]
-    preferences = _FIELD_PREFERENCES.get(field_id, ())
-    ranked = sorted(
-        enumerate(fragments),
-        key=lambda pair: (
-            -sum(term in (" " + pair[1].casefold()) for term in preferences),
-            pair[0],
-        ),
-    )
-    selected: list[tuple[int, str]] = []
-    used = 0
-    for index, fragment in ranked:
-        bounded = _bounded_words(fragment, limit)
-        extra = _display_units(bounded) + (2 if selected else 0)
-        if not bounded or (selected and used + extra > limit):
-            continue
-        selected.append((index, bounded))
-        used += extra
-        if len(selected) == 2:
-            break
-    if not selected:
-        return _bounded_words(text, limit)
-    return "; ".join(value for _index, value in sorted(selected)).strip(" .;,：:")
+                return focused
+    return text
 
 
 def _qualifier_items(value: Any, prefix: str = "") -> list[tuple[str, str]]:
@@ -370,42 +248,19 @@ def _qualifier_matches_field(field_id: str, key: str) -> bool:
     )
 
 
-def _compact_qualifiers(
-    value: Any, *, field_id: str, limit: int = _MAX_CELL_UNITS
-) -> tuple[str, list[str]]:
-    items = [
-        (key, item)
-        for key, item in _qualifier_items(value)
-        if not _REFERENCE_ONLY_QUALIFIER.search(key)
-        and _qualifier_matches_field(field_id, key)
-    ]
-    rendered: list[str] = []
-    keys: list[str] = []
-    used = 0
-    for key, item in items:
-        phrase = _bounded_words(_render_qualifier(key, item), limit)
-        extra = _display_units(phrase) + (2 if rendered else 0)
-        if rendered and used + extra > limit:
-            continue
-        rendered.append(phrase)
-        keys.append(key)
-        used += extra
-    return "; ".join(rendered), keys
+def _compact_qualifiers(value: Any, *, field_id: str) -> str:
+    items = [(key, item) for key, item in _qualifier_items(value)
+             if not _REFERENCE_ONLY_QUALIFIER.search(key)
+             and _qualifier_matches_field(field_id, key)]
+    return "; ".join(dict.fromkeys(_render_qualifier(key, item) for key, item in items))
 
 
 def _compact_cell(cell: dict[str, Any]) -> str:
     field_id = str(cell.get("field_id") or "")
     value = _compact_phrase(cell.get("value"), field_id=field_id)
-    qualifiers, qualifier_keys = _compact_qualifiers(
-        cell.get("qualifiers"), field_id=field_id
-    )
-    if qualifiers and (
-        len(qualifier_keys) >= 2 or _display_units(value) > _MAX_CELL_UNITS // 2
-    ):
-        value = qualifiers
-    elif qualifiers and qualifiers.casefold() not in value.casefold():
-        combined = f"{value}; {qualifiers}" if value else qualifiers
-        value = _compact_phrase(combined, field_id=field_id)
+    qualifiers = _compact_qualifiers(cell.get("qualifiers"), field_id=field_id)
+    if qualifiers and qualifiers.casefold() not in value.casefold():
+        value = f"{value}; {qualifiers}" if value else qualifiers
     status = str(cell.get("epistemic_status") or "").casefold()
     ceiling = str(cell.get("assertion_ceiling") or "").casefold()
     if ceiling == "attributed_author_interpretation" or any(
@@ -414,11 +269,7 @@ def _compact_cell(cell: dict[str, Any]) -> str:
         value = f"Author interpretation: {value}"
     elif field_id == "mechanism":
         value = f"Reported mechanism: {value}"
-    elif field_id in {"quantitative_results", "specialized_metrics"} and re.match(
-        r"^(?:afford|furnish|give|produce|yield)\b", value, re.I
-    ):
-        value = f"Reported to {value}"
-    return _bounded_words(value, _MAX_CELL_UNITS)
+    return value
 
 
 def _selected_fact_ids(section: dict[str, Any]) -> set[str]:
@@ -517,14 +368,22 @@ def _result_with_units(result, units):
         return result if units.casefold() in result.casefold() else f"{result}; {units}"
     tokens = re.findall(r"%|[A-Za-z°µμ]+", units)
     present = set(re.findall(r"%|[a-z°µμ]+", result.casefold()))
+    # A legacy units field must not relabel a typed outcome (e.g. ee/de as
+    # yield). Preserve the already stated metric; never infer a conversion.
+    metrics = {"yield", "conversion", "ee", "de", "dr", "er", "accuracy", "precision", "recall", "auc"}
+    if present & metrics and set(token.casefold() for token in tokens) & metrics:
+        return result
     missing = [token for token in tokens if token.casefold() not in present]
     return " ".join([result, *missing])
 
 
 def _standalone_conditions(value):
     text = str(value or "").strip()
+    if re.fullmatch(r"(?:(?:under|using)\s+)?(?:the\s+)?(?:optimized|standard|same)\s+(?:reaction\s+)?conditions?\.?", text, re.I):
+        return ""
     # Source-local pointers are provenance, not readable experimental conditions.
-    text = re.sub(r"\b(?:entry|table|scheme|figure)\s+[A-Za-z]?\d+[A-Za-z]?\b", "", text, flags=re.I)
+    text = re.sub(r"\b(?:entries|entry|tables?|schemes?|figures?)\s+[A-Za-z]?\d+[A-Za-z]?"
+                  r"(?:\s*(?:,|and|or|[-–])\s*[A-Za-z]?\d+[A-Za-z]?)*\b", "", text, flags=re.I)
     text = re.sub(r"\bconditions?\s+[A-Z]\b", "", text)
     text = re.sub(r"\b(?:(?:under|using)\s+)?(?:the\s+)?same conditions?\b", "", text, flags=re.I)
     text = re.sub(r"^\s*(?:reaction in|in|under)\s*", "", text, flags=re.I)
@@ -702,12 +561,6 @@ def render_section_comparison(
                 value = _compact_cell(cell)
                 if not value or value.casefold() in {item.casefold() for item in values}:
                     continue
-                combined = "; ".join([*values, value])
-                if values and (
-                    len(values) >= _MAX_VALUES_PER_CELL
-                    or _display_units(combined) > _MAX_CELL_UNITS
-                ):
-                    continue
                 values.append(value)
                 displayed_fact_ids.update(str(item) for item in cell.get("fact_ids") or [])
                 provenance.append({
@@ -726,7 +579,7 @@ def render_section_comparison(
     if any(label == "Key result" for label, _ in columns):
         caption += " Results are source-specific, not a performance ranking."
     if any("—" in line for line in lines[2:]):
-        caption += " — = not specified in the selected evidence."
+        caption += " — = unavailable in the extracted records; this does not establish absence from the original paper."
     all_fact_ids = {
         str(item) for cell in cells for item in cell.get("fact_ids") or [] if str(item)
     }
@@ -734,7 +587,7 @@ def render_section_comparison(
         {
             "section_id": section.get("section_id"),
             "cells": provenance,
-            "projection": "publication-comparison/4",
+            "projection": "publication-comparison/5",
             "comparison_question": question,
             "comparison_dimensions": dimensions,
             "evidence_mode": "source_claims" if source_mode else "legacy_facts",

@@ -37,6 +37,7 @@ export function findResumableSectionJob(
   return [...jobs]
     .sort((left, right) => jobTimestamp(right) - jobTimestamp(left))
     .find((job) => {
+      if (job.retry_inputs_current === false) return false;
       const retryable = (job.available_actions || []).includes("retry")
         || ["failed", "cancelled", "interrupted"].includes(job.status);
       if (!retryable) return false;

@@ -48,34 +48,70 @@ export function readableInlineMath(raw: string) {
     .trim();
 }
 
+/** Read balanced labels/destinations; chemistry names frequently contain []. */
+function markdownLinkAt(source: string, start: number) {
+  const image = source[start] === "!";
+  const labelStart = start + (image ? 2 : 1);
+  const close = (from: number, open: string, end: string) => {
+    let depth = 1;
+    for (let index = from; index < source.length; index += 1) {
+      if (source[index] === "\\") { index += 1; continue; }
+      if (source[index] === "\n") return -1;
+      if (source[index] === open) depth += 1;
+      if (source[index] === end && --depth === 0) return index;
+    }
+    return -1;
+  };
+  const labelEnd = close(labelStart, "[", "]");
+  if (labelEnd < 0 || source[labelEnd + 1] !== "(") return null;
+  const urlEnd = close(labelEnd + 2, "(", ")");
+  if (urlEnd < 0) return null;
+  const unescape = (value: string) => value.replace(/\\([\[\]()\\])/g, "$1");
+  return { image, label: unescape(source.slice(labelStart, labelEnd)),
+    url: unescape(source.slice(labelEnd + 2, urlEnd)).trim(), end: urlEnd + 1 };
+}
+
 function inlineContent(text: string): ReactNode[] {
   const source = text
     .replace(/\$(\([RS]\)-\(-\))\$\s+-/g, (_match, math: string) => `$${math}$-`)
     .replace(/\$\s+([,;:])/g, (_match, punctuation: string) => `$${punctuation}`);
   const parts: ReactNode[] = [];
-  const pattern = /!\[([^\]]*)\]\(([^)]+)\)|\[([^\]]+)\]\(([^)]+)\)|\$((?:\\.|[^$\n])+)\$|`([^`]+)`|\*\*([^*]+)\*\*/g;
+  const pattern = /(!?\[)|\$((?:\\.|[^$\n])+)\$|`([^`]+)`|\*\*([^*]+)\*\*/g;
   let cursor = 0;
   let match: RegExpExecArray | null;
   while ((match = pattern.exec(source)) !== null) {
     if (match.index > cursor) parts.push(source.slice(cursor, match.index));
     if (match[1] !== undefined) {
-      const src = match[2].startsWith("/api/v1/artifacts/") ? match[2] : "";
-      parts.push(src ? <img key={`${match.index}-img`} alt={match[1]} src={src} loading="lazy" /> : match[0]);
+      const link = markdownLinkAt(source, match.index);
+      if (!link) { parts.push(match[0]); cursor = pattern.lastIndex; continue; }
+      pattern.lastIndex = link.end;
+      const literal = source.slice(match.index, link.end);
+      if (link.image) {
+        const src = link.url.startsWith("/api/v1/artifacts/") ? link.url : "";
+        parts.push(src ? <img key={`${match.index}-img`} alt={link.label} src={src} loading="lazy" /> : literal);
+      } else {
+        const href = /^(?:https?:\/\/|\/api\/v1\/)/i.test(link.url) ? link.url : "";
+        parts.push(href ? <a key={`${match.index}-link`} href={href} target="_blank" rel="noreferrer">{link.label}</a> : literal);
+      }
+    } else if (match[2] !== undefined) {
+      parts.push(<span className="inline-math" key={`${match.index}-math`} title={match[2]}>{readableInlineMath(match[2])}</span>);
     } else if (match[3] !== undefined) {
-      const href = match[4];
-      const safeHref = /^(?:https?:\/\/|\/api\/v1\/)/i.test(href) ? href : "";
-      parts.push(safeHref ? <a key={`${match.index}-link`} href={safeHref} target="_blank" rel="noreferrer">{match[3]}</a> : match[0]);
-    } else if (match[5] !== undefined) {
-      parts.push(<span className="inline-math" key={`${match.index}-math`} title={match[5]}>{readableInlineMath(match[5])}</span>);
-    } else if (match[6] !== undefined) {
-      parts.push(<code key={`${match.index}-code`}>{match[6]}</code>);
+      parts.push(<code key={`${match.index}-code`}>{match[3]}</code>);
     } else {
-      parts.push(<strong key={`${match.index}-strong`}>{match[7]}</strong>);
+      parts.push(<strong key={`${match.index}-strong`}>{match[4]}</strong>);
     }
     cursor = pattern.lastIndex;
   }
   if (cursor < source.length) parts.push(source.slice(cursor));
-  return parts;
+  // Editable manuscripts identify citations/figure references in text nodes.
+  // Failed link candidates must not split ordinary prose into separate nodes.
+  const merged: ReactNode[] = [];
+  for (const part of parts) {
+    const last = merged.length - 1;
+    if (typeof part === "string" && typeof merged[last] === "string") merged[last] += part;
+    else merged.push(part);
+  }
+  return merged;
 }
 
 export function MarkdownView({ content, empty }: { content?: string | null; empty?: string }) {

@@ -11,7 +11,7 @@ DEFAULT_SECTION_CONCURRENCY = 2
 def chapter_responsibilities(tasks):
     """One shared snapshot for writing, audit, and checkpoint invalidation."""
     return [{key: task.get(key) for key in (
-        "section_id", "heading", "writing_objective", "questions_to_answer", "avoid_points",
+        "section_id", "heading", "writing_objective", "review_problem", "avoid_points",
         "primary_papers", "supporting_papers", "paper_roles", "paragraph_tasks")}
         for task in tasks]
 
@@ -56,6 +56,9 @@ def run_sections(tasks, generate, observe, save, *, completed=None, deferred=Non
                     "paragraphs": (retained.get(dependency, {}).get("writing") or {}).get("paragraphs", []),
                     "claims": (retained.get(dependency, {}).get("writing") or {}).get("claims", [])}
                     for dependency in dependencies]
+                if worker_task.get("synthesis_contract"):
+                    from .synthesis_inputs import synthesis_context
+                    worker_task["dependency_context"] = synthesis_context(dependencies, retained)
                 pool.submit(work, worker_task)
             if not running:
                 if model_waits:

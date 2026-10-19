@@ -8,6 +8,40 @@ ROOT = Path(__file__).resolve().parents[2]
 
 
 class ReactFrontendShellTests(unittest.TestCase):
+    def test_guide_direct_access_is_public_and_returns_the_spa_shell(self) -> None:
+        import base64
+        import tempfile
+        from fastapi.testclient import TestClient
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import sessionmaker
+        from review_writer_api.app import create_app
+        from review_writer_api.config import ApiSettings
+        from review_writer_api.database import Base
+
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            database_url = f"sqlite+pysqlite:///{(root / 'guide.sqlite3').as_posix()}"
+            engine = create_engine(database_url, connect_args={"check_same_thread": False})
+            try:
+                Base.metadata.create_all(engine)
+                settings = ApiSettings(review_root=root, deployment_mode="hosted", database_url=database_url,
+                    public_origin="http://testserver", hosted_workspace_root=root / "workspaces",
+                    credential_encryption_key=base64.urlsafe_b64encode(bytes(range(32))).decode().rstrip("="),
+                    job_execution_enabled=False)
+                app = create_app(settings, session_factory_override=sessionmaker(bind=engine, expire_on_commit=False))
+                with TestClient(app) as client:
+                    self.assertEqual(401, client.get("/api/v1/me").status_code)
+                    for path in ("/guide", "/guide?project=not-a-real-project"):
+                        response = client.get(path)
+                        expected = 200 if (ROOT / "frontend" / "dist" / "index.html").is_file() else 503
+                        self.assertEqual(expected, response.status_code, response.text)
+                        self.assertIn("no-store", response.headers["cache-control"])
+                        self.assertIn("Content-Security-Policy", response.headers)
+                        if expected == 200:
+                            self.assertIn('data-review-writer-react="true"', response.text)
+            finally:
+                engine.dispose()
+
     def test_react_router_owns_every_canonical_workflow_url(self) -> None:
         source = (ROOT / "frontend" / "src" / "app" / "App.tsx").read_text(
             encoding="utf-8"
@@ -15,6 +49,7 @@ class ReactFrontendShellTests(unittest.TestCase):
         for path in (
             "/",
             "/login",
+            "/guide",
             "/workspace",
             "/library",
             "/discovery",
@@ -31,6 +66,7 @@ class ReactFrontendShellTests(unittest.TestCase):
     def test_fastapi_serves_only_the_react_spa_and_ketcher_assets(self) -> None:
         source = (ROOT / "review_writer_api" / "app.py").read_text(encoding="utf-8")
         self.assertIn('@app.get("/login", include_in_schema=False)', source)
+        self.assertIn('@app.get("/guide", include_in_schema=False)', source)
         self.assertIn('@app.get("/workspace", include_in_schema=False)', source)
         self.assertIn('app.mount(\n            "/assets/react"', source)
         self.assertIn("if react_spa_available:", source)
@@ -105,7 +141,7 @@ class ReactFrontendShellTests(unittest.TestCase):
             / "frontend"
             / "src"
             / "features"
-            / "planning"
+            / "sections"
             / "ChapterPlanningWorkspace.tsx"
         ).read_text(encoding="utf-8")
         request = planning.split("const generateBlueprint", 1)[1].split(
@@ -123,8 +159,8 @@ class ReactFrontendShellTests(unittest.TestCase):
             / "images"
             / "ImagesPage.tsx"
         ).read_text(encoding="utf-8")
-        self.assertNotIn('/figures/review/confirm', images)
-        self.assertIn('/figures/review/sync', images)
+        self.assertNotIn('/images/review/confirm', images)
+        self.assertIn('/images/review/sync', images)
         self.assertIn('["figures", projectId]', images)
         self.assertIn("selection_complete", images)
 

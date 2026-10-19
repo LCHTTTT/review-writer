@@ -4,6 +4,7 @@ from __future__ import annotations
 import re
 from copy import deepcopy
 from difflib import SequenceMatcher
+from review_writer_core.publication_voice import paper_id_mentions
 
 
 def normalized(value):
@@ -173,13 +174,23 @@ def paragraph_is_current(plan, paragraph):
     return normalized(CALLOUT_RE.sub("", expected)) == normalized(CALLOUT_RE.sub("", paragraph.get("text") or ""))
 
 
-def style_findings(claims):
+def style_findings(claims, *, paper_ids=None):
     """Bound-source overlap and source-matched repetition; hints, never deletion."""
     findings, seen = {}, {}
+    registered = set(paper_ids or ()) | {str(ref.get("paper_id") or "")
+                                       for claim in claims for ref in claim["evidence_refs"]}
     for claim in claims:
         text = normalized(claim["claim"])
         words = re.findall(r"\w+", text.casefold())
         issues = []
+        if paper_id_mentions(text, registered, source_quotes=[ref["quote"] for ref in claim["evidence_refs"]]):
+            issues.append("internal_paper_identifier")
+        # Repair hints piggyback on an existing scientific check, never trigger
+        # a new model call or mutate prose. A conjunction is not always wrong.
+        if re.search(r"(?<=[.!?])\s+(?:and|but|whereas)\s+[a-z]", text):
+            issues.append("possible_broken_sentence_boundary")
+        if re.match(r"(?:and|but|whereas)\s+[a-z]", text):
+            issues.append("possible_orphaned_clause")
         if len(words) >= 22:
             for ref in claim["evidence_refs"]:
                 source_words = re.findall(r"\w+", ref["quote"].casefold())
@@ -190,17 +201,36 @@ def style_findings(claims):
         sources = tuple(sorted({str(ref.get("paper_id") or ref["evidence_key"])
                                 for ref in claim["evidence_refs"]}))
         if len(words) >= 10:
-            for previous_text, previous_paragraph in seen.get(sources, []):
+            source_quotes = {str(ref.get("quote") or "") for ref in claim["evidence_refs"]}
+            for previous_text, previous_paragraph, previous_quotes in seen.get(sources, []):
                 # Numbers and polarity differences may express essential contrasts.
-                if (re.findall(r"\d+(?:\.\d+)?", previous_text) != re.findall(r"\d+(?:\.\d+)?", text.casefold())
-                        or set(re.findall(r"\b(?:no|not|without|never)\b", previous_text))
-                        != set(re.findall(r"\b(?:no|not|without|never)\b", text.casefold()))):
-                    continue
-                if SequenceMatcher(None, previous_text, text.casefold(), autojunk=False).ratio() >= .9:
+                same_anchors = (
+                    re.findall(r"\d+(?:\.\d+)?", previous_text) == re.findall(r"\d+(?:\.\d+)?", text.casefold())
+                    and set(re.findall(r"\b(?:no|not|without|never)\b", previous_text))
+                    == set(re.findall(r"\b(?:no|not|without|never)\b", text.casefold()))
+                )
+                if same_anchors and SequenceMatcher(None, previous_text, text.casefold(), autojunk=False).ratio() >= .9:
                     issues.append("repeated_wording_in_paragraph" if previous_paragraph == claim["paragraph_id"]
                                   else "repeated_wording_across_paragraphs")
                     break
-            seen.setdefault(sources, []).append((text.casefold(), claim["paragraph_id"]))
+                # Exact source reuse plus several shared long phrases is a
+                # useful candidate for review even when whole-sentence wording
+                # differs. It is not proof that the scientific purpose repeats.
+                if (same_anchors and source_quotes & previous_quotes):
+                    prior_words = re.findall(r"\w+", previous_text)
+                    shared_phrases = {
+                        tuple(words[index:index + 5])
+                        for index in range(len(words) - 4)
+                    } & {
+                        tuple(prior_words[index:index + 5])
+                        for index in range(len(prior_words) - 4)
+                    }
+                    if len(shared_phrases) >= 3:
+                        issues.append("possible_repeated_experiment_in_paragraph"
+                                      if previous_paragraph == claim["paragraph_id"]
+                                      else "possible_repeated_experiment_across_paragraphs")
+                        break
+            seen.setdefault(sources, []).append((text.casefold(), claim["paragraph_id"], source_quotes))
         if issues:
             findings[claim["claim_id"]] = issues
     return findings

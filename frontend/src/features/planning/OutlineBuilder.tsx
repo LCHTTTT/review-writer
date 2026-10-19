@@ -19,6 +19,7 @@ export type OutlineSectionDraft = {
   purpose: string;
   paperIds: string[];
   contextPaperIds?: string[];
+  supportingPaperIds?: string[];
   notes: string;
   sectionRole?: "introduction" | "body" | "conclusion" | "references";
 };
@@ -126,6 +127,11 @@ export function parseOutlineMarkdown(value: string): VisualOutlineDraft {
       continue;
     }
     const contextual = rawLine.trim().match(/^(?:Context|Contextual) papers:\s*(.*)$/i);
+    const supporting = rawLine.trim().match(/^Supporting papers:\s*(.*)$/i);
+    if (supporting) {
+      current.supportingPaperIds = unique(supporting[1].replace(/[.。]\s*$/, "").split(/[,，;；]/));
+      continue;
+    }
     if (contextual) {
       current.contextPaperIds = unique(contextual[1].replace(/[.。]\s*$/, "").split(/[,，;；]/));
       continue;
@@ -173,6 +179,7 @@ export function serializeOutlineMarkdown(draft: VisualOutlineDraft): string {
     if (section.sectionRole) lines.push(`Section role: ${section.sectionRole}`);
     if (section.paperIds.length) lines.push(`Assigned papers: ${unique(section.paperIds).join(", ")}.`);
     if (section.contextPaperIds?.length) lines.push(`Context papers: ${unique(section.contextPaperIds).join(", ")}.`);
+    if (section.supportingPaperIds?.length) lines.push(`Supporting papers: ${unique(section.supportingPaperIds).join(", ")}.`);
     lines.push(`Purpose: ${purpose}`);
     if (section.notes.trim()) lines.push(section.notes.trim());
     return lines.join("\n");

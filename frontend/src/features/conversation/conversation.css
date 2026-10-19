@@ -1,0 +1,188 @@
+/* Conversation layout uses the existing application palette and controls.
+   Roles are distinguished by shape and colour, never by colour alone:
+   the question reads as a raised request card, the reply as a document sheet. */
+.page-container.conversation-page { width: min(calc(100% - 40px), 1800px); display: grid; padding-block: 12px; }
+.project-paper-dialog { width: min(900px, calc(100vw - 32px)); max-height: calc(100dvh - 48px); padding: 24px; border: 1px solid var(--line-strong); border-radius: 18px; color: var(--ink); background: var(--surface); box-shadow: var(--shadow); overflow: auto; }
+.project-paper-dialog::backdrop { background: #153b3655; backdrop-filter: blur(3px); }
+.conversation-elapsed { display: block; margin-top: 6px; color: var(--muted); font-size: 12px; }
+.conversation-screening-results { margin-top: 16px; }
+.conversation-screening-results h4 { margin: 0 0 8px; }
+.conversation-screening-results > article { padding: 12px 0; border-bottom: 1px solid var(--line); }
+.conversation-screening-results > article > small { display: block; margin-top: 4px; color: var(--muted); }
+.conversation-screening-results > article p { font-size: 13px; margin-bottom: 0; }
+.project-paper-dialog > header, .project-paper-dialog > footer, .project-paper-tools, .project-paper-pagination { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; justify-content: space-between; }
+.project-paper-dialog h2 { margin: 4px 0 0; font-size: 22px; }
+.project-paper-dialog > p { font-size: 13px; line-height: 1.8; }
+.project-paper-tools { margin: 16px 0 8px; }
+.project-paper-tools form { display: flex; gap: 8px; flex: 1; min-width: 220px; }
+.project-paper-tools input { min-width: 0; flex: 1; }
+.project-paper-list { margin-top: 18px; border: 1px solid var(--line); border-radius: 12px; max-height: 42dvh; overflow: auto; }
+.project-paper-row { display: flex; gap: 12px; align-items: start; padding: 14px 16px; border-bottom: 1px solid var(--line); cursor: pointer; }
+.project-paper-row:last-child { border-bottom: 0; }
+.project-paper-row input { width: 18px; height: 18px; margin-top: 3px; accent-color: var(--green); flex-shrink: 0; }
+.project-paper-row span { display: grid; gap: 5px; min-width: 0; }
+.project-paper-row strong { font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
+.project-paper-row small, .project-paper-pagination { color: var(--muted); font-size: 12px; }
+.project-paper-dialog > footer { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--line); font-size: 13px; }
+.project-paper-uploads { font-size: 12px; line-height: 1.8; padding-left: 20px; }
+.conversation-contextbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+.conversation-contextbar label { font-size: 12px; color: var(--muted); }
+.conversation-contextbar select { width: clamp(140px, 19vw, 260px); max-width: 100%; min-width: 0; font-size: 13px; }
+.conversation-header-controls { display: flex; align-items: center; justify-content: flex-end; flex-wrap: wrap; gap: 8px 14px; max-width: 100%; margin-left: auto; }
+.conversation-workspace { display: grid; grid-template-columns: minmax(0, 1fr); align-items: start; gap: 0; width: 100%; }
+.conversation-workspace.has-viewer { grid-template-columns: minmax(0, .95fr) minmax(0, 1.05fr); max-width: none; }
+.conversation-chat, .conversation-viewer { min-width: 0; }
+.conversation-chat { display: flex; flex-direction: column; height: var(--conversation-room, calc(100dvh - 180px)); min-height: 360px; padding: 0; overflow: hidden; border: 0; border-radius: 0; background: var(--surface); box-shadow: none; }
+.conversation-header, .conversation-viewer > header, .conversation-actions { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.conversation-header { flex-shrink: 0; padding: 14px 24px; border-bottom: 1px solid var(--line); position: relative; background: linear-gradient(110deg, var(--green-pale), var(--surface) 55%); }
+.conversation-discussions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 12px; }
+.conversation-discussions select { width: auto; max-width: 220px; min-width: 0; padding: 7px; font-size: 13px; }
+.conversation-title { display: grid; gap: 4px; min-width: 0; }
+.conversation-header h1 { font-size: 22px; margin: 0; letter-spacing: -.02em; overflow-wrap: anywhere; }
+.conversation-background summary, .conversation-execution-details summary, .conversation-delivery-options summary { cursor: pointer; font-size: 12px; color: var(--muted); }
+.conversation-model-picker { display: flex; align-items: center; gap: 8px; min-width: 0; font-size: 12px; }
+.conversation-model-picker label { white-space: nowrap; color: var(--muted); }
+.conversation-model-picker select { min-width: 110px; width: auto; max-width: 200px; border: 0; background: var(--green-pale); color: var(--green); min-height: 34px; padding: 5px 10px; font-size: 12px; }
+.conversation-log { flex: 1; min-height: 0; overflow: auto; overscroll-behavior: contain; padding: 24px clamp(20px, 3vw, 48px); scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent; background: linear-gradient(180deg, #fbfcfb 0, var(--green-pale) 340px); }
+.conversation-log > .empty-state { display: grid; align-content: center; justify-items: center; min-height: 270px; text-align: center; gap: 10px; max-width: 560px; margin: auto; }
+.conversation-log .empty-state h2 { font-size: 24px; margin-bottom: 0; }
+.conversation-log .empty-state p { color: var(--muted); line-height: 1.8; }
+.conversation-turn { display: grid; gap: 14px; width: 100%; max-width: 1000px; margin: 0 auto 30px; }
+.conversation-turn p { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.85; }
+.conversation-turn .chat-message { margin: 0; }
+
+/* The speaker label is a head row shared by both roles. The question needs an
+   avatar so "you" reads as a person; the reply keeps its plain "AI" word, which
+   would only be repeated by a second badge. */
+.conversation-turn .chat-message > small { display: flex; align-items: center; gap: 8px; margin: 0 0 8px; font-size: 11px; font-weight: 750; letter-spacing: .04em; color: var(--muted); }
+
+/* Question: raised card, right-aligned, tapering to the corner nearest the
+   speaker, exactly like the chapter dialogue already in the application. */
+.conversation-turn .chat-message-user { justify-self: end; width: fit-content; max-width: min(82%, 660px); padding: 12px 16px; border: 1px solid var(--line-strong); border-radius: 14px; border-top-right-radius: 4px; background: var(--green-soft); box-shadow: var(--shadow-soft); }
+.conversation-turn .chat-message-user > small { justify-content: flex-end; color: var(--green-dark); }
+.conversation-turn .chat-message-user > small::before { content: "你"; width: 22px; height: 22px; flex: none; display: grid; place-items: center; border-radius: 50%; color: #fff; background: linear-gradient(145deg, #1d7058, var(--green-dark)); font-size: 10px; font-weight: 800; letter-spacing: 0; }
+html[lang="en"] .conversation-turn .chat-message-user > small::before { content: "Y"; }
+.conversation-turn .chat-message-user p { margin: 0; font-size: 14px; white-space: pre-wrap; }
+
+/* Reply: a titled document sheet, left-aligned and full-measure, so a long
+   answer keeps a stable reading width instead of reflowing per message. The
+   green edge stops just past the title, marking the speaker's side of the
+   thread without drawing a hard line down the whole card. */
+.conversation-turn .chat-message-assistant { position: relative; justify-self: stretch; max-width: 100%; padding: 14px 18px 16px 20px; border: 1px solid var(--line); border-radius: 14px; border-top-left-radius: 4px; background: var(--surface); box-shadow: var(--shadow-soft); }
+.conversation-turn .chat-message-assistant::before { content: ""; position: absolute; top: 14px; left: -1px; width: 3px; height: 14px; border-radius: 0 3px 3px 0; background: linear-gradient(180deg, var(--green), #2f8a6d); }
+.conversation-turn .chat-message-assistant > small { color: var(--green-dark); }
+.conversation-turn .chat-message-assistant > .markdown-view { margin: 0; max-width: 100%; padding: 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; }
+.conversation-turn .chat-message-assistant > p { margin: 0; }
+.conversation-log .markdown-view { font-size: 15px; }
+.conversation-log .markdown-view > :first-child { margin-top: 0; }
+.conversation-log .markdown-view > :last-child { margin-bottom: 0; }
+.conversation-log .markdown-view table { display: block; overflow-x: auto; max-width: 100%; }
+.conversation-log .markdown-view pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+.conversation-composer { flex-shrink: 0; border-top: 1px solid var(--line); padding: 12px max(24px, calc((100% - 1000px) / 2)) 14px; background: var(--surface); box-shadow: 0 -6px 20px rgba(28, 47, 38, .035); }
+.conversation-composer textarea { width: 100%; min-height: 64px; height: 88px; max-height: 180px; resize: vertical; border: 1px solid var(--line-strong); border-radius: 12px; padding: 12px 14px; background: var(--green-pale); line-height: 1.7; font-size: 15px; box-shadow: none; transition: border-color .15s, background .15s, box-shadow .15s; }
+.conversation-composer textarea::placeholder { color: var(--muted); }
+.conversation-composer textarea:focus { border-color: var(--green); background: var(--surface); outline: none; box-shadow: 0 0 0 3px var(--green-soft); }
+.conversation-attachments { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; font-size: 12px; }
+.conversation-attachments > small { line-height: 1.8; width: 100%; color: var(--muted); }
+.conversation-composer .conversation-actions { margin-top: 10px; }
+.conversation-composer .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; }
+.conversation-composer .conversation-actions small { font-size: 12px; margin-right: auto; }
+.conversation-composer > p { font-size: 12px; margin: 0 0 10px; }
+.conversation-delivery { display: flex; align-items: center; gap: 10px; margin-top: 10px; font-size: 12px; flex-wrap: wrap; }
+.conversation-delivery select { width: auto; max-width: 100%; }
+.conversation-action-card, .conversation-execution-card { margin: 16px 0 0; padding: 14px; border: 1px solid var(--line); border-radius: 11px; background: var(--green-pale); }
+.conversation-action-card h3, .conversation-execution-card h3 { margin: 0 0 8px; font-size: 14px; }
+.conversation-action-card p, .conversation-execution-card p { font-size: 12px; }
+.conversation-action-card pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; }
+.conversation-execution-details { margin-top: 12px; }
+.conversation-edit-preview { margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--line); }
+.conversation-edit-preview summary { cursor: pointer; font-size: 13px; color: var(--green); }
+.conversation-edit-preview h4 { font-size: 12px; color: var(--muted); margin: 14px 0 4px; }
+.conversation-edit-preview .markdown-view { max-height: 340px; overflow: auto; padding: 8px 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; }
+.conversation-task { border-top: 1px solid var(--line); padding: 12px 0; margin-top: 12px; font-size: 12px; }
+.conversation-artifacts { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.conversation-file-card { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--green-pale); color: var(--ink); cursor: pointer; text-align: left; text-decoration: none; font: inherit; transition: border-color .15s, background .15s; }
+.conversation-file-card:hover, .conversation-file-card:focus-visible { border-color: var(--green); background: var(--green-soft); }
+.conversation-file-icon { display: grid; place-items: center; min-width: 34px; height: 34px; padding: 0 4px; border-radius: 8px; background: var(--green-soft); color: var(--green); font-size: 11px; font-weight: 700; letter-spacing: 0.02em; }
+.conversation-file-meta { display: grid; gap: 2px; min-width: 0; }
+.conversation-file-card .conversation-file-meta { flex: 1; }
+.conversation-file-card .button { white-space: nowrap; }
+.conversation-selected-papers { margin: 12px 0; }
+.conversation-selected-papers ul { list-style: none; padding: 0; margin: 8px 0; max-height: 240px; overflow-y: auto; }
+.conversation-selected-papers li { display: grid; gap: 4px; padding: 9px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.conversation-selected-papers strong { font-size: 13px; font-weight: 600; }
+.conversation-selected-papers small { color: var(--muted); font-size: 11px; }
+.conversation-file-meta strong { font-size: 13px; font-weight: 600; overflow-wrap: anywhere; }
+.conversation-file-meta small { color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+.conversation-background { max-width: 100%; }
+.conversation-header .conversation-background[open] { width: 100%; max-height: 220px; overflow: auto; padding-top: 8px; }
+.conversation-viewer { padding: 24px; height: var(--conversation-room, calc(100dvh - 180px)); overflow: auto; border: 0; border-left: 1px solid var(--line); border-radius: 0; background: var(--surface); box-shadow: none; scrollbar-width: thin; }
+.conversation-viewer > header { position: sticky; top: -24px; z-index: 2; margin: -24px -24px 20px; padding: 18px 24px; border-bottom: 1px solid var(--line); background: var(--surface); }
+.conversation-viewer > header p { margin: 6px 0 0; font-size: 12px; }
+.conversation-viewer > header > div:last-child { display: flex; gap: 8px; flex-wrap: wrap; }
+.conversation-viewer > header h2 { margin: 0; font-size: 18px; }
+.conversation-viewer img { max-width: 100%; height: auto; }
+.conversation-viewer pre { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; background: var(--soft); border-radius: 8px; padding: 12px; }
+.conversation-viewer label { display: grid; gap: 6px; margin: 12px 0; font-size: 12px; }
+.conversation-viewer .markdown-view { margin-top: 20px; }
+.conversation-editor textarea { width: 100%; resize: vertical; }
+.conversation-workspace.viewer-wide { grid-template-columns: 1fr; }
+.conversation-workspace.viewer-wide .conversation-chat { display: none; }
+.conversation-outline-choices { margin-top: 16px; padding: 16px 0; background: transparent; border: 0; border-block: 1px solid var(--line); border-radius: 0; }
+.conversation-outline-choices h4 { margin: 0; }
+.conversation-empty { padding: 48px; }
+.conversation-preparation { width: 100%; }
+.conversation-create-form { display: grid; gap: 14px; padding: 22px; border: 1px solid var(--line); border-radius: var(--radius); background: var(--soft); }
+.conversation-create-form h2 { margin: 0; font-size: 18px; }
+.conversation-create-form label { display: grid; gap: 6px; font-size: 12px; }
+.conversation-create-form textarea { width: 100%; }
+.conversation-create-options { display: flex; gap: 12px; flex-wrap: wrap; }
+.conversation-create-options label { flex: 1; min-width: 160px; }
+@media (max-width: 960px) {
+  .conversation-workspace.has-viewer { grid-template-columns: minmax(0, 1fr); }
+  .conversation-workspace.has-viewer .conversation-chat { display: none; }
+}
+@media (max-width: 800px) {
+  .page-container.conversation-page { width: calc(100% - 24px); gap: 12px; padding-block: 12px; }
+  .conversation-workspace { grid-template-columns: minmax(0, 1fr); }
+  .conversation-chat { height: var(--conversation-room, calc(100dvh - 160px)); min-height: 360px; }
+  .conversation-header { padding: 14px 16px; }
+  .conversation-title { gap: 8px; }
+  .conversation-header h1 { font-size: 17px; }
+  .conversation-composer, .conversation-background { padding-left: 16px; padding-right: 16px; }
+  .conversation-log { padding: 20px 16px; }
+  .conversation-viewer { padding: 18px; border-radius: 0; }
+  .conversation-viewer > header { top: -18px; margin: -18px -18px 16px; padding: 16px 18px; }
+  .conversation-log .empty-state h2 { font-size: 20px; }
+}
+
+.conversation-composer-tools { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 14px; padding-top: 10px; }
+.conversation-upload-tool { margin: 0; max-width: 100%; }
+.conversation-upload-icon { min-width: 34px; width: 34px; height: 34px; padding: 6px; border: 0; border-radius: 6px; background: transparent; color: var(--green); }
+.conversation-upload-icon:hover:not(:disabled) { background: var(--green-pale); }
+.conversation-upload-icon:focus-visible { outline: 2px solid var(--green); outline-offset: 2px; }
+.conversation-upload-tool .badge { max-width: 100%; overflow-wrap: anywhere; }
+.conversation-toolbar-actions { display: flex; gap: 8px; align-items: center; margin-left: auto; }
+.conversation-toolbar-actions .button-primary { min-width: 76px; }
+.conversation-web-toggle { display: inline-flex; align-items: center; gap: 8px; font-size: 12px; cursor: pointer; }
+.conversation-web-toggle input { appearance: none; width: 32px; height: 18px; border: 1px solid var(--line-strong); border-radius: 999px; background: var(--line); position: relative; cursor: pointer; margin: 0; }
+.conversation-web-toggle input::before { content: ""; position: absolute; width: 12px; height: 12px; top: 2px; left: 2px; background: white; border-radius: 50%; transition: transform .15s ease; }
+.conversation-web-toggle input:checked { background: var(--green); border-color: var(--green); }
+.conversation-web-toggle input:checked::before { transform: translateX(14px); }
+.conversation-web-toggle input:focus-visible { outline: 2px solid var(--green); outline-offset: 3px; }
+.conversation-submit-status { color: var(--muted); font-size: 12px; }
+.conversation-composer .conversation-attachments > small { width: auto; font-size: 11px; }
+.conversation-delivery-options { margin-top: 8px; }
+@media (prefers-reduced-motion: reduce) { .conversation-web-toggle input::before { transition: none; } }
+@media (max-height: 650px) {
+  .conversation-chat, .conversation-viewer { min-height: 360px; }
+}
+/* A narrow column cannot carry two aligned sides without squeezing the text,
+   so the question stops hanging right and both roles use the full width.
+   This block sits last so it overrides the base role rules above. */
+@media (max-width: 800px) {
+  .conversation-turn { gap: 12px; }
+  .conversation-turn .chat-message-user { justify-self: stretch; width: auto; max-width: 100%; padding: 10px 14px; border-top-right-radius: 14px; }
+  .conversation-turn .chat-message-assistant { padding: 12px 14px 14px 16px; }
+  .conversation-turn .chat-message-user > small { justify-content: flex-start; }
+}

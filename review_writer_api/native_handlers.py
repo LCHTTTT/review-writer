@@ -70,6 +70,8 @@ class NativeWorkflowHandlers(
         model_gateway: ModelGatewayService | None = None,
         planning_service: Any | None = None,
         sections_service: Any | None = None,
+        runtime_settings: Any | None = None,
+        session_factory: Any | None = None,
     ):
         self.runner = runner
         self.workspaces = workspaces
@@ -77,6 +79,8 @@ class NativeWorkflowHandlers(
         self.model_gateway = model_gateway
         self.planning_service = planning_service
         self.sections_service = sections_service
+        self.runtime_settings = runtime_settings
+        self.session_factory = session_factory
         self.root = Path(__file__).resolve().parents[1]
 
     def mapping(self) -> dict[str, Any]:

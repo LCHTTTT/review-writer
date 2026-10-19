@@ -10,12 +10,14 @@ import uuid
 import time
 import logging
 from dataclasses import dataclass
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import timedelta
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
 from sqlalchemy import and_, case, delete, func, or_, select, update
-from review_writer_api.database import UserCreditAccount, database_session, utc_now
+from review_writer_api.database import AIModelRequest, UserCreditAccount, database_session, utc_now
 from review_writer_api.config import RetrievalTuning
 from review_writer_api.errors import WorkflowNotFound, WorkflowValidationError
 from review_writer_api.security import Permission, Principal
@@ -24,6 +26,7 @@ from review_writer_api.workflow_models import (
     LibraryDocumentChunk,
     LibraryDocumentIndex,
     LibraryPaper,
+    WorkflowJob,
 )
 from review_writer_api.workspaces import HostedWorkspaceManager
 from review_writer_core.retrieval import (
@@ -33,6 +36,50 @@ from review_writer_core.retrieval import (
 
 
 _QUERY_TOKEN = re.compile(r"[\u3400-\u9fff]|[\w]+(?:[-'][\w]+)*", re.UNICODE)
+_NON_RESEARCH_HEADINGS = re.compile(
+    r"\b(?:references|bibliography|acknowledg(?:e)?ments?|author information|"
+    r"associated content|supporting information|conflicts? of interest)\b", re.IGNORECASE
+)
+
+
+def _contribution_chunk_candidates(chunks: list[LibraryDocumentChunk], contribution: str, limit: int) -> list[LibraryDocumentChunk]:
+    """Sample the paper's own body, not the keyword-rich introduction or references.
+
+    This is a recall aid, not a claim that a sampled passage reports original work.
+    The source writer still checks study ownership against the passage itself.
+    """
+    readable = [chunk for chunk in chunks
+                if chunk.content_type in {"text", "merged_text", "markdown"}
+                and len(str(chunk.content or "").strip()) >= 80
+                and not _NON_RESEARCH_HEADINGS.search(" ".join(str(part) for part in chunk.section_path_json or []))]
+    if not readable:
+        return []
+    pages = sorted({chunk.page_start for chunk in readable if chunk.page_start is not None})
+    interior = ([chunk for chunk in readable if chunk.page_start != pages[0]]
+                if len(pages) >= 2 else [])
+    candidates = interior or readable
+    terms = {token.casefold() for token in _QUERY_TOKEN.findall(contribution)
+             if len(token) >= 4 and not token.isdigit()}
+    def score(chunk: LibraryDocumentChunk) -> tuple[int, int]:
+        body = str(chunk.normalized_content or chunk.content or "").casefold()
+        matched = sum(term in body for term in terms)
+        return matched, min(len(body), 1500)
+    ranked = sorted(candidates, key=lambda chunk: (-score(chunk)[0], -score(chunk)[1], chunk.ordinal))
+    selected: list[LibraryDocumentChunk] = []
+    used_pages: set[int | None] = set()
+    for chunk in ranked:
+        if chunk.page_start in used_pages:
+            continue
+        selected.append(chunk)
+        used_pages.add(chunk.page_start)
+        if len(selected) >= limit:
+            return selected
+    for chunk in ranked:
+        if chunk not in selected:
+            selected.append(chunk)
+        if len(selected) >= limit:
+            break
+    return selected
 
 
 def postgres_term_group_constraint(vector, groups: list[list[str]]):
@@ -87,6 +134,26 @@ class EvidenceHit:
     next_chunk_id: str = ""
 
 
+def _indexed_chunk_hit(chunk: LibraryDocumentChunk, lineage_hash: str, reason: str) -> EvidenceHit:
+    return EvidenceHit(
+        paper_id=chunk.paper_id,
+        chunk_id=chunk.chunk_id,
+        content=chunk.content,
+        page_start=chunk.page_start,
+        page_end=chunk.page_end,
+        section_path=tuple(str(item) for item in chunk.section_path_json or []),
+        content_type=chunk.content_type,
+        asset_refs=tuple(str(item) for item in chunk.asset_refs_json or []),
+        score=0.0,
+        match_reason=reason,
+        is_neighbor=False,
+        index_id=str(chunk.index_id),
+        source_lineage_hash=str(lineage_hash),
+        previous_chunk_id=chunk.previous_chunk_id,
+        next_chunk_id=chunk.next_chunk_id,
+    )
+
+
 class LibraryIndexService:
     """Own derived chunks without changing Library admission semantics."""
 
@@ -115,6 +182,7 @@ class LibraryIndexService:
         self.vector_store = LocalVectorStore(session_factory, workspace_manager, sqlite_vector_extension)
         from review_writer_api.ttl_cache import TTLCache
         self._query_embedding_cache = TTLCache(capacity=256, ttl=600)
+        self._query_embedding_session = ContextVar(f"query-embeddings-{id(self)}", default=None)
         self._semantic_failures = TTLCache(capacity=1024, ttl=300)
 
     def _semantic_scope(self, principal):
@@ -1032,6 +1100,123 @@ class LibraryIndexService:
         built = self.build_embedding_batch(principal, pending)
         return {**ready, **{p: str(r.get("status") or "failed") for p,r in built.items()}}
 
+    def _query_embedding_key(self, principal, normalized):
+        return hashlib.sha256(json.dumps([principal.user_id,
+            self._current_embedding_profile(), normalized], sort_keys=True).encode("utf-8")).hexdigest()
+
+    def _cached_query_embedding(self, key):
+        session = self._query_embedding_session.get()
+        if session is not None and key in session:
+            return session[key]
+        cached = self._query_embedding_cache.get(key)
+        if cached is not None and cached[0] > time.monotonic():
+            if session is not None:
+                session[key] = cached
+            return cached
+        return None
+
+    def _paid_query_responses(self, principal, request_keys):
+        """Read successful exact-key results only within this owned retry chain."""
+        from review_writer_api.job_lease_context import active_job_lease
+        lease = active_job_lease()
+        if lease is None or self.session_factory is None or not request_keys:
+            return {}
+        with database_session(self.session_factory) as session:
+            current = session.get(WorkflowJob, uuid.UUID(lease.job_id))
+            if current is None or str(current.user_id) != str(principal.user_id):
+                return {}
+            ids, source = [], current
+            while source is not None and source.id not in ids and len(ids) < 16:
+                if (source.user_id != current.user_id or source.project_id != current.project_id
+                        or source.job_type != current.job_type):
+                    break
+                ids.append(source.id)
+                source = session.get(WorkflowJob, source.retry_of_job_id) if source.retry_of_job_id else None
+            rows = session.execute(select(AIModelRequest.request_key, AIModelRequest.response_json).where(
+                AIModelRequest.user_id == current.user_id, AIModelRequest.job_id.in_(ids),
+                AIModelRequest.stage == "retrieval.query.embedding", AIModelRequest.status == "succeeded",
+                AIModelRequest.request_key.in_(request_keys),
+            ).order_by(AIModelRequest.created_at.desc())).all()
+        results = {}
+        for key, response in rows:
+            results.setdefault(key, response)
+        return results
+
+    def _cache_query_batch(self, batch, response):
+        vectors = response.get("embeddings")
+        model = str(response.get("model") or "")
+        dimension = int(response.get("dimension") or (len(vectors[0]) if vectors else 0))
+        if not model or dimension <= 0 or not isinstance(vectors, list) or len(vectors) != len(batch):
+            raise ValueError("Invalid query embedding batch.")
+        from review_writer_api.sqlite_vectors import vector_blob
+        checked = [[float(v) for v in vector] for vector in vectors]
+        for vector in checked:
+            vector_blob(vector, dimension)
+        for (key, _query), vector in zip(batch, checked):
+            value = (time.monotonic() + 600, model, dimension, vector)
+            self._query_embedding_cache[key] = value
+            scope = self._query_embedding_session.get()
+            if scope is not None:
+                scope[key] = value
+
+    def _warm_query_embeddings(self, principal, queries, progress=None):
+        principal.require(Permission.PROJECT_READ)
+        normalized = list(dict.fromkeys(" ".join(str(q or "").casefold().split()) for q in queries))
+        normalized = [q for q in normalized if q]
+        pending = [(self._query_embedding_key(principal, q), q) for q in normalized]
+        pending = [(key, q) for key, q in pending if self._cached_query_embedding(key) is None]
+        saved = self._paid_query_responses(principal, [f"embed-query:{key[:32]}" for key, _q in pending])
+        for key, query in pending:
+            response = saved.get(f"embed-query:{key[:32]}")
+            if response is not None:
+                try:
+                    self._cache_query_batch([(key, query)], response)
+                except (ValueError, TypeError, KeyError, IndexError, AttributeError):
+                    continue  # Corrupt historical rows never become evidence.
+        pending = [(key, q) for key, q in pending if self._cached_query_embedding(key) is None]
+        batch_size = max(1, min(int(self.tuning.embedding_batch_size), 64))
+        for offset in range(0, len(pending), batch_size):
+            if progress:
+                progress(offset, len(pending))
+            batch = pending[offset:offset + batch_size]
+            # A singleton retains the historical idempotency key. Batch keys
+            # bind exact ordered texts/profile; never alias a different request.
+            request_key = (f"embed-query:{batch[0][0][:32]}" if len(batch) == 1 else
+                "embed-query-batch:" + hashlib.sha256(json.dumps(batch).encode()).hexdigest()[:32])
+            try:
+                response = self._paid_query_responses(principal, [request_key]).get(request_key)
+                if response is None:
+                    response = self.embedding_gateway.embed_for_active_job(
+                        [q for _key, q in batch], request_key=request_key, stage="retrieval.query.embedding")
+                self._cache_query_batch(batch, response)
+            except Exception:
+                self._semantic_failures[self._semantic_scope(principal)] = True
+                session = self._query_embedding_session.get()
+                if session is not None:
+                    session["unavailable"] = True
+                logging.getLogger(__name__).warning("Query embedding batch unavailable; using lexical evidence")
+                return False
+            if progress:
+                progress(min(offset + batch_size, len(pending)), len(pending))
+        return True
+
+    @contextmanager
+    def query_embedding_session(self, principal, queries, *, progress=None):
+        """Pin this preparation's vectors across TTL expiry; no cross-job scope."""
+        token = self._query_embedding_session.set({})
+        try:
+            if self.vector_enabled and self._semantic_cooling_down(principal):
+                self._query_embedding_session.get()["unavailable"] = True
+            if (self.vector_enabled and self.embedding_gateway is not None
+                    and hasattr(self.embedding_gateway, "embed_for_active_job")
+                    and not self._semantic_cooling_down(principal)):
+                self._warm_query_embeddings(principal, queries, progress)
+            # Callback cancellation/errors propagate; only optional embedding
+            # errors fall back. A failed batch is not replayed query by query.
+            yield self._query_embedding_session.get()
+        finally:
+            self._query_embedding_session.reset(token)
+
     def _semantic_ranked_ids(
         self,
         principal: Principal,
@@ -1043,6 +1228,7 @@ class LibraryIndexService:
     ) -> list[tuple[uuid.UUID, float]]:
         if (
             not self.vector_enabled
+            or (self._query_embedding_session.get() or {}).get("unavailable")
             or self._semantic_cooling_down(principal)
             or self.embedding_gateway is None
             or not hasattr(self.embedding_gateway, "embed_for_active_job")
@@ -1053,35 +1239,14 @@ class LibraryIndexService:
             return []
         # A process may serve multiple users/profiles; do not reuse another
         # user's query space or a stale model after a provider configuration change.
-        cache_key = hashlib.sha256(json.dumps([principal.user_id,
-            self._current_embedding_profile(), normalized], sort_keys=True).encode("utf-8")).hexdigest()
-        cached = self._query_embedding_cache.get(cache_key)
-        if cached is not None and cached[0] > time.monotonic():
-            _expires, model, dimension, query_vector = cached
-        else:
-            try:
-                response = self.embedding_gateway.embed_for_active_job(
-                    [normalized],
-                    request_key=f"embed-query:{cache_key[:32]}",
-                    stage="retrieval.query.embedding",
-                )
-            except Exception:
-                self._semantic_failures[self._semantic_scope(principal)] = True
-                raise
-            vectors = response.get("embeddings")
-            if not isinstance(vectors, list) or len(vectors) != 1:
-                return []
-            query_vector = [float(value) for value in vectors[0]]
-            model = str(response.get("model") or "")
-            dimension = int(response.get("dimension") or len(query_vector))
-            if not model or dimension != len(query_vector):
-                return []
-            self._query_embedding_cache[cache_key] = (
-                time.monotonic() + 10 * 60,
-                model,
-                dimension,
-                query_vector,
-            )
+        cache_key = self._query_embedding_key(principal, normalized)
+        cached = self._cached_query_embedding(cache_key)
+        if cached is None:
+            self._warm_query_embeddings(principal, [normalized])
+            cached = self._cached_query_embedding(cache_key)
+        if cached is None:
+            return []
+        _expires, model, dimension, query_vector = cached
         paper_limit = max(0, min(int(per_paper_limit or 0), 3))
         return self.vector_store.rank(principal.user_id, model, dimension, query_vector,
             allowed_papers, max(1, min(int(limit), 400)),
@@ -1893,6 +2058,83 @@ class LibraryIndexService:
                         "section_path": list(hit.section_path), "source_lineage_hash": hit.source_lineage_hash})
         return resolved
 
+    def sample_document_context(self, principal: Principal, paper_id: str, *,
+                                expected_lineage: str, limit: int = 6, opening_only: bool = False) -> list[dict[str, Any]]:
+        """Sample registered text across a document or from its opening.
+
+        Both modes share ownership, current-lineage and archive checks. Opening
+        position is a reading hint, never an abstract/own-contribution verdict.
+        """
+        principal.require(Permission.PROJECT_READ)
+        if not expected_lineage:
+            return []
+        limit = max(1, min(int(limit), 6))
+        with database_session(self.session_factory) as session:
+            ranked = (select(LibraryDocumentChunk.chunk_id.label("chunk_id"),
+                             func.row_number().over(order_by=LibraryDocumentChunk.ordinal).label("position"))
+                .join(LibraryDocumentIndex, LibraryDocumentIndex.id == LibraryDocumentChunk.index_id)
+                .join(LibraryPaper, (LibraryPaper.user_id == LibraryDocumentChunk.user_id)
+                      & (LibraryPaper.paper_id == LibraryDocumentChunk.paper_id))
+                .where(LibraryDocumentChunk.user_id == uuid.UUID(principal.user_id),
+                       LibraryDocumentChunk.paper_id == paper_id,
+                       LibraryDocumentIndex.is_current.is_(True), LibraryDocumentIndex.status == "ready",
+                       LibraryDocumentIndex.source_lineage_hash == expected_lineage,
+                       LibraryDocumentChunk.is_reference.is_(False),
+                       func.length(func.trim(LibraryDocumentChunk.content)) > 0,
+                       LibraryPaper.status == "active", LibraryPaper.deleted_at.is_(None)).subquery())
+            count = session.scalar(select(func.count()).select_from(ranked)) or 0
+            size = min(limit, count)
+            positions = (list(range(1, size + 1)) if opening_only else
+                         sorted({1 + round(i * (count - 1) / max(1, size - 1)) for i in range(size)}))
+            ids = list(session.scalars(select(ranked.c.chunk_id)
+                       .where(ranked.c.position.in_(positions)).order_by(ranked.c.position)))
+        resolved = self.resolve_source_chunks(principal, paper_id, ids, expected_lineage=expected_lineage)
+        by_id = {row["chunk_id"]: row for row in resolved}
+        return [by_id[cid] for cid in ids if cid in by_id]
+
+    def primary_contribution_hits(
+        self,
+        principal: Principal,
+        *,
+        paper_id: str,
+        contribution: str = "",
+        limit: int = 2,
+    ) -> list[EvidenceHit]:
+        """Recover bounded interior passages when fact cards contain no own results.
+
+        The current index and Library ownership are checked here just as in
+        ordinary retrieval. No embedding request or new model call is needed.
+        """
+        principal.require(Permission.PROJECT_READ)
+        user_id = uuid.UUID(principal.user_id)
+        count = max(1, min(int(limit), 3))
+        with database_session(self.session_factory) as session:
+            owned = session.scalar(select(LibraryPaper.paper_id).where(
+                LibraryPaper.user_id == user_id,
+                LibraryPaper.paper_id == paper_id,
+                LibraryPaper.deleted_at.is_(None),
+                LibraryPaper.status == "active",
+            ))
+            if owned != paper_id:
+                raise WorkflowValidationError("Evidence retrieval includes a paper outside the current user's Library.")
+            rows = session.execute(
+                select(LibraryDocumentChunk, LibraryDocumentIndex.source_lineage_hash)
+                .join(LibraryDocumentIndex, LibraryDocumentIndex.id == LibraryDocumentChunk.index_id)
+                .where(
+                    LibraryDocumentChunk.user_id == user_id,
+                    LibraryDocumentChunk.paper_id == paper_id,
+                    LibraryDocumentIndex.status == "ready",
+                    LibraryDocumentIndex.is_current.is_(True),
+                    LibraryDocumentChunk.is_reference.is_(False),
+                )
+                .order_by(LibraryDocumentChunk.ordinal)
+                .limit(320)
+            ).all()
+            lineage_by_id = {chunk.id: str(lineage) for chunk, lineage in rows}
+            chosen = _contribution_chunk_candidates([chunk for chunk, _ in rows], contribution, count)
+            return [_indexed_chunk_hit(chunk, lineage_by_id[chunk.id], "primary_contribution_recovery")
+                    for chunk in chosen]
+
     def primary_coverage_hits(
         self,
         principal: Principal,
@@ -1963,30 +2205,8 @@ class LibraryIndexService:
                     .order_by(preferred_content, LibraryDocumentChunk.ordinal)
                     .limit(limit)
                 ).all()
-                output.extend(
-                    EvidenceHit(
-                        paper_id=chunk.paper_id,
-                        chunk_id=chunk.chunk_id,
-                        content=chunk.content,
-                        page_start=chunk.page_start,
-                        page_end=chunk.page_end,
-                        section_path=tuple(
-                            str(item) for item in chunk.section_path_json or []
-                        ),
-                        content_type=chunk.content_type,
-                        asset_refs=tuple(
-                            str(item) for item in chunk.asset_refs_json or []
-                        ),
-                        score=0.0,
-                        match_reason="primary_paper_coverage_fallback",
-                        is_neighbor=False,
-                        index_id=str(chunk.index_id),
-                        source_lineage_hash=str(lineage_hash),
-                        previous_chunk_id=chunk.previous_chunk_id,
-                        next_chunk_id=chunk.next_chunk_id,
-                    )
-                    for chunk, lineage_hash in rows
-                )
+                output.extend(_indexed_chunk_hit(chunk, lineage_hash, "primary_paper_coverage_fallback")
+                              for chunk, lineage_hash in rows)
         return output
 
     def recover_pdf_pages(self, principal: Principal, paper_id: str, pages: list[int], *, expected_lineage: str) -> list[EvidenceHit]:

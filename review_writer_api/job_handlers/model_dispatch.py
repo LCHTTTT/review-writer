@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 from review_writer_api.job_service import JobCancellationRequested, JobYieldRequested
-from review_writer_api.job_queues import DELEGATED_TEXT_PARENT_JOB_TYPES
+from review_writer_api.errors import ModelTaskFailed
+from review_writer_api.job_queues import delegated_text_parent
 from review_writer_api.scientific_runner import ScientificInsufficientCredit, ScientificRunFailed
 from review_writer_core.model_gateway_client import GatewayRequestError, ModelResultUnknown, call_model
+from review_writer_core.provider_errors import normalize_provider_error, provider_error_message
 
 
 class ModelDispatchJobHandlers:
@@ -14,7 +16,7 @@ class ModelDispatchJobHandlers:
         parent = context.repository.get_job(context.user_id, parent_id)
         if (
             parent is None or parent.project_id != context.project_id
-            or parent.job_type not in DELEGATED_TEXT_PARENT_JOB_TYPES
+            or not delegated_text_parent(parent.job_type,getattr(parent,'payload',{}))
             or parent.status not in {"queued", "running"}
             or parent.cancellation_requested
         ):
@@ -43,7 +45,14 @@ class ModelDispatchJobHandlers:
                     attempts=1, retryable=False,
                     details={"model_outcome": "unknown"},
                 ) from exc
-            raise
+            diagnosis = normalize_provider_error(exc.status_code, {
+                "code": exc.code, "message": str(exc), "details": exc.details,
+            })
+            diagnosis.update(exc.details)
+            message = provider_error_message(diagnosis)
+            if diagnosis.get("category") == "empty_response" and diagnosis.get("reasoning_only"):
+                message = "模型仅返回推理过程，没有可用答案。已完成内容已保留；可重试未完成部分，重试可能产生模型费用。"
+            raise ModelTaskFailed(message, code=exc.code or diagnosis["code"], details=diagnosis) from exc
         except ModelResultUnknown as exc:
             raise ScientificRunFailed(
                 "The original model request outcome is unknown. It was not sent again; check the provider result before retrying.",

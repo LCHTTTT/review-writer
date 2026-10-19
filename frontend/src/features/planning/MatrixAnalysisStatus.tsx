@@ -2,14 +2,31 @@ import { LocalizedError } from "../../components/LocalizedError";
 import { useMutation } from "@tanstack/react-query";
 import { apiRequest, newIdempotencyKey } from "../../api/client";
 import { useUiText } from "../../i18n/useUiText";
+import type { Job } from "../../api/types";
+import { hasPendingFactRevision, readingCompleted, type FactExtractionProfile, type FactProcessing, type FactsDigest } from "./matrixReading";
 
-type Paper = { paper_id: string; scientific_facts?: unknown[]; fact_enrichment?: {
+type Paper = { paper_id: string; scientific_facts?: unknown[]; facts_digest?: FactsDigest; fact_enrichment?: {
   status?: string; extraction_status?: string; error?: string;
   review_readiness?: string;
-  processing?: { extraction?: string; verification?: string; source_recovery?: string };
-  fact_extraction_profile?: { stop_reason?: string };
+  processing?: FactProcessing;
+  fact_extraction_profile?: FactExtractionProfile;
+  pending_revision_fact_ids?: string[];
   last_attempt?: { status?: string; error?: string };
 } };
+
+/**
+ * Whether any fact record is context-only, uncertain or rejected.
+ *
+ * A list row omits the fact records and carries the server-derived digest, so
+ * both paths must agree — see fact_display_signals in review_writer_core.
+ */
+function limitedFactsPresent(paper: Paper): boolean {
+  if (paper.facts_digest) return Boolean(paper.facts_digest.has_limited_fact);
+  return Boolean(paper.scientific_facts?.some(item => {
+    const value = item as { support_level?: string; verification?: { status?: string } } | null;
+    return value?.support_level === "context_only" || ["uncertain", "rejected"].includes(value?.verification?.status || "");
+  }));
+}
 
 export function analysisFailed(paper: Paper): boolean {
   const fact = paper.fact_enrichment;
@@ -21,15 +38,18 @@ export function analysisState(paper: Paper, active = false): "pending" | "runnin
   const fact = paper.fact_enrichment;
   if (analysisFailed(paper)) return "failed";
   if (["provider_or_budget_unavailable", "retrieval_unavailable", "extraction_failed"].includes(fact?.fact_extraction_profile?.stop_reason || "")) return "failed";
+  if (fact?.processing?.reading === "failed") return "failed";
+  if (hasPendingFactRevision(paper)) return "pending";
+  if (readingCompleted(paper)) {
+    if (Object.values(fact?.processing || {}).includes("failed")) return "failed";
+    if ([fact?.processing?.extraction, fact?.processing?.source_recovery].includes("pending")) return "pending";
+    return fact?.status === "limited" ? "limited" : "complete";
+  }
   const terminalGap = ["no_new_evidence", "supplement_budget_reached", "review_ready_deferred_supplements"].includes(fact?.fact_extraction_profile?.stop_reason || "");
   if (terminalGap && !["pending", "failed"].includes(fact?.processing?.verification || "") && !["pending", "failed"].includes(fact?.processing?.extraction || "")) return "limited";
   if (fact?.processing && Object.values(fact.processing).some((status) => status === "pending" || status === "failed")) return "pending";
   if (fact && ["complete", "partial", "limited"].includes(fact.status || "")) {
-    const limitedFacts = paper.scientific_facts?.some(item => {
-      const value = item as { support_level?: string; verification?: { status?: string } } | null;
-      return value?.support_level === "context_only" || ["uncertain", "rejected"].includes(value?.verification?.status || "");
-    });
-    if (fact.status === "limited" || limitedFacts || (fact.review_readiness && fact.review_readiness !== "complete")) return "limited";
+    if (fact.status === "limited" || limitedFactsPresent(paper) || (fact.review_readiness && fact.review_readiness !== "complete")) return "limited";
   }
   return fact && ["complete", "partial", "limited"].includes(fact.status || "") ? "complete" : "pending";
 }
@@ -46,7 +66,9 @@ export function analysisFailureReason(error: string): "source" | "configuration"
 export function MatrixEvidenceUse({ paper }: { paper: Paper }) {
   const { text } = useUiText();
   return <details className="matrix-evidence-use">
-    <summary><strong>{text("证据用途", "Evidence use")}</strong><span>{paper.fact_enrichment?.review_readiness === "complete"
+    <summary><strong>{text("证据用途", "Evidence use")}</strong><span>{readingCompleted(paper) && paper.fact_enrichment?.review_readiness !== "complete"
+      ? text("初读已完成，具体判断按写作需要核验", "First reading is complete; claims are checked when needed for writing")
+      : paper.fact_enrichment?.review_readiness === "complete"
       ? text("可用于介绍本篇研究", "Supports an introduction to this study")
       : text("当前证据不足，按写作问题补查原文", "Current evidence is insufficient; retrieve sources for writing questions")}</span></summary>
     {analysisState(paper) === "limited" ? <p>{text("分析已完成，但部分记录不确定、被否决或尚不足以支撑论证。已有有效证据可继续使用，受限记录不会自动升级为可靠论据；无需仅为消除状态提示重复分析整篇。", "Analysis is complete, with evidence limitations. Valid evidence remains usable; uncertain or rejected records are not promoted. Do not rerun the entire paper just to clear this status.")}</p> : null}
@@ -58,6 +80,28 @@ export function unfinishedAnalysis(papers: Paper[]) {
   const unfinished = papers.filter(p => ["pending", "failed"].includes(analysisState(p)));
   const blocked = unfinished.filter(p => ["source", "configuration"].includes(analysisFailureReason(p.fact_enrichment?.last_attempt?.error || p.fact_enrichment?.error || "")));
   return { unfinished, blocked, retryable: unfinished.filter(p => !blocked.includes(p)) };
+}
+
+export function matrixRecovery(job?: Job) {
+  const recovery = job?.result?.matrix_enrichment_recovery as {
+    completed_paper_ids?: string[]; publication_pending?: boolean;
+  } | undefined;
+  return { completedPaperIds: recovery?.completed_paper_ids || [],
+    publicationPending: recovery?.publication_pending === true };
+}
+
+export function MatrixEnrichmentFailureNotice({ job }: { job: Job }) {
+  const { text } = useUiText();
+  const { publicationPending } = matrixRecovery(job);
+  return <div className="message message-error matrix-enrichment-error">
+    <strong>{publicationPending
+      ? text("已有分析结果尚未同步到文献分析。", "Completed analysis has not been published to Paper analysis.")
+      : text("上次科学事实分析未完成。", "The previous scientific fact analysis did not finish.")}</strong>
+    <p>{publicationPending
+      ? text("点击“继续未完成分析”尝试恢复已完成结果；现有内容会保留。", "Choose Resume unfinished analysis to recover completed results. Existing content is retained.")
+      : text("点击“继续未完成分析”重试未完成部分。已有有效结果会复用，未完成部分可能需要模型调用并产生费用。", "Choose Resume unfinished analysis to retry unfinished work. Valid results are reused; unfinished work may require model calls and incur costs.")}</p>
+    {job.error_message ? <p><LocalizedError error={Object.assign(new Error(job.error_message), { code: job.error_code })} /></p> : null}
+  </div>;
 }
 
 export function MatrixAnalysisStatus({ paper, papers, projectId, busy, refresh, recoveryJobId }: {

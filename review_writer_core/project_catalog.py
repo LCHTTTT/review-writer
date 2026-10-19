@@ -70,6 +70,7 @@ def list_review_projects(review_root: Path) -> list[dict[str, Any]]:
         projects.append(
             {
                 "project_id": project.name,
+                "display_name": str(project_config.get("display_name") or project.name),
                 "topic": infer_project_topic(root, project.name),
                 "taxonomy_profile": str(
                     project_config.get("taxonomy_profile") or "chemistry_general"

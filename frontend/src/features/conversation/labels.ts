@@ -1,0 +1,1 @@
+export const statusNames: Record<string, [string, string]> = { queued: ["排队中", "Queued"], running: ["进行中", "Running"], succeeded: ["已完成", "Completed"], failed: ["未完成", "Failed"], cancelled: ["已停止", "Stopped"], cancel_requested: ["正在停止", "Stopping"], interrupted: ["已中断", "Interrupted"] };

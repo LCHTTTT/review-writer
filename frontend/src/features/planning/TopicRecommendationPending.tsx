@@ -4,7 +4,7 @@ import { apiRequest } from "../../api/client";
 import { useUiText } from "../../i18n/useUiText";
 import { jobIsActive } from "../../hooks/useJob";
 
-export type TopicRecommendationState = { input_fingerprint: string; status: string; previous_outline_md?: string; job?: { id?: string; created_at?: string; error_message?: string }; model_progress?: { attempt: number; status: string; model: string } | null };
+export type TopicRecommendationState = { input_fingerprint: string; status: string; additional_evidence_available?: boolean; previous_outline_md?: string; job?: { id?: string; created_at?: string; error_message?: string }; model_progress?: { attempt: number; status: string; model: string } | null };
 
 export function TopicRecommendationPending({ projectId, state, refresh }: {
   projectId: string; state?: TopicRecommendationState | null; refresh: () => Promise<unknown>;
@@ -49,6 +49,7 @@ export function TopicRecommendationPending({ projectId, state, refresh }: {
       <p role="status">{active ? text("正在根据主题和入选论文推荐章节结构，无需等待事实卡全部完成。", "Recommending an outline from your topic and selected papers; complete fact cards are not required.")
         : text("推荐尚未就绪。系统会分析主题和论文内容，不使用固定模板替代推荐，也不会覆盖已保存的大纲。", "The recommendation is not ready. It uses your topic and papers, not a fixed template, and will not overwrite your saved outline.")}</p>
       {active ? <progress aria-label={text("正在推荐大纲", "Generating outline recommendation")} /> : null}
+      <p className="muted">{text("推荐使用文本模型额度；也可以直接选择其他结构或编辑自定义大纲。", "Recommendations use text-model credit; you can also choose another structure or edit a custom outline.")}</p>
       {active ? <p role="status">{progress
         ? progress.status === "succeeded" ? text("模型已返回，正在检查并整理推荐。", "Model response received; validating the recommendation.")
           : progress.attempt > 1 ? text(`模型请求正在第 ${progress.attempt} 次尝试，请勿重复提交。`, `Model request attempt ${progress.attempt} is in progress. Please do not resubmit.`)

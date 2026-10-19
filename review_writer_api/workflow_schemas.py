@@ -70,6 +70,11 @@ class BibliographyResolutionRequest(BaseModel):
     reason: StrictStr = Field(default="", max_length=10_000)
 
 
+class DiscoveryDownloadRequest(BaseModel):
+    candidate_id: StrictStr = Field(min_length=1, max_length=2048)
+    revision: StrictInt = Field(ge=0)
+
+
 class DiscoverySearchRequest(WorkflowRequest):
     topic: StrictStr = Field(min_length=3, max_length=10_000)
     keywords: StrictStr = Field(default="", max_length=10_000)
@@ -90,12 +95,11 @@ class DiscoveryReviewSaveRequest(BaseModel):
     coverage_decision: Literal["keep_local"] | None = None
 
 
-class DiscoverySelectionRequest(BaseModel):
-    selected: StrictBool
+class DiscoveryFulltextCheckRequest(BaseModel):
+    """Candidates to probe for an open PDF in one request."""
 
-
-class DiscoveryTopSelectionRequest(BaseModel):
-    count: StrictInt = Field(ge=1)
+    model_config = {"extra": "forbid"}
+    candidate_ids: list[StrictStr] = Field(default_factory=list, max_length=200)
 
 
 class DiscoveryConfirmRequest(BaseModel):
@@ -152,6 +156,7 @@ class BlueprintRestoreRequest(BaseModel):
 
 class SectionsGenerateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    restart: StrictBool = False
 
 
 class SectionsConfirmRequest(BaseModel):
@@ -188,6 +193,8 @@ class FigureRedrawRequest(BaseModel):
     figure_ids: list[StrictStr] = Field(default_factory=list, max_length=500)
     figure_type: StrictStr = Field(default="auto", max_length=64)
     retry_of_job_id: StrictStr | None = Field(default=None, max_length=64)
+    edit_instructions: StrictStr = Field(default="", max_length=4000)
+    palette: StrictStr = Field(default="", pattern="^(|monochrome|source)$")
 
 
 class FigureConfirmRequest(BaseModel):
@@ -242,6 +249,13 @@ class DraftEvaluationRequest(BaseModel):
 
 class DraftOptimizationRequest(DraftEvaluationRequest):
     auto_apply_safe: StrictBool = True
+
+
+class DraftPeerReviewRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    guidance: StrictStr = Field(default="", max_length=12000)
+    standard: StrictStr = Field(default="", max_length=8000)
+    expected_draft_artifact_id: StrictStr = Field(min_length=1, max_length=36)
 
 
 class DraftRewriteRequest(BaseModel):
@@ -366,6 +380,13 @@ class FinalFrontMatterRequest(BaseModel):
     omitted_fields: list[
         Literal["authors", "affiliations"]
     ] = Field(default_factory=list, max_length=2)
+
+
+class DraftPublicationRequest(BaseModel):
+    model_config = {"extra": "forbid"}
+    revision: StrictInt = Field(ge=0)
+    authors: list[StrictStr] = Field(default_factory=list, max_length=100)
+    affiliations: list[StrictStr] = Field(default_factory=list, max_length=100)
 
 
 class DraftManuscriptFieldsRequest(BaseModel):

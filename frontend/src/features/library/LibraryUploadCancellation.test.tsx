@@ -57,6 +57,7 @@ it("stops later uploads even when cancel is clicked while the current upload is 
   const cancellations: string[] = [];
   vi.stubGlobal("fetch", vi.fn(async (input: string) => {
     const path = String(input);
+    if (path === "/api/v1/me") return Response.json({user_id: "upload-owner"});
     if (path.includes("/upload-jobs?")) {
       submitted.push(path);
       return new Promise<Response>((resolve) => { finishUpload = resolve; });

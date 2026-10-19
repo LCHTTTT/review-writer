@@ -4,6 +4,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from review_writer_api.job_handlers.model_dispatch import ModelDispatchJobHandlers
+from review_writer_api.errors import ModelTaskFailed
 from review_writer_api.job_service import JobCancellationRequested, JobYieldRequested
 from review_writer_core.model_gateway_client import GatewayRequestError, ModelResultUnknown
 
@@ -87,8 +88,23 @@ def test_rate_limit_exhausts_local_retries_without_another_yield():
     failure = GatewayRequestError("busy", status_code=502,
                                   details={"category": "rate_limited", "provider_status": 429})
     with patch("review_writer_api.job_handlers.model_dispatch.call_model", side_effect=failure):
-        with pytest.raises(GatewayRequestError):
+        with pytest.raises(ModelTaskFailed) as failed:
             _handler().model_dispatch(context, _payload())
+    assert failed.value.code == "PROVIDER_RATE_LIMITED"
+    context.report_partial_result.assert_not_called()
+
+
+@pytest.mark.parametrize("reasoning_only", [False, True])
+def test_empty_response_survives_task_error_handling_without_a_replay(reasoning_only):
+    context = _context()
+    failure = GatewayRequestError("unavailable", status_code=502, code="PROVIDER_EMPTY_RESPONSE",
+                                  details={"category": "empty_response", "reasoning_only": reasoning_only})
+    with patch("review_writer_api.job_handlers.model_dispatch.call_model", side_effect=failure) as call:
+        with pytest.raises(ModelTaskFailed) as failed:
+            _handler().model_dispatch(context, _payload())
+    assert failed.value.code == "PROVIDER_EMPTY_RESPONSE"
+    assert "没有可用答案" in str(failed.value) if reasoning_only else "未返回有效回复" in str(failed.value)
+    call.assert_called_once()
     context.report_partial_result.assert_not_called()
 
 

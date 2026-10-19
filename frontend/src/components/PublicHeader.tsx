@@ -1,4 +1,4 @@
-import { Link } from "react-router-dom";
+import { Link, useLocation } from "react-router-dom";
 
 import type { AuthConfig, Principal } from "../api/types";
 import { UserMenu } from "./UserMenu";
@@ -14,6 +14,7 @@ type PublicHeaderProps = {
 export function PublicHeader({ authConfig, identity = null, compact = false }: PublicHeaderProps) {
   const language = usePreferences((state) => state.language);
   const setLanguage = usePreferences((state) => state.setLanguage);
+  const onGuide = useLocation().pathname === "/guide";
 
   return (
     <header className={compact ? "public-header compact" : "public-header"}>
@@ -31,10 +32,12 @@ export function PublicHeader({ authConfig, identity = null, compact = false }: P
             <a href="#capabilities">{language === "en" ? "Capabilities" : "核心能力"}</a>
             <a href="#workflow">{language === "en" ? "Workflow" : "工作流程"}</a>
             <a href="#governance">{language === "en" ? "Governance" : "可信保障"}</a>
+            <Link to="/guide">{language === "en" ? "Guide" : "使用指南"}</Link>
           </nav>
         ) : null}
 
         <div className="top-actions public-header-actions">
+          {!onGuide ? <Link className="button button-quiet public-guide-shortcut" to="/guide">{language === "en" ? "Guide" : "使用指南"}</Link> : null}
           {!identity ? <div className="language-switch" aria-label={language === "en" ? "Language" : "语言"}>
             <button type="button" className={language === "zh-CN" ? "active" : ""} onClick={() => setLanguage("zh-CN")}>中</button>
             <button type="button" className={language === "en" ? "active" : ""} onClick={() => setLanguage("en")}>EN</button>

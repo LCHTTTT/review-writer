@@ -135,6 +135,53 @@ class ModelGatewayTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(diag["first_reasoning_ms"])
             self.assertNotIn("private thought", json.dumps(row.response_json))
 
+    async def test_output_limit_stream_is_not_accepted_as_complete_json(self):
+        from review_writer_api.model_gateway import GatewayProviderError
+        raw = ('data: {"choices":[{"delta":{"content":"{\\"question\\":\\"partial"},"finish_reason":"length"}]}\n\n'
+               'data: [DONE]\n\n')
+        async with httpx.AsyncClient(transport=httpx.MockTransport(lambda request:
+                httpx.Response(200, headers={"content-type": "text/event-stream"}, content=raw))) as client:
+            with mock.patch.object(self.service, "_provider_client", client):
+                with self.assertRaises(GatewayProviderError) as raised:
+                    await self.service._stream_text_response(
+                        "https://test.example/v1", {}, {}, str(uuid.uuid4()), "chat-completions", None)
+        self.assertEqual("output_limit", raised.exception.gateway_detail["details"]["category"])
+
+    async def test_reasoning_only_completion_has_specific_error_without_replay(self):
+        from review_writer_api.model_gateway import GatewayProviderError
+        from review_writer_api.errors import ConversationModelFailure
+        events = [{"choices": [{"delta": {"reasoning_content": "private thought"}}]},
+                  {"choices": [{"delta": {}, "finish_reason": "stop"}]}]
+        raw = ''.join('data: ' + json.dumps(e) + '\n\n' for e in events) + 'data: [DONE]\n\n'
+        calls = []
+        def provider(request):
+            calls.append(request)
+            return httpx.Response(200, headers={"content-type": "text/event-stream"}, content=raw)
+        tier = replace(resolve_model_tier(None, self.sessions), wire_api="chat-completions")
+        async with httpx.AsyncClient(transport=httpx.MockTransport(provider)) as client:
+            with mock.patch.object(self.service, "_provider_client", client), mock.patch.object(self.service, "_claims_model", return_value=tier):
+                with self.assertRaises(GatewayProviderError) as raised:
+                    await self.service.complete(self.token(), request_key="reasoning-only", stage="project-conversation-1", prompt="reply")
+        self.assertEqual(1, len(calls))
+        details = raised.exception.gateway_detail["details"]
+        self.assertEqual("reasoning_only", details["category"])
+        self.assertTrue(details["reasoning_only"])
+        self.assertEqual("stop", details["finish_reason"])
+        self.assertIn("仅返回推理内容", str(ConversationModelFailure.from_provider(raised.exception.gateway_detail)))
+        with database_session(self.sessions) as session:
+            row = session.scalar(select(AIModelRequest))
+            self.assertEqual("failed", row.status)
+            self.assertNotIn("private thought", json.dumps(row.response_json))
+
+    def test_legacy_empty_response_is_not_reported_as_provider_outage(self):
+        from review_writer_api.errors import ConversationModelFailure
+        from review_writer_core.provider_errors import normalize_provider_error
+        error = normalize_provider_error(502, "Model provider returned an empty response.")
+        self.assertEqual("empty_response", error["category"])
+        failure = ConversationModelFailure.from_provider({"details": {**error, "category": "transient"}})
+        self.assertIn("未返回有效回复", str(failure))
+        self.assertNotIn("服务暂时不可用", str(failure))
+
     async def test_overview_does_not_starve_reasoning_models_with_a_small_shared_budget(self):
         for wire, field in (("chat-completions", "max_tokens"), ("responses", "max_output_tokens")):
             captured = []
@@ -149,6 +196,22 @@ class ModelGatewayTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn(field, captured[0])
             self.assertNotIn(field, captured[1])
             self.assertNotIn("thinking", captured[0])
+
+    def test_only_current_review_can_delegate_draft_calls_and_reuse_durable_child(self) -> None:
+        with database_session(self.sessions) as session:
+            parent=session.get(WorkflowJob,self.job_id)
+            parent.job_type='draft.optimize'
+            parent.payload_json={**parent.payload_json,'revision_mode':'peer_review','flow_policy':'review-revision/2'}
+        token=self.service.issue_task_token(job_id=str(self.job_id),user_id=str(self.user_id),
+            project_id=str(self.project_id),job_type='draft.optimize')
+        kwargs={'request_key':'read-1','stage':'Review revision plan read-1','prompt':'Assigned objects only','response_format':'json'}
+        child=self.service.delegate_text(token,**kwargs)
+        self.assertEqual(child['model_job_id'],self.service.delegate_text(token,**kwargs)['model_job_id'])
+        with database_session(self.sessions) as session:
+            parent=session.get(WorkflowJob,self.job_id)
+            parent.payload_json={**parent.payload_json,'flow_policy':'focused-review/1'}
+        with self.assertRaises(GatewayRequestConflict):self.service.delegate_text(token,**kwargs)
+        with self.assertRaises(GatewayRequestConflict):self.service.delegated_text_status(token,request_key='read-1')
 
     def test_standalone_matrix_can_delegate_without_changing_the_parent_model(self) -> None:
         with database_session(self.sessions) as session:
@@ -280,7 +343,7 @@ class ModelGatewayTests(unittest.IsolatedAsyncioTestCase):
             counters = self.service._reserve_text_attempt(request_id, len(prompt))
             external_calls.append(prompt)
             return {**answer, "_gateway_metering": counters}
-        with mock.patch.object(self.service, "_provider_call", new=mock.AsyncMock(side_effect=provider_attempt)) as provider:
+        with mock.patch.object(self.service, "_provider_call", new=mock.AsyncMock(side_effect=provider_attempt)):
             for index, child_id in enumerate(children):
                 token = self.service.issue_task_token(
                     job_id=child_id, user_id=str(self.user_id),

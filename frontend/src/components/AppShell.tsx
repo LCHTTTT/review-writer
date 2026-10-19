@@ -1,9 +1,12 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
+import { apiRequest } from "../api/client";
+import { isStagePath, rememberStage, stageReturnPath } from "../features/conversation/modeNavigation";
 import { Link, NavLink, useLocation } from "react-router-dom";
 
 import type { AuthConfig, Principal } from "../api/types";
 import { UserMenu } from "./UserMenu";
-import { translate, type MessageKey } from "../i18n/messages";
+import { translate } from "../i18n/messages";
+import { workflowLinks } from "../workflow";
 import { usePreferences } from "../state/preferences";
 
 type AppShellProps = {
@@ -11,16 +14,6 @@ type AppShellProps = {
   identity: Principal;
   children: React.ReactNode;
 };
-
-const workflowLinks: Array<{ href: string; label: MessageKey; stage: string; hintZh: string; hintEn: string }> = [
-  { href: "/library", label: "library", stage: "01", hintZh: "文献准备", hintEn: "Sources" },
-  { href: "/discovery", label: "discovery", stage: "02", hintZh: "文献筛选", hintEn: "Literature screening" },
-  { href: "/planning?view=reading", label: "planning", stage: "03", hintZh: "文献与大纲", hintEn: "Papers & outline" },
-  { href: "/sections", label: "sections", stage: "04", hintZh: "规划与正文", hintEn: "Plan & drafts" },
-  { href: "/images?tab=review", label: "images", stage: "05", hintZh: "选图重绘", hintEn: "Figures" },
-  { href: "/draft", label: "draft", stage: "06", hintZh: "编辑优化", hintEn: "Revision" },
-  { href: "/final", label: "final", stage: "07", hintZh: "审计导出", hintEn: "Release" },
-];
 
 function withCurrentProject(href: string, search: string): string {
   const project = new URLSearchParams(search).get("project");
@@ -34,6 +27,19 @@ export function AppShell({ authConfig, identity, children }: AppShellProps) {
   const location = useLocation();
   const workflowNavRef = useRef<HTMLDivElement>(null);
   const language = usePreferences((state) => state.language);
+  const conversation = location.pathname === "/conversation";
+  const projectId = new URLSearchParams(location.search).get("project") || "";
+  const [conversationEnabled, setConversationEnabled] = useState(false);
+  useEffect(() => {
+    const controller = new AbortController();
+    void apiRequest<{ enabled: boolean }>("/api/v1/conversation/config", { signal: controller.signal })
+      .then(config => { if (!controller.signal.aborted) setConversationEnabled(config.enabled); })
+      .catch(() => { /* Optional conversation availability never blocks the existing shell. */ });
+    return () => controller.abort();
+  }, [identity.user_id]);
+  useEffect(() => {
+    if (isStagePath(location.pathname)) rememberStage(identity.user_id, projectId, `${location.pathname}${location.search}${location.hash}`);
+  }, [identity.user_id, projectId, location.pathname, location.search, location.hash]);
   useEffect(() => {
     document.documentElement.lang = language;
   }, [language]);
@@ -58,12 +64,18 @@ export function AppShell({ authConfig, identity, children }: AppShellProps) {
           </Link>
           <div className="top-actions">
             <Link className="button button-quiet topbar-home" to="/">{language === "en" ? "Home" : "首页"}</Link>
+            {(conversationEnabled && isStagePath(location.pathname)) || conversation ? <Link className="button button-quiet" to={conversation
+              ? stageReturnPath(identity.user_id, projectId)
+              : `/conversation${projectId ? `?project=${encodeURIComponent(projectId)}` : ""}`}>
+              {conversation ? (language === "en" ? "Stage mode" : "切换到阶段模式") : (language === "en" ? "Conversation mode" : "切换到对话模式")}
+            </Link> : null}
+            <Link className="button button-quiet topbar-guide" to={withCurrentProject("/guide", location.search)}>{language === "en" ? "Guide" : "使用指南"}</Link>
             <UserMenu identity={identity} authConfig={authConfig} />
           </div>
         </div>
       </header>
 
-      <nav className="workflow-nav" aria-label={language === "en" ? "Review workflow" : "综述工作流"}>
+      {!conversation ? <nav className="workflow-nav" aria-label={language === "en" ? "Review workflow" : "综述工作流"}>
         <div className="workflow-nav-inner" ref={workflowNavRef}>
           <NavLink to="/workspace" end className={({ isActive }) => (isActive ? "workflow-link workflow-home active" : "workflow-link workflow-home")}>
             <span className="workflow-link-index">00</span>
@@ -80,7 +92,7 @@ export function AppShell({ authConfig, identity, children }: AppShellProps) {
             </NavLink>
           ))}
         </div>
-      </nav>
+      </nav> : null}
 
       {children}
     </div>

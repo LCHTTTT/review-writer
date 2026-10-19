@@ -1074,6 +1074,44 @@ class FinalService(FinalFigureReviewMixin, FinalHistoryMixin, ArtifactBackedServ
             return " ".join(str(user.display_name or "").split()).strip() if user else ""
 
 
+    def publication_metadata(
+        self, principal: Principal, project_id: str
+    ) -> dict[str, Any]:
+        """Publication metadata for Draft-stage editing; approval is not required yet."""
+        principal.require(Permission.PROJECT_WRITE)
+        text, draft = self._read_text(principal, project_id, DRAFT_DOCUMENT)
+        value, artifact = self._read_json(principal, project_id, FINAL_FRONT_MATTER)
+        if artifact is None:
+            project = self.repository.get_owned_project(principal.user_id, project_id)
+            value = self._default_front_matter(
+                text,
+                fallback_title=project.topic if project is not None else "",
+                author_candidate=self._author_candidate(principal),
+                source_draft_artifact_id=draft.id if draft else "",
+            )
+        return {
+            "revision": self._revision(principal, project_id),
+            "front_matter_artifact_id": artifact.id if artifact else "",
+            "title": str(value.get("title") or ""),
+            "authors": [str(item) for item in value.get("authors") or []],
+            "affiliations": [str(item) for item in value.get("affiliations") or []],
+        }
+
+    def save_publication_metadata(
+        self, principal: Principal, project_id: str, *, revision: int,
+        authors: list[str], affiliations: list[str], changed_fields: set[str] | None = None,
+        expected_draft_artifact_id: str | None = None, expected_front_matter_artifact_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Draft-stage publication metadata; the Draft may not be approved yet."""
+        principal.require(Permission.PROJECT_WRITE)
+        _text, draft = self._read_text(principal, project_id, DRAFT_DOCUMENT)
+        if expected_draft_artifact_id is not None and (draft.id if draft else "") != expected_draft_artifact_id:
+            raise WorkflowConflict("Draft changed before publication metadata was edited.")
+        return self._write_publication_metadata(
+            principal, project_id, draft=draft, revision=revision,
+            authors=authors, affiliations=affiliations, omitted_fields=[], changed_fields=changed_fields,
+            expected_front_matter_artifact_id=expected_front_matter_artifact_id)
+
     def save_front_matter(
         self, principal: Principal, project_id: str, *, revision: int,
         authors: list[str], affiliations: list[str],
@@ -1082,11 +1120,33 @@ class FinalService(FinalFigureReviewMixin, FinalHistoryMixin, ArtifactBackedServ
         """Publication metadata only; legacy prose is retained for explicit Draft migration."""
         principal.require(Permission.PROJECT_WRITE)
         _text, draft, _approval = self._approved_draft(principal, project_id)
+        return self._write_publication_metadata(
+            principal, project_id, draft=draft, revision=revision,
+            authors=authors, affiliations=affiliations,
+            omitted_fields=list(omitted_fields or []))
+
+    def _write_publication_metadata(
+        self, principal: Principal, project_id: str, *, draft: ArtifactRecord | None,
+        revision: int, authors: list[str], affiliations: list[str],
+        omitted_fields: list[str], changed_fields: set[str] | None = None,
+        expected_front_matter_artifact_id: str | None = None,
+    ) -> dict[str, Any]:
         current_value, current = self._read_json(principal, project_id, FINAL_FRONT_MATTER)
+        if expected_front_matter_artifact_id is not None and (current.id if current else "") != expected_front_matter_artifact_id:
+            raise WorkflowConflict("Publication metadata changed before the field edit.")
+        if changed_fields is not None and (not changed_fields or changed_fields - {"authors", "affiliations"}):
+            raise WorkflowValidationError("Only specified publication fields may be changed.")
+        if changed_fields is not None and current is None:
+            text, _ = self._read_text(principal, project_id, DRAFT_DOCUMENT)
+            project = self._owned_project(principal, project_id)
+            current_value = self._default_front_matter(text, fallback_title=project.topic,
+                author_candidate=self._author_candidate(principal), source_draft_artifact_id=draft.id if draft else "")
         value = dict(current_value)
         states = dict(value.get("field_states") or {})
         for name, values in (("authors", authors), ("affiliations", affiliations)):
-            omitted = name in (omitted_fields or [])
+            if changed_fields is not None and name not in changed_fields:
+                continue
+            omitted = name in omitted_fields
             value[name] = [] if omitted else [" ".join(v.split()) for v in values if v.strip()]
             states[name] = "user_omitted" if omitted else "user_modified"
         if current and all(value.get(k) == current_value.get(k) for k in ("authors", "affiliations")) and states == current_value.get("field_states"):
@@ -1095,7 +1155,7 @@ class FinalService(FinalFigureReviewMixin, FinalHistoryMixin, ArtifactBackedServ
         published, state = self._publish_files(principal, project_id,
             {FINAL_FRONT_MATTER: ((json.dumps(value, ensure_ascii=False)+"\n").encode(), "json")},
             expected_revision=revision,
-            expected_current_artifacts={FINAL_FRONT_MATTER: current.id if current else "", DRAFT_DOCUMENT: draft.id},
+            expected_current_artifacts={FINAL_FRONT_MATTER: current.id if current else "", DRAFT_DOCUMENT: draft.id if draft else ""},
             metadata={"operation": "publication-metadata-edit"})
         return {"front_matter_artifact_id": published[FINAL_FRONT_MATTER].id, "revision": state.revision}
 
@@ -1574,7 +1634,7 @@ class FinalService(FinalFigureReviewMixin, FinalHistoryMixin, ArtifactBackedServ
             warning_issues.append("library_sources_unavailable")
         if missing_source_artifacts:
             warning_issues.append("library_source_artifacts_missing")
-        voice_issues = publication_voice_issues(body)
+        voice_issues = publication_voice_issues(body, paper_ids=normalized_sources)
         if voice_issues:
             warning_issues.append("publication_voice_leakage")
         figure_argument_findings = _figure_argument_findings(body)

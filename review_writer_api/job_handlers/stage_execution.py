@@ -8,11 +8,12 @@ from __future__ import annotations
 
 import re
 import logging
+import json
 from copy import deepcopy
 from collections.abc import Callable, Mapping
 
 from review_writer_api.domain_services.sections import SectionProviderUnavailable
-from review_writer_api.errors import WorkflowConflict, WorkflowValidationError
+from review_writer_api.errors import ModelTaskFailed, WorkflowConflict, WorkflowValidationError
 from review_writer_api.job_service import JobYieldRequested
 from review_writer_api.scientific_runner import ScientificRunError, ScientificModelDeferred, ScientificInsufficientCredit
 from review_writer_api.job_handlers.lifecycle import report_committed_progress
@@ -52,15 +53,18 @@ def wait_for_delegated_model(context, result: dict | None) -> None:
         raise WorkflowConflict("The delegated model task is unavailable.")
     if all(job.status in {"queued", "running"} for job in jobs):
         raise JobYieldRequested(delay_seconds=10, queue_reason="model_waiting")
-    # Parallel sections must consume each ready result independently. A failed
-    # child is surfaced by its own chapter; don't discard successful siblings.
+    # Parallel chapters/papers consume each ready result independently. A
+    # failed child is surfaced by its own item; retain successful siblings.
     if len(jobs) > 1:
         return
     model_job = jobs[0]
     if model_job.status != "succeeded":
         if model_job.error_code == "INSUFFICIENT_CREDIT":
             raise ScientificInsufficientCredit(attempts=1)
-        raise WorkflowConflict("The delegated model task did not finish. No model call was replayed automatically.")
+        raise ModelTaskFailed(
+            model_job.error_message or "模型任务未完成。已完成内容已保留，系统没有自动重发模型请求。",
+            code=model_job.error_code or "MODEL_TASK_FAILED",
+        )
 
 
 def yield_to_delegated_model(context, exc: ScientificModelDeferred) -> None:
@@ -104,6 +108,7 @@ def section_retry_checkpoints(context) -> tuple[dict | None, dict | None]:
         if isinstance(source_checkpoint, dict):
             if checkpoint is None:
                 checkpoint = deepcopy(source_checkpoint)
+                prepare_failed_audit_retry(context, source_job, checkpoint)
             invalidated_sections.update(
                 str(section_id)
                 for section_id in (
@@ -150,6 +155,37 @@ def section_retry_checkpoints(context) -> tuple[dict | None, dict | None]:
         # their sections in the deferred set. Completed chapters remain reusable.
         checkpoint["failed_sections"] = []
     return checkpoint, fact_repair_checkpoint
+
+
+def prepare_failed_audit_retry(context, source_job, checkpoint):
+    """Only an explicit retry may replace a terminal legacy audit with batches.
+
+    Live/unknown-running requests retain their exact historical prompt. Never
+    clear writing, accepted claims or completed chapters, or change the old job.
+    """
+    if not context.retry_of_job_id or getattr(source_job, "status", "") != "failed":
+        return
+    result = source_job.result or {}
+    ids = result.get("waiting_model_job_ids") or ([result["waiting_model_job_id"]] if result.get("waiting_model_job_id") else [])
+    for identifier in ids:
+        child = context.repository.get_job(context.user_id, identifier)
+        if (child is None or child.project_id != context.project_id or child.status != "failed"
+                or child.job_type != "model.dispatch" or child.payload.get("parent_job_id") != source_job.id
+                or child.payload.get("stage") != "section-used-claim-check"):
+            continue
+        prompt = child.payload.get("prompt") or ""
+        try:
+            data = json.JSONDecoder().raw_decode(prompt[prompt.index('{"claims":'):])[0]
+        except (ValueError, TypeError):
+            continue  # Unsupported historical shape: preserve its original request.
+        paragraphs = {c.get("paragraph_id") for c in data.get("claims", []) if isinstance(c, dict)}
+        for section_id, record in (checkpoint.get("authoring_states") or {}).items():
+            state = record.get("state") or {}
+            if (state.get("audit_pending") and "source_audit_requests" not in state and paragraphs
+                    and all(isinstance(pid, str) and pid.startswith(section_id + "-p") for pid in paragraphs)
+                    and isinstance(data.get("allow_style_repair"), bool)):
+                state.pop("audit_pending", None)
+                state["source_audit_allow_style_repair"] = data["allow_style_repair"]
 
 
 def _yield_incomplete_matrix_batch(context, payload, built):
@@ -205,6 +241,7 @@ def register_planning_handlers(planning_service, job_service, handlers: Mapping[
             if integration.get("enabled") and enrichment_builder is not None:
                 fact_payload = planning_service.matrix_enrichment_payload(
                     principal, str(context.project_id),
+                    reading_strategy=payload.get("reading_strategy"),
                     classification_contract_override=selected_formal_classification_contract(
                         payload.get("outline_snapshot")
                     ),
@@ -274,6 +311,12 @@ def register_planning_handlers(planning_service, job_service, handlers: Mapping[
                                     source["planning_source_passages"]
                                 )
                         payload["planning_matrix_snapshot"] = planning_matrix
+                        if payload.get("reading_strategy"):
+                            # New reading candidates can reference passages that
+                            # did not exist in the earlier planning projection.
+                            # Resolve them into a new model-only snapshot.
+                            payload["planning_matrix_snapshot"] = planning_service.planning_matrix_with_sources(
+                                principal, candidate["matrix_snapshot"], reading_strategy=payload["reading_strategy"])
                         fact_result = {
                             "status": "completed",
                             "mode": integration.get("mode"),
@@ -373,6 +416,7 @@ def register_planning_handlers(planning_service, job_service, handlers: Mapping[
                     source_matrix_artifact_id=expected_artifact_id) if payload.get("operation") == "fact_revision"
                     else planning_service.matrix_enrichment_payload(principal, str(context.project_id),
                         force=bool(request.get("force_refresh")),
+                        reading_strategy=request.get("reading_strategy"),
                         selected_paper_ids=request.get("selected_paper_ids") or None))
                 if (
                     expected_artifact_id
@@ -513,13 +557,17 @@ def register_sections_handler(sections_service, job_service, handlers: Mapping[s
                 else payload
             )
             try:
-                result = sections_service.publish_generation(
-                    principal,
-                    str(context.project_id),
-                    publication_payload,
-                    built,
-                    attempts=1,
-                )
+                if payload.get("_rewrite_scope"):
+                    from review_writer_api.domain_services.section_rewrites import SectionRewrites
+                    result = SectionRewrites(sections_service).publish_candidate(principal, str(context.project_id), publication_payload, built)
+                else:
+                    result = sections_service.publish_generation(
+                        principal,
+                        str(context.project_id),
+                        publication_payload,
+                        built,
+                        attempts=1,
+                    )
             except WorkflowValidationError as exc:
                 # Publication is a final safety net, not a reason to retain a
                 # known-invalid "completed" entry and replay the same failure.

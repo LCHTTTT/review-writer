@@ -31,8 +31,15 @@ def job_payload(job: JobRecord) -> dict[str, Any]:
     actions = []
     if job.status in {"queued", "running", "cancel_requested"}:
         actions.append("cancel")
-    if job.status in JobService.RETRYABLE_STATUSES:
+    uncertain_action = job.job_type == "conversation.action" and any((job.result or {}).get(key) for key in ("execution_started", "execution_completed"))
+    from review_writer_core.review_revision import POLICY as REVIEW_POLICY
+    retired_review = job.payload.get('revision_mode') == 'peer_review' and job.payload.get('flow_policy') != REVIEW_POLICY
+    if job.status in JobService.RETRYABLE_STATUSES and not uncertain_action and not retired_review:
         actions.append("retry")
+    result = job.result
+    if job.payload.get('revision_mode') == 'peer_review':
+        from review_writer_core.review_revision_public import review_result
+        result = review_result(job.result, job.payload)
     return {
         "id": job.id,
         "project_id": job.project_id,
@@ -43,7 +50,8 @@ def job_payload(job: JobRecord) -> dict[str, Any]:
         if job.status == "queued" and job.next_run_at else None,
         "queue_reason": job.queue_reason if job.status == "queued" else "",
         "job_type": job.job_type,
-        "result": job.result,
+        "result": ({key: job.result[key] for key in ("reply", "tool_events", "artifact_ids", "scope", "actions", "executions", "interrupted_by", "project_proposal", "bound_project_id", "activity")
+                    if key in job.result} if job.job_type in {"conversation.turn", "conversation.prepare"} else result),
         "progress_current": job.progress_current,
         "progress_total": job.progress_total,
         "cancellation_requested": job.cancellation_requested,
@@ -172,6 +180,7 @@ class JobService:
         self.shutdown_grace_seconds = max(0.0, float(shutdown_grace_seconds))
         self.execution_enabled = bool(execution_enabled)
         self._handlers: dict[str, JobHandler] = {}
+        self._retry_validators = {}
         self._executor: DaemonWorkerPool | None = None
         self._futures: dict[str, Future] = {}
         self._delayed_timers: dict[str, threading.Timer] = {}
@@ -199,6 +208,10 @@ class JobService:
 
         with self._lock:
             return dict(self._handlers)
+
+    def register_retry_validator(self, job_type, validator):
+        """Reuse stage input checks before creating a retry, including non-HTTP callers."""
+        self._retry_validators[job_type] = validator
 
     def start(self) -> int:
         with self._lock:
@@ -273,6 +286,8 @@ class JobService:
                     "Retry source does not belong to the same workflow operation."
                 )
         self.start()
+        from review_writer_api.submission_context import submission_model_source
+        model_source = submission_model_source()
         job = self.repository.create_or_get_job(
             principal.user_id,
             project_id,
@@ -282,6 +297,7 @@ class JobService:
             dict(payload or {}),
             retry_of_job_id=retry_source.id if retry_source else None,
             operation_key=operation_key,
+            **({"model_snapshot_source_job_id": model_source} if model_source else {}),
         )
         if job.status == "queued":
             self._schedule(job)
@@ -301,14 +317,31 @@ class JobService:
             raise WorkflowNotFound("Job not found.")
         return job
 
-    def retry_interrupted(self, principal: Principal, job_id: str) -> JobRecord:
+    def retry_interrupted(self, principal: Principal, job_id: str, *, idempotency_key: str | None = None) -> JobRecord:
         principal.require(Permission.PROJECT_WRITE)
         source = self.status(principal, job_id)
+        if source.job_type == "conversation.action" and any((source.result or {}).get(key) for key in ("execution_started", "execution_completed")):
+            raise WorkflowConflict("请核对这个操作的实际成果与任务；无法安全重放可能已提交的保存或收费操作。")
+        if source.payload.get('revision_mode') == 'peer_review':
+            from review_writer_core.review_revision import POLICY
+            if source.payload.get('flow_policy') != POLICY:
+                raise WorkflowValidationError('旧审稿任务已停用，历史报告保留。请从当前初稿启动审稿式修订。')
         if source.job_type == "model.dispatch":
             raise WorkflowValidationError("Retry the parent writing task, not its internal model call.")
         if (source.job_type in {"draft.evaluate", "draft.optimize", "draft.rewrite", "draft.accept-rewrite"}
-                and source.payload.get("revision_mode") not in {"dialogue", "dialogue_batch"}):
+                and source.payload.get("revision_mode") not in {"dialogue", "dialogue_batch", "peer_review"}):
             raise WorkflowValidationError("Scored Draft jobs were retired. Open Draft to start paragraph dialogue or batch analysis.")
+        validator = self._retry_validators.get(source.job_type)
+        if validator is not None and source.project_id:
+            try:
+                validator(principal, source)
+            except WorkflowConflict as exc:
+                if exc.details.get("current_outputs_available"):
+                    raise
+                raise WorkflowConflict(
+                    "Workflow inputs changed. Start a new task with current inputs.",
+                    details={**exc.details, "retry_inputs_stale": True, "job_id": source.id},
+                ) from exc
         if source.status not in self.RETRYABLE_STATUSES:
             raise WorkflowConflict(
                 "Only failed, interrupted, or cancelled jobs can be retried.",
@@ -331,7 +364,7 @@ class JobService:
             source.project_id,
             source.scope,
             source.job_type,
-            f"retry:{source.id}:{uuid.uuid4()}",
+            f"retry:{source.id}:{idempotency_key or uuid.uuid4()}",
             source.payload,
             retry_of_job_id=source.id,
             operation_key=operation_key,
@@ -372,7 +405,7 @@ class JobService:
             self._futures.pop(job.id, None)
         if not self._shutdown_event.is_set():
             latest = self.repository.get_job(job.user_id, job.id)
-            planning_job = job.job_type in {"matrix.enrich", "planning.blueprint"}
+            planning_job = job.job_type in {"matrix.enrich", "planning.blueprint", "conversation.turn", "conversation.prepare"}
             if latest and latest.status == "queued" and (not planning_job or not self.repository.planning_job_blocked(latest.id)):
                 self._schedule(latest)
             elif latest and latest.status != "queued" and planning_job and job.project_id:
@@ -383,8 +416,12 @@ class JobService:
                 except WorkflowNotFound:
                     return  # Project deletion already cancels its queued jobs.
                 for queued in pending:
-                    if (queued.status == "queued" and queued.job_type in {"matrix.enrich", "planning.blueprint"}
+                    if (queued.status == "queued" and queued.job_type in {"matrix.enrich", "planning.blueprint", "conversation.turn", "conversation.prepare"}
                             and not self.repository.planning_job_blocked(queued.id)):
+                        self._schedule(queued)
+            elif latest and latest.status != "queued" and job.job_type == "conversation.prepare":
+                for queued in self.repository.list_queued_jobs({"conversation.prepare"}):
+                    if queued.user_id == job.user_id and not self.repository.planning_job_blocked(queued.id):
                         self._schedule(queued)
 
     def _execute(self, job_id: str) -> None:

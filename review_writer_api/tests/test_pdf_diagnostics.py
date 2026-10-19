@@ -66,3 +66,23 @@ class PdfDiagnosticTests(unittest.TestCase):
         with self.assertRaises(WorkflowValidationError) as caught:
             FinalJobHandlers._raise_pdf_renderer_http_error(error)
         self.assertNotIn('invalid character', str(caught.exception))
+
+    def test_table_error_keeps_safe_compiler_diagnostics_without_source_or_paths(self):
+        detail = ('PDF compilation failed:\n/private/workspace/manuscript.tex:643: '
+                  'Missing number, treated as zero.\n<to be read again> P\n'
+                  'l.643 \\end{tabularx}\nprivate manuscript text')
+        error = HTTPError('http://renderer', 422, '', {}, io.BytesIO(json.dumps({'detail': detail}).encode()))
+        with self.assertRaises(WorkflowValidationError) as caught:
+            FinalJobHandlers._raise_pdf_renderer_http_error(error)
+        self.assertIn('PDF table formatting failed', str(caught.exception))
+        self.assertEqual('Missing number, treated as zero.', caught.exception.details['compiler_error'])
+        self.assertEqual(643, caught.exception.details['tex_line'])
+        self.assertNotIn('/private', json.dumps(caught.exception.details))
+        self.assertNotIn('private manuscript', json.dumps(caught.exception.details))
+
+    def test_non_table_compiler_error_is_not_mislabeled(self):
+        error = HTTPError('http://renderer', 422, '', {}, io.BytesIO(b'{"detail":"! Undefined control sequence.\\n"}'))
+        with self.assertRaises(WorkflowValidationError) as caught:
+            FinalJobHandlers._raise_pdf_renderer_http_error(error)
+        self.assertEqual('Undefined control sequence.', caught.exception.details['compiler_error'])
+        self.assertNotIn('table formatting', str(caught.exception))

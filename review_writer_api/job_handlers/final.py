@@ -394,15 +394,32 @@ class FinalJobHandlers:
             if blocking_checks
             else ""
         )
+        compiler_errors = re.findall(
+            r"(?:^!\s+|\.tex:\d+:\s*)([^\r\n]+)",
+            renderer_detail,
+            flags=re.MULTILINE,
+        )
+        compiler_line = re.search(r"\.tex:(\d+):", renderer_detail)
+        details = {"renderer_status": 422, "blocking_checks": blocking_checks}
+        if compiler_errors:
+            # Retain the actual error, not raw logs containing manuscript text
+            # or private workspace paths. Keep the public message actionable.
+            details["compiler_error"] = re.sub(
+                r"[\x00-\x1f\x7f]", " ", compiler_errors[0]
+            )[:240]
+        if compiler_line:
+            details["tex_line"] = int(compiler_line.group(1))
         if "Text line contains an invalid character" in renderer_detail:
             message = "PDF compilation failed: an invalid character was rejected. See the source locations in this task's PDF diagnostics; no automatic character repair was applied."
         elif blocking_checks:
             message = "PDF publication checks failed." + check_suffix
+        elif "Missing number, treated as zero" in renderer_detail and "end{tabular" in renderer_detail:
+            message = "PDF table formatting failed during compilation. Your Final manuscript is preserved; contact the administrator to fix the PDF renderer, then retry PDF export. Regenerating the manuscript is not required."
         else:
             message = "PDF rendering failed. The renderer rejected an input or compilation failed; this does not necessarily require regenerating the Final manuscript."
         raise WorkflowValidationError(
             message,
-            details={"renderer_status": 422, "blocking_checks": blocking_checks},
+            details=details,
         ) from exc
 
     def _extract_pdf_bundle(self, archive_bytes, bundle):

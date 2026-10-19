@@ -205,7 +205,7 @@ def test_publication_table_uses_only_facts_bound_to_current_claims():
     assert "P1-method_conditions-E1" not in table.split('"selected_fact_ids":', 1)[1].split(']', 1)[0]
 
 
-def test_publication_table_prefers_structured_qualifiers_over_long_prose():
+def test_publication_table_preserves_qualifiers_and_long_scientific_text():
     index, rows = _comparison_fixture()
     for paper in ("P1", "P2"):
         fact = rows[paper]["scientific_facts"][1]
@@ -224,7 +224,7 @@ def test_publication_table_prefers_structured_qualifiers_over_long_prose():
         index["sections"][0], rows, {"P1": 1, "P2": 2}, table_number=1
     )
 
-    assert "long procedural description" not in table
+    assert "long procedural description" in table
     assert "catalyst: 20 mol%; toluene; T 130 °C; time 12 h" in table
 
 

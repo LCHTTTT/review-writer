@@ -920,8 +920,12 @@ class FiguresService(ArtifactBackedService):
         figure_type: str,
         retry_of_job_id: str | None = None,
         origin: str = "batch",
+        edit_instructions: str = "",
+        palette: str = "",
     ) -> dict[str, Any]:
         principal.require(Permission.PROJECT_WRITE)
+        if not isinstance(edit_instructions, str) or len(edit_instructions) > 4000 or palette not in {"", "monochrome", "source"}:
+            raise WorkflowValidationError("Invalid image edit instructions or palette.")
         figures, inputs_artifact = self._selected_inputs(principal, project_id)
         available = {str(row.get("figure_id") or ""): row for row in figures}
         requested = list(dict.fromkeys(str(item).strip() for item in figure_ids if str(item).strip()))
@@ -997,6 +1001,7 @@ class FiguresService(ArtifactBackedService):
             "source_inputs_artifact_id": inputs_artifact.id,
             "figure_ids": requested,
             "figure_type": str(figure_type or "auto"),
+            **({"edit_instructions": edit_instructions, "palette": palette} if edit_instructions or palette else {}),
             "origin": "single" if origin == "single" else "batch",
             "baseline_output_artifact_ids": baseline_outputs,
         }

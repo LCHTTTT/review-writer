@@ -54,7 +54,40 @@ LEAK_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 )
 
 
-def publication_voice_issues(markdown: str) -> list[dict[str, Any]]:
+def _paper_id_matches(text, paper_ids, source_quotes):
+    """Recognize registered paper labels, never rewrite text or guess an owner.
+
+    Short labels require a unique registered prefix. Source-native identifiers
+    and quoted/code text are not publication aliases merely because they look
+    like a paper ID. Ambiguous prefixes remain untouched.
+    """
+    registered = {str(value) for value in paper_ids if re.fullmatch(r"P\d{3,}", str(value))}
+    if not registered:
+        return
+    protected_labels = {match.group() for quote in source_quotes
+                        for match in re.finditer(r"\bP\d{3,}\b", str(quote))}
+    visible = _PROTECTED.sub(lambda m: " " * len(m.group()), str(text or ""))
+    for match in re.finditer(r"\bP\d{3,}\b", visible):
+        token = match.group()
+        matches = [token] if token in registered else [value for value in registered if value.startswith(token)]
+        if len(matches) == 1 and token not in protected_labels:
+            yield match, matches[0]
+
+
+def paper_id_mentions(text: str, paper_ids, *, source_quotes=()) -> list[dict[str, str]]:
+    return [{"phrase": match.group(), "paper_id": paper_id}
+            for match, paper_id in _paper_id_matches(text, paper_ids, source_quotes)]
+
+
+def without_internal_paper_labels(text: str, paper_ids, *, source_quotes=()) -> str:
+    """Transient validation input, never publication rendering or a saved rewrite."""
+    result = str(text or "")
+    for match, _ in reversed(list(_paper_id_matches(result, paper_ids, source_quotes))):
+        result = result[:match.start()] + " " * len(match.group()) + result[match.end():]
+    return result
+
+
+def publication_voice_issues(markdown: str, *, paper_ids=()) -> list[dict[str, Any]]:
     """Return prose leaks while ignoring references, comments, code and quotes."""
 
     body = str(markdown or "")
@@ -78,4 +111,7 @@ def publication_voice_issues(markdown: str) -> list[dict[str, Any]]:
                         "context": line[:500],
                     }
                 )
+        for mention in paper_id_mentions(line, paper_ids):
+            issues.append({"code": "internal_paper_identifier", "line": line_number,
+                           **mention, "context": line[:500]})
     return issues
