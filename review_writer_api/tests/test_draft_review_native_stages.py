@@ -6,7 +6,7 @@ import pytest
 from review_writer_api.job_handlers.draft import DraftJobHandlers
 
 
-@pytest.mark.parametrize('stage',['prepare','validate_sources','plan','plan_slice','coordinate'])
+@pytest.mark.parametrize('stage',['prepare','validate_sources','plan','plan_slice','coordinate','recoordinate'])
 def test_native_evidence_stages_skip_gateway_configuration(tmp_path,stage):
     handler=DraftJobHandlers();handler.root=Path(__file__).resolve().parents[2]
     project=tmp_path/'projects'/'isolated';first=project/'04_first_draft';first.mkdir(parents=True)
@@ -15,7 +15,7 @@ def test_native_evidence_stages_skip_gateway_configuration(tmp_path,stage):
     configured=[];runs=[]
     def gateway(context):
         configured.append(True)
-        assert stage in ('plan','plan_slice','coordinate'),'A local-only evidence stage requested model configuration'
+        assert stage in ('plan','plan_slice','coordinate','recoordinate'),'A local-only evidence stage requested model configuration'
         return {'MODEL_TEST':'local-fixture'},{}
     handler._text_gateway_environment=gateway
     def run(command,**kwargs):
@@ -26,7 +26,7 @@ def test_native_evidence_stages_skip_gateway_configuration(tmp_path,stage):
     result=handler.draft_rewrite(SimpleNamespace(cancellation_requested=lambda:False),{
         'revision_mode':'dialogue','draft_text':'Saved manuscript','dialogue':{'review_revision':{'stage':stage}}})
     assert result=={'stage':stage}
-    assert len(configured)==(1 if stage in ('plan','plan_slice','coordinate') else 0)
+    assert len(configured)==(1 if stage in ('plan','plan_slice','coordinate','recoordinate') else 0)
     assert runs[0]['max_attempts']==1
 
 

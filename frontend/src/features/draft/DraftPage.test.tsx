@@ -136,9 +136,9 @@ it("starts with the manuscript and opens optional tools without a numbered wizar
   const readerToolbar = screen.getByRole("button", { name: "Hide contents" }).closest(".draft-reader-toolbar")!;
   expect(within(readerToolbar as HTMLElement).getByRole("group", { name: "Complete manuscript" })).toBeVisible();
   expect(document.querySelector(".draft-document-tools")).toBeNull();
-  expect(screen.queryByRole("button", { name: "Review and revise manuscript" })).toBeNull();
+  expect(screen.queryByRole("button", { name: "Review and generate revision candidates" })).toBeNull();
   fireEvent.click(within(nav).getByRole("button", { name: "Review-style revision" }));
-  expect(screen.getByRole("button", { name: "Review and revise manuscript" })).toBeEnabled();
+  expect(screen.getByRole("button", { name: "Review and generate revision candidates" })).toBeEnabled();
   fireEvent.click(within(nav).getByRole("button", { name: "Manuscript" }));
   fireEvent.click(screen.getByRole("button", { name: "Discuss current chapter" }));
   expect(await screen.findByRole("button", { name: "Chapter versions" })).toBeTruthy();
@@ -212,7 +212,7 @@ it("groups batch actions and suggestions without duplicating the full manuscript
   });
   mount("/draft?project=p&tab=batch");
   expect(await screen.findByRole("heading", { name: "Review-style revision", level: 2 })).toBeVisible();
-  expect(screen.getByRole("button", { name: "Review and revise manuscript" })).toBeEnabled();
+  expect(screen.getByRole("button", { name: "Review and generate revision candidates" })).toBeEnabled();
   expect(screen.getByRole("region", { name: "Revision suggestions" })).toBeVisible();
   expect(screen.queryByText("Preview combined paragraphs (not saved)")).toBeNull();
   fireEvent.click(screen.getByRole("checkbox", { name: "Select" }));
@@ -285,7 +285,7 @@ it("late batch submission does not pull the user away from another column", asyn
     ? new Promise(resolve => { finish = resolve; }) : original(path, init));
   mount();
   fireEvent.click(await screen.findByRole("button", { name: "Review-style revision" }));
-  fireEvent.click(await screen.findByRole("button", { name: "Review and revise manuscript" }));
+  fireEvent.click(await screen.findByRole("button", { name: "Review and generate revision candidates" }));
   await waitFor(() => expect(finish).toBeDefined());
   fireEvent.click(screen.getByRole("button", { name: "Manuscript" }));
   await act(async () => { finish({ id: "batch" }); });

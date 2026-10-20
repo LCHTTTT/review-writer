@@ -345,7 +345,10 @@ class DraftsV1Tests(NativeFigureApiTestCase):
             headers=self.headers("draft-assemble"),
         )
         self.assertEqual(200, assembled.status_code, assembled.text)
-        return assembled.json()
+        body = assembled.json()
+        if body.get("synthesis_job_id"):
+            self.wait_job(client, body["synthesis_job_id"])
+        return body
 
     def test_evaluation_snapshot_tracks_blueprint_and_figures_and_rejects_stale_sections(self):
         from review_writer_core.workflow.artifacts import BLUEPRINT, FIGURE_MANIFEST

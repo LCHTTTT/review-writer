@@ -198,6 +198,9 @@ def register_draft_handlers(drafts_service, job_service, handlers, planning_serv
                 from review_writer_api.job_handlers.lifecycle import report_committed_progress
                 report_committed_progress(context, 3, 3)
                 return result
+            if payload.get('revision_mode') == 'peer_review_recommendation':
+                from review_writer_api.job_handlers.draft_review import run_review
+                return run_review(drafts_service,available['draft.rewrite'],context,payload,planning=planning_service)
             if payload.get("revision_mode") == "peer_review":
                 from review_writer_api.job_handlers.draft_review import run_review
                 return run_review(drafts_service, available["draft.rewrite"], context, payload, planning=planning_service)

@@ -221,7 +221,8 @@ class WorkflowRepository:
         )
 
     @staticmethod
-    def _job_record(job: WorkflowJob, *, include_payload: bool = True) -> JobRecord:
+    def _job_record(job: WorkflowJob, *, include_payload: bool = True,
+                    include_result: bool = True) -> JobRecord:
         """Map one job row.
 
         ``include_payload=False`` is for polling views that read only status and
@@ -241,7 +242,7 @@ class WorkflowRepository:
             idempotency_scope_key=job.idempotency_scope_key,
             idempotency_key=job.idempotency_key,
             payload=dict(job.payload_json or {}) if include_payload else {},
-            result=dict(job.result_json or {}),
+            result=dict(job.result_json or {}) if include_result else {},
             progress_current=job.progress_current,
             progress_total=job.progress_total,
             cancellation_requested=job.cancellation_requested,
@@ -1579,6 +1580,7 @@ class WorkflowRepository:
         operation_key: str = "",
         idempotency_key: str = "",
         include_payload: bool = True,
+        include_result: bool = True,
     ) -> list[JobRecord]:
         user_uuid = self._uuid(user_id, not_found_message="Project not found.")
         project_uuid = self._uuid(project_id, not_found_message="Project not found.")
@@ -1598,13 +1600,16 @@ class WorkflowRepository:
             if not include_payload:
                 # Skip the column entirely instead of loading and discarding it.
                 statement = statement.options(defer(WorkflowJob.payload_json))
+            if not include_result:
+                statement = statement.options(defer(WorkflowJob.result_json))
             rows = session.scalars(
                 statement.order_by(WorkflowJob.created_at.desc()).limit(
                     max(1, min(int(limit), 500))
                 )
             ).all()
             return [
-                self._job_record(row, include_payload=include_payload) for row in rows
+                self._job_record(row, include_payload=include_payload,
+                                 include_result=include_result) for row in rows
             ]
 
     def list_library_jobs(

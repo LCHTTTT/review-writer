@@ -1,9 +1,11 @@
 """Native review revision stages, sharing one immutable original-source board."""
+import hashlib
 import re
 import json
+from pathlib import Path
 from review_writer_core.review_revision_document import digest, plan_object_aliases
 from review_writer_core.review_revision import call_json, CATEGORY_LABELS, MAX_GROUPS
-from review_writer_core.review_revision_schedule import article_overview
+from review_writer_core.review_revision_schedule import article_overview, author_pdf_write_scope
 from review_writer_core.review_source_context import contextual_review_evidence, bibliography_context
 
 
@@ -15,7 +17,15 @@ def prepare_board(project, snapshot, loop):
         doc=loop.load_original_source(project.parent.parent,pid,loop.metadata_record(project.parent.parent,pid))
         blocks=[{'ref':f'{pid}:b{n+1}','paper_id':pid,'page':b.get('page'),'text':str(b.get('text') or '')}
                 for n,b in enumerate(doc.get('blocks') or []) if str(b.get('text') or '').strip()]
+        source_kind=str(doc.get('source_kind') or '')
+        source_sha256=''
+        if source_kind!='unavailable' and doc.get('source_path'):
+            try:
+                source_sha256=hashlib.sha256(Path(str(doc['source_path'])).read_bytes()).hexdigest()
+            except OSError:
+                source_sha256=''
         papers[pid]={'paper_id':pid,'title':str(row.get('title') or ''),'available':bool(blocks),
+                     'source_kind':source_kind,'source_sha256':source_sha256,
                      'source_hash':digest(doc.get('blocks') or []),'blocks':blocks}
     for block in snapshot['blocks']:
         pmeta=metadata.get(block['block_id'].removeprefix('paragraph:'),{})
@@ -112,7 +122,13 @@ def execute(project, request, loop):
     common={'standard':request.get('standard',''),'guidance_unverified':request.get('guidance',''),
             'evidence_board_hash':board['hash'],'citation_map':board.get('citation_map',{})}
     if stage in ('propose','audit'):
-        common['actual_bibliography']=bibliography_context(snapshot['text'])
+        read_ids=(request['task'].get('read_ids',[]) if stage=='propose'
+            else request['group'].get('read_ids',[]))
+        if any(block['kind']=='reference' for block in snapshot['blocks']
+               if block['block_id'] in read_ids):
+            # The full reference section is only relevant when the task actually
+            # edits or verifies a reference object; body-only groups stay lean.
+            common['actual_bibliography']=bibliography_context(snapshot['text'])
     if stage=='plan':
         return call_json(model_call,'plan'+(' '+request['label_suffix'] if request.get('label_suffix') else ''),{**common,'manuscript':snapshot['text'],
             **({'article_overview':request['overview']} if request.get('overview') else {}),
@@ -135,6 +151,26 @@ def execute(project, request, loop):
             'read_ids must include every actual supporting/comparison object. All write_ids must be included in read_ids. '
             'Do not yet claim findings verified. Choose relevant existing papers from the index for original checks. '
             'Missing sources or major author decisions go to explicit limitations; do not invent an executable fix.')
+    if stage=='recoordinate':
+        original=request['original_task'];checks=request['confirmed_pdf_checks']
+        fields={b['block_id']:b for b in snapshot['blocks']}
+        ids=author_pdf_write_scope(snapshot,board,original,checks)
+        overview=article_overview(snapshot)
+        context=[fields[bid] for bid in ids if bid in fields]
+        context.sort(key=lambda b:b['start'])
+        return call_json(model_call,'recoordinate',{**common,'original_task':original,
+            'author_pdf_checks':checks,'objects':context,
+            'previous_composition_feedback':request.get('previous_composition_feedback',[]),
+            'article_overview':overview},
+            'The author, not you, read the original PDF and transcribed the text. Do NOT claim you visually read the PDF. '
+            'Plan one coordinated atomic revision for this unresolved root cause. Account for all affected manuscript objects '
+            '(body, abstract/conclusion, figure/table captions, table cells, relevant references) provided here. '
+            'Check chemical identities using the author transcription as AUTHOR-ATTESTED, not independently verified PDF bytes. '
+            'You may include additional writable object_ids ONLY from objects; every original write_id must remain writable. '
+            'Return {summary,tasks:[{category,problem,strategy,read_ids:[],write_ids:[],paper_ids:[]}],limitations:[]}; '
+            'exactly ONE task, containing all affected objects as a single atomic group. '
+            'For missing original evidence, add a limitation, never invent an answer. '
+            'Do not output replacement prose yet; an independent audit and full composition check follow.')
     if stage=='coordinate':
         return call_json(model_call,'coordinate',{**common,'article_overview':article_overview(snapshot),
             'objects':[{k:b[k] for k in ('block_id','kind')} for b in snapshot['blocks']],
@@ -153,15 +189,30 @@ def execute(project, request, loop):
             'Use supplied object IDs only. Keep explanations concise; no replacement text or copied evidence.')
     if stage=='propose':
         task=request['task']; sources=select_sources(task,board,snapshot,loop,request.get('feedback'))
+        for check in request.get('confirmed_pdf_checks',[]):
+            if check['id'] in task.get('pdf_check_ids',[]) and check['paper_id'] in board['papers']:
+                sources.append({'ref':'author-pdf:'+check['id'],'paper_id':check['paper_id'],
+                    'page':check['page'],'text':check['transcription'],
+                    'title':board['papers'][check['paper_id']]['title'],
+                    'source_hash':check['pdf_sha256'],'origin':'author_inspected_original_pdf',
+                    'note':check['note']})
         rows={b['block_id']:b for b in snapshot['blocks']}
+        guess=bool(request.get('suggest_pdf_quote'))
         value=call_json(model_call,'propose',{**common,'task':task,
             'objects':[rows[bid] for bid in task['read_ids']],'original_sources':sources,
+            'suggest_pdf_quote_unverified':guess,'suggest_paper_id':request.get('suggest_paper_id',''),
             'feedback':request.get('feedback'), 'previous_candidate':request.get('previous_candidate')},
-            'Independently test the proposed diagnosis; do not implement a false finding. Return '
+            ('If suggest_pdf_quote_unverified, propose a SHORT exact expression that MAY occur in the original PDF, '
+             'also present verbatim in a changed after text; return pdf_quote_guess:"...". This is a GUESS from parsed '
+             'material/inference, NOT proof of the PDF. The human must compare the original PDF and may reject it. '
+             'If uncertain, return blocked with no patches, never assert you visually read the PDF. ' if guess else '')
+            +'Independently test the proposed diagnosis; do not implement a false finding. Return '
             '{explanation,disposition:"revised"|"not_needed"|"blocked",patches:[{block_id,before_sha256,after,basis:"source"|"manuscript",'
             'operation:"correct"|"narrow"|"qualify"|"editorial",source_refs:[],support_ids:[]}],limitation}. '
             'Deliver complete replacement text for each affected object, not advice. Only write write_ids. '
-            'For science corrections use actual source refs. Manuscript-only edits may narrow/qualify/organize '
+            'For science corrections use actual source refs; use basis:"author_pdf" ONLY with an author-pdf: ref '
+            'when the author transcribed a page of the owned original PDF. This is a HUMAN attestation, not your '
+            'independent visual inspection; never claim to have viewed the PDF. Manuscript-only edits may narrow/qualify/organize '
             'with explicit support_ids but cannot invent scientific facts, new numerical values or pretend original verification. '
             'For figures return image and caption with URLs/numbering/rights unchanged; fix caption/alt only. '
             'For tables preserve valid Markdown and supported rows; for bibliography preserve the bound reference number. '
@@ -185,6 +236,8 @@ def execute(project, request, loop):
             'For a not_needed candidate independently establish that the concern is false or no change is warranted: '
             'add no_change_needed:true and checked_object_ids covering every supplied original object; '
             'include actual source_refs when sources were supplied. Do not dismiss a real important defect. '
+            'For author_pdf evidence explicitly report author_pdf_acknowledged:true, and check consistency against '
+            'the supplied author transcription without claiming independent PDF visual verification. '
             'If unsupported explain a concrete bounded correction, or blocked if missing evidence/author decision prevents it.')
     if stage=='final':
         return call_json(model_call,'final',{**common,'original_manuscript':snapshot['text'],
@@ -194,5 +247,6 @@ def execute(project, request, loop):
             'not a new open-ended fault hunt. Verify no core information is lost or scientific scope enlarged. '
             'Return {status:"pass"|"blocked",consistent:boolean,preserves_core_information:boolean,'
             'checked_group_ids:[],affected_group_ids:[],reason}. All supplied groups must be explicitly checked. '
-            'If blocked identify the affected groups, or all groups when the cause cannot be isolated.')
+            'If any group uses author_pdf, return author_pdf_acknowledged:true and do NOT claim you viewed '
+            'the original PDF yourself. If blocked identify the affected groups, or all groups when the cause cannot be isolated.')
     raise ValueError('Unknown review revision stage')

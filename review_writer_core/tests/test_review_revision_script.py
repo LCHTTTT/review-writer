@@ -115,6 +115,45 @@ def test_plan_prompt_is_compact_but_preserves_entire_manuscript_scopes_and_claim
     assert board==original  # Original bytes/hashes still available for proposal/audit.
 
 
+def test_tentative_ai_pdf_quote_is_marked_as_guess_before_human_agreement():
+    project,snapshot,loop,documents,answers,prompts=fixture()
+    board=execute(project,{'stage':'prepare','snapshot':snapshot},loop)['board']
+    task={'group_id':'g','category':'accuracy','problem':'Possible parsing conflict','strategy':'Propose only a verifiable wording',
+          'read_ids':['paragraph:abs'],'write_ids':['paragraph:abs'],'paper_ids':['P1']}
+    answers.append({'explanation':'Tentative wording based on parsed material',
+        'pdf_quote_guess':'CuBr₂','patches':[],'disposition':'blocked','limitation':'PDF has not been visually checked'})
+    result=execute(project,{'stage':'propose','snapshot':snapshot,'board':board,'task':task,
+        'suggest_pdf_quote':True,'suggest_paper_id':'P1'},loop)
+    assert result['proposal']['pdf_quote_guess']=='CuBr₂'
+    assert 'GUESS from parsed' in prompts[0][0]
+    assert 'human must compare the original PDF' in prompts[0][0]
+
+
+def test_author_pdf_recoordination_reads_original_page_transcription_as_attestation_not_parsed_fact():
+    project,snapshot,loop,documents,answers,prompts=fixture()
+    board=execute(project,{'stage':'prepare','snapshot':snapshot},loop)['board']
+    bid='paragraph:abs'
+    task={'group_id':'old','category':'accuracy','problem':'Possible salt subscript mismatch',
+        'strategy':'Read author-confirmed original PDF page','read_ids':[bid],'write_ids':[bid],
+        'paper_ids':['P1'],'pdf_check_ids':['check-id']}
+    check={'id':'check-id','group_id':'old','paper_id':'P1','page':2,'pdf_sha256':'a'*64,
+        'transcription':'Author read CuBr₂ from original PDF','note':'Marked PDF experiment line',
+        'origin':'author_inspected_original_pdf'}
+    answers.append({'summary':'Targeted correction','tasks':[task],'limitations':[]})
+    value=execute(project,{'stage':'recoordinate','snapshot':snapshot,'board':board,
+        'original_task':task,'confirmed_pdf_checks':[check],'previous_composition_feedback':[]},loop)
+    assert value['tasks'][0]['write_ids']==[bid]
+    assert prompts[0][1]=='Review revision recoordinate'
+    assert 'Do NOT claim you visually read the PDF' in prompts[0][0]
+    answers.append({'explanation':'Author transcription, not AI visual evidence','patches':[],'disposition':'not_needed'})
+    proposed=execute(project,{'stage':'propose','snapshot':snapshot,'board':board,'task':task,
+        'confirmed_pdf_checks':[check]},loop)
+    author=[s for s in proposed['sources'] if s.get('origin')=='author_inspected_original_pdf']
+    assert len(author)==1 and author[0]['ref']=='author-pdf:check-id'
+    assert author[0]['source_hash']=='a'*64 and author[0]['page']==2
+    assert 'Author read CuBr₂' in prompts[1][0]
+
+
 def test_native_paragraph_entry_uses_new_revision_stages_and_rejects_retired_flags(monkeypatch):
     import importlib.util
     script=Path(__file__).resolve().parents[2]/'skills/review-first-draft-feedback-loop/scripts/revise_paragraph.py'

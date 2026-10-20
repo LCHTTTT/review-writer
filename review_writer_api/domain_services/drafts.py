@@ -73,7 +73,11 @@ from review_writer_core.stages.draft.text import (
 )
 from review_writer_core.paragraph_markers import ensure_prose_paragraph_markers
 from review_writer_core.figure_caption import caption_fields
-from review_writer_core.review_revision_public import review_result as public_review_result
+from review_writer_core.review_revision_public import (
+    pending_review_group_count,
+    review_result as public_review_result,
+)
+from review_writer_api.domain_services.review_decisions import rejected_group_ids
 from review_writer_core.publication_caption import (
     figure_rights_fields,
 )
@@ -917,7 +921,7 @@ class DraftsService(
             **repair,
         }
 
-    def get(self, principal: Principal, project_id: str) -> dict[str, Any]:
+    def get(self, principal: Principal, project_id: str, *, review_job_id: str = "") -> dict[str, Any]:
         text, draft_artifact = self._read_text(
             principal, project_id, DRAFT_DOCUMENT, required=False
         )
@@ -1098,14 +1102,52 @@ class DraftsService(
                 if isinstance(change, dict)
             ]
             optimization_proposals.append(proposal)
-        jobs = self.repository.list_project_jobs(principal.user_id, project_id)
-        synthesis_job = next((j for j in jobs if j.payload.get("revision_mode") == "section_synthesis"), None)
-        dialogue_batch_job = next((job for job in jobs if job.payload.get("revision_mode") == "dialogue_batch" and not job.payload.get("section_id")), None)
-        peer_review_job = next((job for job in jobs if job.payload.get("revision_mode") == "peer_review"), None)
-        paragraph_task_states = {}
-        for job in jobs:
-            if job.status not in {"queued", "running", "cancel_requested"}:
+        jobs = self.repository.list_project_jobs(principal.user_id, project_id,
+            include_payload=False, include_result=False)
+        def full_job(job):
+            return self.repository.get_job(principal.user_id, job.id) if job else None
+        review_states = [job for job in jobs if job.job_type == "draft.optimize"
+            and str(job.idempotency_scope_key or "").endswith(":peer-review")]
+        review_jobs = []
+        requested_job = None
+        if review_job_id:
+            requested = self.repository.get_job(principal.user_id, review_job_id)
+            if (requested and requested.project_id == project_id
+                    and requested.payload.get("revision_mode") == "peer_review"):
+                requested_job = requested
+                review_jobs.append(requested)
+        for review_state in review_states[:5]:
+            if any(job.id == review_state.id for job in review_jobs):
                 continue
+            job = full_job(review_state)
+            if job and job.payload.get("revision_mode") == "peer_review":
+                review_jobs.append(job)
+        # Legacy/test jobs may predate the `:peer-review` operation key. Inspect
+        # only the newest few optimize jobs so the review history stays visible
+        # without loading every payload again.
+        if not review_jobs:
+            for state_job in [job for job in jobs if job.job_type == "draft.optimize"][:5]:
+                job = full_job(state_job)
+                if job and job.payload.get("revision_mode") == "peer_review":
+                    review_jobs.append(job)
+        review_jobs.sort(key=lambda job: job.created_at, reverse=True)
+        peer_review_job = requested_job or (review_jobs[0] if review_jobs else None)
+        synthesis_state = next((job for job in jobs if job.job_type == "draft.optimize"
+            and ":synthesis:" in str(job.idempotency_scope_key or "")), None)
+        synthesis_job = full_job(synthesis_state)
+        if synthesis_job and synthesis_job.payload.get("revision_mode") != "section_synthesis":
+            synthesis_job = None
+        dialogue_state = next((job for job in jobs if job.job_type == "draft.optimize"
+            and str(job.idempotency_scope_key or "") == str(project_id)), None)
+        dialogue_batch_job = full_job(dialogue_state)
+        if (dialogue_batch_job
+                and (dialogue_batch_job.payload.get("revision_mode") != "dialogue_batch"
+                     or dialogue_batch_job.payload.get("section_id"))):
+            dialogue_batch_job = None
+        active_jobs = [job for job in (full_job(state_job) for state_job in jobs
+            if state_job.status in {"queued", "running", "cancel_requested"}) if job]
+        paragraph_task_states = {}
+        for job in active_jobs:
             key = (job.payload.get("dialogue") or {}).get("paragraph_key") or (job.result or {}).get("active_paragraph_key")
             if key:
                 paragraph_task_states[key] = {"id": job.id, "status": job.status,
@@ -1129,9 +1171,8 @@ class DraftsService(
             None,
         )
         rewrite_states: dict[str, dict[str, Any]] = {}
-        for job in jobs:
-            if job.job_type != "draft.rewrite":
-                continue
+        for job in self.repository.list_project_jobs(principal.user_id, project_id,
+                job_type="draft.rewrite", include_result=False):
             paragraph_id = str(job.payload.get("paragraph_id") or "")
             rewrite_states.setdefault(
                 paragraph_id,
@@ -1151,11 +1192,52 @@ class DraftsService(
             repetition = scan_repetition_hints(paragraphs, sections)
             if repetition_key:
                 self._repetition_cache[repetition_key] = repetition
+        approved_review_job_id = (draft_artifact.metadata.get("author_approved_from_review_job_id", "")
+            if draft_artifact and draft_artifact.metadata.get("operation") == "author-approved-review-candidate" else "")
+        approved_review_group_ids = (draft_artifact.metadata.get("author_approved_group_ids", [])
+            if draft_artifact and draft_artifact.metadata.get("operation") == "author-approved-review-candidate" else [])
+        review_source_text = None
+        if peer_review_job:
+            source_id = peer_review_job.payload.get("source_draft_artifact_id", "")
+            if draft_artifact and source_id == draft_artifact.id:
+                review_source_text = text
+            elif source_id:
+                try:
+                    source = self.artifacts.resolve_owned_artifact(principal.user_id, source_id)
+                    if str(source.artifact.project_id) == str(project_id):
+                        review_source_text = source.path.read_text(encoding="utf-8")
+                except (WorkflowNotFound, OSError, UnicodeError):
+                    pass
+        peer_review_public = (public_review_result(peer_review_job.result, peer_review_job.payload,
+            raw_source_text=review_source_text) if peer_review_job else None)
+        peer_review_rejected = (rejected_group_ids(self.repository.session_factory, principal.user_id,
+            project_id, peer_review_job.id) if peer_review_job else set())
+        peer_review_current = bool(peer_review_job and (
+            peer_review_job.payload.get("source_draft_artifact_id")
+                == (draft_artifact.id if draft_artifact else "")
+            or approved_review_job_id == peer_review_job.id))
+        peer_review_pending = (pending_review_group_count(
+            peer_review_public, approved_review_group_ids, peer_review_rejected)
+            if peer_review_current else 0)
+        review_runs = []
+        for job in review_jobs[:6]:
+            public = peer_review_public if job is peer_review_job else public_review_result(job.result, job.payload)
+            rejected = peer_review_rejected if job is peer_review_job else rejected_group_ids(
+                self.repository.session_factory, principal.user_id, project_id, job.id)
+            accepted = approved_review_group_ids if approved_review_job_id == job.id else []
+            current = bool(job.payload.get("source_draft_artifact_id")
+                == (draft_artifact.id if draft_artifact else "") or approved_review_job_id == job.id)
+            review_runs.append({"id": job.id, "status": job.status, "created_at": job.created_at.isoformat(),
+                "source_draft_artifact_id": job.payload.get("source_draft_artifact_id", ""),
+                "outcome": (public or {}).get("outcome", ""), "current": current,
+                "pending_group_count": pending_review_group_count(public, accepted, rejected) if current else 0})
         return {
             "project_id": project_id,
             "revision": state.revision if state else 0,
             "status": state.status if state else "pending",
             "draft_artifact_id": draft_artifact.id if draft_artifact else "",
+            "author_approved_review_job_id": approved_review_job_id,
+            "author_approved_review_group_ids": approved_review_group_ids,
             "draft_manual_paragraph_ids": sorted(
                 str(value)
                 for value in (
@@ -1190,17 +1272,20 @@ class DraftsService(
             "quality_artifact_id": quality_artifact.id if quality_artifact else "",
             "rewrite_candidates": rewrite_candidates,
             "peer_review_job": ({"id": peer_review_job.id, "status": peer_review_job.status,
-                "result": public_review_result(peer_review_job.result, peer_review_job.payload), "progress_current": peer_review_job.progress_current,
+                "result": peer_review_public, "progress_current": peer_review_job.progress_current,
                 "progress_total": peer_review_job.progress_total, "error_message": public_model_error(peer_review_job.error_message or ""),
-                "source_draft_artifact_id": peer_review_job.payload.get("source_draft_artifact_id")}
+                "source_draft_artifact_id": peer_review_job.payload.get("source_draft_artifact_id"),
+                "current": peer_review_current, "pending_group_count": peer_review_pending,
+                "rejected_group_ids": sorted(peer_review_rejected)}
                 if peer_review_job else None),
+            "review_runs": review_runs,
             "dialogue_batch_job": ({"id": dialogue_batch_job.id, "status": dialogue_batch_job.status,
                 "result": dialogue_batch_job.result, "progress_current": dialogue_batch_job.progress_current,
                 "progress_total": dialogue_batch_job.progress_total, "error_message": public_model_error(dialogue_batch_job.error_message or "")}
                 if dialogue_batch_job else None),
             "sections": sections,
             "section_task_states": {job.payload["section_id"]: {"id": job.id, "status": job.status}
-                for job in jobs if job.payload.get("section_id") and job.status in {"queued", "running", "cancel_requested"}},
+                for job in active_jobs if job.payload.get("section_id")},
             "paragraph_task_states": paragraph_task_states,
             "optimization_proposals": optimization_proposals,
             "rewrite_states": rewrite_states,

@@ -21,11 +21,14 @@ import { DraftUpstreamSync } from "./DraftUpstreamSync";
 import { EditableManuscript } from "./EditableManuscript";
 import type { NarrativeRepetitionReport } from "./NarrativeRepetitionNotice";
 import { DraftPeerReview, type PeerReviewJob } from "./DraftPeerReview";
+import type { ReviewRun } from "./peerReviewTypes";
 
 type Batch = { id: string; status: string; progress_current: number; progress_total: number; error_message?: string; result?: { coherence_plan?: { status: string }; paragraph_results?: Record<string, { paragraph_id: string; status: string; reason?: string }> } };
 type DraftPayload = { revision: number; draft_artifact_id: string; first_draft_md: string; manuscript_preview_md?: string; paragraphs: DialogueParagraph[];
+  author_approved_review_job_id?: string; author_approved_review_group_ids?: string[];
   synthesis_job?: SynthesisJob;
   peer_review_job?: PeerReviewJob;
+  review_runs?: ReviewRun[];
   synthesis_stale?: boolean;
   manuscript_fields?: { title: string; keywords: string[] };
   legacy_manuscript_fields?: { title: string; keywords: string[] } | null;
@@ -95,7 +98,9 @@ function DraftWorkspace({ projectId, userId }: { projectId: string; userId: stri
   const [versionLimit, setVersionLimit] = useState(20);
   const [viewed, setViewed] = useState<{ id: string; content: string } | null>(null);
   const base = "/api/v1/projects/" + encodeURIComponent(projectId) + "/draft";
-  const draft = useQuery({ queryKey: ["draft", projectId], queryFn: () => apiRequest<DraftPayload>(base),
+  const reviewId = params.get("review") || "";
+  const draftUrl = base + (reviewId ? "?review_job_id=" + encodeURIComponent(reviewId) : "");
+  const draft = useQuery({ queryKey: ["draft", projectId, reviewId], queryFn: () => apiRequest<DraftPayload>(draftUrl),
     refetchInterval: query => query.state.data?.active_feedback_job_id || jobIsActive(query.state.data?.peer_review_job?.status) || jobIsActive(query.state.data?.synthesis_job?.status) || jobIsActive(query.state.data?.dialogue_batch_job?.status) ? 3000 : false, refetchIntervalInBackground: true });
   const data = draft.data;
   const refresh = async () => { await Promise.all([
@@ -135,6 +140,19 @@ function DraftWorkspace({ projectId, userId }: { projectId: string; userId: stri
   const section = data.sections?.find(s => s.section_id === selected || s.paragraphs.some(p => p.paragraph_key === selected || p.paragraph_id === selected)) || data.sections?.[0];
   const candidates = data.rewrite_candidates.filter(c => ["dialogue", "section_synthesis"].includes(c.revision_mode || ""));
   const pending = candidates.filter(c => c.status === "pending");
+  const otherDraftJobActive = !!data.active_feedback_job_id && data.active_feedback_job_id !== data.peer_review_job?.id;
+  const selectReviewRun = (id: string) => setParams(previous => {
+    const next = new URLSearchParams(previous);
+    if (id) next.set("review", id); else next.delete("review");
+    return next;
+  });
+  const reviewRejected = data.peer_review_job?.rejected_group_ids || [];
+  const reviewPending = data.peer_review_job?.pending_group_count ?? (data.peer_review_job?.result?.revisions || []).filter(group =>
+    group.status === "not_saved" && group.patches.length > 0
+    && !reviewRejected.includes(group.group_id)
+    && !(data.author_approved_review_job_id === data.peer_review_job?.id
+      && (data.author_approved_review_group_ids || []).includes(group.group_id))).length;
+  const pendingTotal = pending.length + reviewPending;
   const choose = (key: string) => switchTab("dialogue", key);
   const tabs = [["batch", text("审稿式修订", "Review-style revision")], ["dialogue", text("章节对话", "Chapter dialogue")], ["preview", text("完整正文", "Manuscript")], ["approval", text("确认事项", "Approval details")], ["history", text("版本历史", "History")]];
   const latestPending = [...new Map(pending.map(c => [c.paragraph_key, c])).values()];
@@ -162,11 +180,11 @@ function DraftWorkspace({ projectId, userId }: { projectId: string; userId: stri
       <div className="draft-stage-navigation">
         <nav className="workspace-step-tabs" aria-label={text("初稿工作区", "Draft workspace")}>
           <button type="button" className={["preview", "dialogue"].includes(tab) ? "active" : ""} aria-current={["preview", "dialogue"].includes(tab) ? "page" : undefined} onClick={() => switchTab("preview")}>{text("完整正文", "Manuscript")}</button>
-          <button type="button" className={tab === "batch" ? "active" : ""} aria-current={tab === "batch" ? "page" : undefined} onClick={() => switchTab("batch")}>{text("审稿式修订", "Review-style revision")}{pending.length ? " · " + pending.length : ""}</button>
+          <button type="button" className={tab === "batch" ? "active" : ""} aria-current={tab === "batch" ? "page" : undefined} onClick={() => switchTab("batch")}>{text("审稿式修订", "Review-style revision")}{pendingTotal ? " · " + pendingTotal : ""}</button>
         </nav>
         <button type="button" className="button button-quiet draft-history-link" onClick={() => switchTab("history")}>{text("版本历史", "History")}</button>
       </div>
-      {pending.length > 0 && tab !== "batch" ? <p role="status"><button className="button button-quiet" onClick={() => switchTab("batch")}>{text("待查看修改建议：", "Suggestions to review: ")}{pending.length}{text(" 处，尚未改变正文", " — not yet applied")}</button></p> : null}
+      {pendingTotal > 0 && tab !== "batch" ? <p role="status"><button className="button button-quiet" onClick={() => switchTab("batch")}>{text("待查看修改建议：", "Suggestions to review: ")}{pendingTotal}{text(" 处，尚未改变正文", " — not yet applied")}</button></p> : null}
       <div className={tab === "dialogue" ? `draft-reading-with-dialogue${dialogueExpanded ? " draft-dialogue-expanded" : ""}` : ""}>
       <section hidden={!["preview", "dialogue"].includes(tab) || (tab === "dialogue" && dialogueExpanded)} className="pane draft-manuscript-home">
 
@@ -191,7 +209,9 @@ function DraftWorkspace({ projectId, userId }: { projectId: string; userId: stri
         {tab === "batch" ? <div className="draft-batch-workspace">
           <DraftPeerReview key={`${userId}:${projectId}`} projectId={projectId} userId={userId} revision={data.revision} onEditingChange={recordEdit} draftArtifactId={data.draft_artifact_id}
             sections={data.sections || []} paragraphs={data.paragraphs} job={data.peer_review_job}
-            blocked={data.freshness.upstream_stale} requireSaved={() => {
+            runs={data.review_runs || []} onSelectRun={selectReviewRun}
+            authorApprovedReviewJobId={data.author_approved_review_job_id} authorApprovedReviewGroupIds={data.author_approved_review_group_ids}
+            blocked={data.freshness.upstream_stale || otherDraftJobActive} requireSaved={() => {
               requireSaved();
               if (data.paragraphs.some(p => hasDraftScratch(userId + ":" + projectId + ":" + p.paragraph_key + ":manual")
                   || hasDraftScratch(userId + ":" + projectId + ":" + p.paragraph_key + ":review-manual")))

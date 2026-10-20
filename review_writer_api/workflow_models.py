@@ -97,6 +97,44 @@ class WorkflowSystemState(Base):
     )
 
 
+class ReviewPdfCheck(Base):
+    """Author's transcription after inspecting an owned PDF; not AI visual verification."""
+    __tablename__ = 'review_pdf_checks'
+    __table_args__ = (Index('ix_review_pdf_checks_owner','user_id','project_id','review_job_id'),)
+    id: Mapped[uuid.UUID] = mapped_column(Uuid,primary_key=True,default=new_uuid)
+    user_id: Mapped[uuid.UUID] = mapped_column(Uuid,ForeignKey('users.id',ondelete='CASCADE'),nullable=False)
+    project_id: Mapped[uuid.UUID] = mapped_column(Uuid,ForeignKey('projects.id',ondelete='CASCADE'),nullable=False)
+    review_job_id: Mapped[uuid.UUID] = mapped_column(Uuid,ForeignKey('workflow_jobs.id',ondelete='CASCADE'),nullable=False)
+    draft_artifact_id: Mapped[uuid.UUID] = mapped_column(Uuid,ForeignKey('workflow_artifacts.id',ondelete='RESTRICT'),nullable=False)
+    group_id: Mapped[str] = mapped_column(String(64),nullable=False)
+    paper_id: Mapped[str] = mapped_column(String(96),nullable=False)
+    pdf_sha256: Mapped[str] = mapped_column(String(64),nullable=False)
+    page: Mapped[int] = mapped_column(Integer,nullable=False)
+    transcription: Mapped[str] = mapped_column(Text,nullable=False)
+    note: Mapped[str] = mapped_column(Text,default='',nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True),default=utc_now,nullable=False)
+
+
+class ReviewCandidateDecision(Base):
+    """Author's explicit decision to keep the original for one review group."""
+    __tablename__ = 'review_candidate_decisions'
+    __table_args__ = (
+        UniqueConstraint('user_id','project_id','review_job_id','group_id',
+                         name='uq_review_candidate_decision_group'),
+        Index('ix_review_candidate_decisions_owner','user_id','project_id','review_job_id'),
+    )
+    id: Mapped[uuid.UUID] = mapped_column(Uuid,primary_key=True,default=new_uuid)
+    user_id: Mapped[uuid.UUID] = mapped_column(Uuid,ForeignKey('users.id',ondelete='CASCADE'),nullable=False)
+    project_id: Mapped[uuid.UUID] = mapped_column(Uuid,ForeignKey('projects.id',ondelete='CASCADE'),nullable=False)
+    review_job_id: Mapped[uuid.UUID] = mapped_column(Uuid,ForeignKey('workflow_jobs.id',ondelete='CASCADE'),nullable=False)
+    draft_artifact_id: Mapped[uuid.UUID] = mapped_column(Uuid,ForeignKey('workflow_artifacts.id',ondelete='RESTRICT'),nullable=False)
+    group_id: Mapped[str] = mapped_column(String(64),nullable=False)
+    candidate_sha256: Mapped[str] = mapped_column(String(64),nullable=False)
+    decision: Mapped[str] = mapped_column(String(16),default='rejected',nullable=False)
+    note: Mapped[str] = mapped_column(Text,default='',nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True),default=utc_now,nullable=False)
+
+
 class LibraryPaper(Base):
     """User-owned searchable catalog for admitted, precisely parsed PDFs."""
 

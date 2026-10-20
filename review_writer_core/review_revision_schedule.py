@@ -44,6 +44,20 @@ def article_overview(snapshot):
             'coverage_note':'Body text is reviewed in complete bounded units; this overview is not original-source evidence.'}
 
 
+def author_pdf_write_scope(snapshot,board,task,checks):
+    """Objects the targeted coordinator may inspect/ask to edit; not granted writes."""
+    selected={c['paper_id'] for c in checks}
+    ids=set(task['read_ids']+task['write_ids'])
+    for block in snapshot['blocks']:
+        bid=block['block_id']
+        if set(board.get('bindings',{}).get(bid,[]))&selected:
+            ids.add(bid)
+        if block['kind']=='reference' and board.get('citation_map',{}).get(bid.split(':')[1]) in selected:
+            ids.add(bid)
+    ids.update(b['block_id'] for b in article_overview(snapshot)['framing_objects'])
+    return ids
+
+
 def validate_coordination(value, reviews):
     """Every local suspicion is retained or explicitly limited, not silently lost."""
     concerns={t['concern_id']:t for r in reviews.values() if r.get('status')=='reviewed'

@@ -37,7 +37,7 @@ class DraftReviewRevisionTests(NativeFigureApiTestCase):
         self.prepare_draft(client)
         self.service=self.app.state.drafts_service
         current=self.service.get(self.first,self.project_id)
-        return review_payload(self.service,self.first,self.project_id,expected_draft_artifact_id=current['draft_artifact_id'])
+        return review_payload(self.service,self.first,self.project_id,expected_draft_artifact_id=current['draft_artifact_id'],author_selects=False)
 
     def context(self,payload):
         job=SimpleNamespace(result={},retry_of_job_id=None)
@@ -76,6 +76,117 @@ class DraftReviewRevisionTests(NativeFigureApiTestCase):
             if stage=='validate_sources': return {'unchanged':source_unchanged,'board_hash':r['board']['hash']}
             raise AssertionError(stage)
         return build,calls
+
+    def test_new_review_shows_before_after_without_automatic_audit_or_publication(self):
+        with TestClient(self.app) as client:
+            old=self.setup_payload(client)
+            payload=review_payload(self.service,self.first,self.project_id,
+                expected_draft_artifact_id=old['source_draft_artifact_id'])
+            self.assertTrue(payload['author_selects'])
+            build,calls=self.builder(payload)
+            result=self.drive(payload,build)
+            self.assertEqual('awaiting_author_choice',result['outcome'])
+            self.assertEqual('recommended',result['groups']['revision-1']['status'])
+            self.assertNotIn('board',result)
+            self.assertIn('board_ref',result)
+            self.assertFalse(result['publication']['changed'])
+            self.assertNotIn('audit',calls)
+            self.assertNotIn('final',calls)
+            public=review_result(result,payload)
+            self.assertEqual('not_saved',public['revisions'][0]['status'])
+            self.assertTrue(public['revisions'][0]['candidate_sha256'])
+            self.assertEqual(old['source_draft_artifact_id'],
+                self.service.get(self.first,self.project_id)['draft_artifact_id'])
+
+    def test_author_selects_zero_task_plan_is_no_change_not_a_failure(self):
+        with TestClient(self.app) as client:
+            old=self.setup_payload(client)
+            payload=review_payload(self.service,self.first,self.project_id,
+                expected_draft_artifact_id=old['source_draft_artifact_id'])
+            base,_=self.builder(payload)
+            def build(context,one):
+                if one['dialogue']['review_revision']['stage']=='plan':
+                    return {'summary':'No defensible changes are needed.','tasks':[],'limitations':[]}
+                return base(context,one)
+            result=self.drive(payload,build)
+            self.assertEqual('no_change_needed',result['outcome'])
+            self.assertEqual('No defensible changes are needed.',result['summary'])
+            self.assertEqual([],result['limitations'])
+            self.assertEqual([],result['revisions'])
+            self.assertFalse(result['publication']['changed'])
+
+    def test_author_selects_not_needed_is_dismissed_without_a_limitation(self):
+        with TestClient(self.app) as client:
+            old=self.setup_payload(client)
+            payload=review_payload(self.service,self.first,self.project_id,
+                expected_draft_artifact_id=old['source_draft_artifact_id'])
+            base,_=self.builder(payload)
+            def build(context,one):
+                if one['dialogue']['review_revision']['stage']=='propose':
+                    return {'proposal':{'explanation':'The sentence already limits its scope.',
+                        'disposition':'not_needed','patches':[]},'sources':[]}
+                return base(context,one)
+            result=self.drive(payload,build)
+            self.assertEqual('dismissed',result['groups']['revision-1']['status'])
+            self.assertEqual('no_change_needed',result['outcome'])
+            self.assertEqual([],result['limitations'])
+            public=review_result(result,payload)
+            self.assertEqual('dismissed',public['revisions'][0]['status'])
+            self.assertFalse(public['revisions'][0]['patches'])
+
+    def test_author_selects_retries_one_malformed_proposal_before_giving_up(self):
+        with TestClient(self.app) as client:
+            old=self.setup_payload(client)
+            payload=review_payload(self.service,self.first,self.project_id,
+                expected_draft_artifact_id=old['source_draft_artifact_id'])
+            base,_=self.builder(payload)
+            feedback=[]
+            def build(context,one):
+                request=one['dialogue']['review_revision']
+                if request['stage']=='propose':
+                    feedback.append(request.get('feedback'))
+                    if len(feedback)==1:
+                        return {'proposal':{'explanation':'','disposition':'revised','patches':[]},'sources':[]}
+                return base(context,one)
+            result=self.drive(payload,build)
+            self.assertEqual(2,len(feedback))
+            self.assertIsNone(feedback[0])
+            self.assertTrue(feedback[1])
+            self.assertEqual('recommended',result['groups']['revision-1']['status'])
+            self.assertEqual('awaiting_author_choice',result['outcome'])
+
+    def test_review_payload_is_blocked_while_another_draft_writer_is_active(self):
+        with TestClient(self.app) as client:
+            old=self.setup_payload(client)
+            from review_writer_api.database import database_session
+            from review_writer_api.workflow_models import WorkflowJob
+            with database_session(self.sessions) as session:
+                session.add(WorkflowJob(id=uuid.uuid4(),user_id=uuid.UUID(self.first.user_id),
+                    project_id=uuid.UUID(self.project_id),scope='project',job_type='draft.rewrite',
+                    queue_name='scientific',status='running',idempotency_key='active-writer',
+                    idempotency_scope_key=f'{self.project_id}:paragraph:k',payload_json={},result_json={}))
+            with self.assertRaises(WorkflowConflict):
+                review_payload(self.service,self.first,self.project_id,
+                    expected_draft_artifact_id=old['source_draft_artifact_id'])
+
+    def test_new_review_keeps_structurally_valid_but_unverified_source_proposal_for_author(self):
+        with TestClient(self.app) as client:
+            old=self.setup_payload(client)
+            payload=review_payload(self.service,self.first,self.project_id,
+                expected_draft_artifact_id=old['source_draft_artifact_id'])
+            base,_=self.builder(payload)
+            def build(context,one):
+                answer=base(context,one)
+                if one['dialogue']['review_revision']['stage']=='propose':
+                    patch=answer['proposal']['patches'][0]
+                    patch['basis']='source';patch['source_refs']=['unknown-paper:b1']
+                return answer
+            result=self.drive(payload,build)
+            candidate=result['groups']['revision-1']['candidate']
+            self.assertTrue(candidate['unverified_tentative'])
+            self.assertEqual([],candidate['sources'])
+            self.assertEqual('not_saved',review_result(result,payload)['revisions'][0]['status'])
+            self.assertFalse(result['publication']['changed'])
 
     def test_parallel_groups_keep_fast_sibling_and_publish_only_verified_changes(self):
         import json
@@ -169,6 +280,36 @@ class DraftReviewRevisionTests(NativeFigureApiTestCase):
             self.assertEqual('limited',result['outcome']);self.assertFalse(result['publication']['changed'])
             self.assertTrue(any('read-1' in value for value in result['limitations']))
             self.assertEqual(payload['source_draft_artifact_id'],self.service.get(self.first,self.project_id)['draft_artifact_id'])
+
+    def test_public_comparison_shows_every_group_without_inventing_missing_replacements(self):
+        result={'policy':POLICY,'groups':{'revision-1':{'status':'limited','reason':'Model returned no text'},
+                                         'revision-2':{'status':'limited','attempts':[]}},
+            'plan':{'tasks':[{'group_id':'revision-1','category':'accuracy','problem':'Check salt'},
+                {'group_id':'revision-2','category':'consistency','problem':'Check conclusion'}]}}
+        public=review_result(result,{})
+        self.assertNotIn('groups',public)
+        self.assertNotIn('board',public)
+        self.assertNotIn('pdf_check_targets',public)
+        self.assertEqual(['revision-1','revision-2'],[g['group_id'] for g in public['revisions']])
+        self.assertTrue(all(g['status']=='no_candidate' and not g['patches'] and not g['candidate_sha256']
+            for g in public['revisions']))
+
+    def test_author_pdf_confirmation_cannot_bypass_failed_independent_audit(self):
+        from review_writer_core.tests.test_review_revision import TEXT,patch
+        from review_writer_core.review_revision_document import document_blocks
+        blocks=document_blocks(TEXT);b=next(x for x in blocks if x['block_id']=='paragraph:abs')
+        human={'ref':'author-pdf:check','paper_id':'P1','page':1,'text':'CuBr₂',
+            'source_hash':'a'*64,'origin':'author_inspected_original_pdf'}
+        task={'group_id':'g','category':'accuracy','problem':'Salt identity','read_ids':[b['block_id']],
+            'write_ids':[b['block_id']]}
+        from review_writer_core.review_revision import validate_group,audit_passed
+        candidate=validate_group({'explanation':'Author attestation, not AI reading','patches':[
+            patch(b,'The mechanism is proposed. [1]',basis='author_pdf',source_refs=[human['ref']])]},
+            task,TEXT,blocks,[human])
+        check={'status':'pass','problem_resolved':True,'preserves_core_information':True,'no_unsupported_claims':True,
+            'no_scope_expansion':True,'no_direct_regressions':True,'checked_patch_ids':[b['block_id']],
+            'source_refs':[human['ref']],'reason':'Claim supported only by user assertion'}
+        self.assertFalse(audit_passed(check,candidate))
 
     def test_atomic_delivery_real_artifact_history_and_public_comparison(self):
         with TestClient(self.app) as client:
@@ -310,7 +451,7 @@ class DraftReviewRevisionTests(NativeFigureApiTestCase):
             text=TEXT.replace('/api/v1/artifacts/image/content',url)
             self.service.save_text(self.first,self.project_id,text=text,revision=initial['source_draft_revision'])
             current=self.service.get(self.first,self.project_id)
-            payload=review_payload(self.service,self.first,self.project_id,expected_draft_artifact_id=current['draft_artifact_id'])
+            payload=review_payload(self.service,self.first,self.project_id,expected_draft_artifact_id=current['draft_artifact_id'],author_selects=False)
             blocks={b['block_id']:b for b in payload['snapshot']['blocks']}
             edits={'paragraph:abs':'The mechanism is proposed. [1]',
                 'paragraph:con':'Coordination remains a proposal. [1]',

@@ -74,6 +74,8 @@ WORKFLOW_TABLES = {
     "registration_codes",
     "system_error_events",
     "library_upload_batch_cancellations",
+    "review_pdf_checks",
+    "review_candidate_decisions",
 }
 
 
@@ -84,7 +86,10 @@ class WorkflowMigrationTests(unittest.TestCase):
     def test_workflow_schema_has_separate_workflow_and_job_scope_revisions(self) -> None:
         script = ScriptDirectory.from_config(self.alembic_config())
 
-        self.assertEqual(["20260925_0029"], script.get_heads())
+        self.assertEqual(['20261020_0032'], script.get_heads())
+        self.assertEqual('20261016_0031',script.get_revision('20261020_0032').down_revision)
+        self.assertEqual('20261011_0030',script.get_revision('20261016_0031').down_revision)
+        self.assertEqual('20260925_0029',script.get_revision('20261011_0030').down_revision)
         self.assertEqual("20260924_0028", script.get_revision("20260925_0029").down_revision)
         self.assertEqual("20260923_0027", script.get_revision("20260924_0028").down_revision)
         delegation_revision = script.get_revision("20260923_0027")

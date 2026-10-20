@@ -15,7 +15,8 @@ from review_writer_api.job_service import JobService
 from review_writer_api.routers.jobs import _job_response
 from review_writer_api.security import Principal
 from review_writer_api.workflow_schemas import (
-    DraftApprovalRequest, DraftPeerReviewRequest,
+    DraftApprovalRequest, DraftPeerReviewRequest, DraftReviewCandidateAcceptRequest,
+    DraftReviewCandidateBatchAcceptRequest,
     DraftDialogueRequest,
     DraftSectionDialogueRequest,
     DraftParagraphSaveRequest,
@@ -156,6 +157,31 @@ def build_drafts_router(
         return drafts_service.decide_dialogue(principal, project_id, candidate_id, decision=decision,
             expected_base_text_sha256=if_match)
 
+    @router.post('/review-candidates/{review_job_id}/{group_id}/accept')
+    def accept_review_group(project_id: str,review_job_id: str,group_id: str,
+                            payload: DraftReviewCandidateAcceptRequest,
+                            principal: Principal = Depends(principal_dependency)):
+        from review_writer_api.domain_services.review_candidate_acceptance import accept_review_candidate
+        return accept_review_candidate(drafts_service,principal,project_id,review_job_id=review_job_id,
+            group_id=group_id,**payload.model_dump())
+
+    @router.post('/review-candidates/{review_job_id}/{group_id}/reject')
+    def reject_review_group(project_id: str,review_job_id: str,group_id: str,
+                            payload: DraftReviewCandidateAcceptRequest,
+                            principal: Principal = Depends(principal_dependency)):
+        from review_writer_api.domain_services.review_candidate_acceptance import reject_review_candidate
+        return reject_review_candidate(drafts_service,principal,project_id,review_job_id=review_job_id,
+            group_id=group_id,**payload.model_dump())
+
+    @router.post('/review-candidates/{review_job_id}/accept-selected')
+    def accept_review_groups(project_id: str,review_job_id: str,
+                             payload: DraftReviewCandidateBatchAcceptRequest,
+                             principal: Principal = Depends(principal_dependency)):
+        from review_writer_api.domain_services.review_candidate_acceptance import accept_review_candidates
+        return accept_review_candidates(drafts_service,principal,project_id,review_job_id=review_job_id,
+            groups=[item.model_dump() for item in payload.groups],
+            expected_draft_artifact_id=payload.expected_draft_artifact_id)
+
     @router.post("/review-jobs", status_code=status.HTTP_202_ACCEPTED)
     def start_review(project_id: str, payload: DraftPeerReviewRequest,
                      idempotency_key: str = Header(default="", alias="Idempotency-Key"),
@@ -224,9 +250,10 @@ def build_drafts_router(
     @router.get("")
     def get_draft(
         project_id: str,
+        review_job_id: str = "",
         principal: Principal = Depends(principal_dependency),
     ) -> dict:
-        return drafts_service.get(principal, project_id)
+        return drafts_service.get(principal, project_id, review_job_id=review_job_id)
 
     @router.post("/assemble")
     def assemble_draft(

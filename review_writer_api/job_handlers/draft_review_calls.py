@@ -16,9 +16,10 @@ class ReviewUnitFailed(WorkflowValidationError):
 
 
 class ReviewCalls:
-    def __init__(self, context, state, payload, builder, checkpoint):
+    def __init__(self, context, state, payload, builder, checkpoint, board=None):
         self.context=context;self.state=state;self.payload=payload
         self.builder=builder;self.checkpoint=checkpoint
+        self.board=board if board is not None else state.get('board')
         self.records=state.setdefault('model_calls',{})
 
     def child(self, record):
@@ -34,7 +35,8 @@ class ReviewCalls:
     def invoke(self, stage, *, call_key=None, **extra):
         key=call_key or stage
         fingerprint=digest({'stage':stage,'extra':extra,'snapshot':self.payload['snapshot']['sha256'],
-                            'board':self.state.get('board',{}).get('hash')})
+                            'board':(self.board or {}).get('hash'),
+                            'pdf_checks':self.payload.get('confirmed_pdf_checks',[])})
         record=self.records.get(key)
         if record and record['fingerprint']!=fingerprint:
             raise WorkflowConflict('审稿调用输入与检查点不一致，未创建新模型请求。')
@@ -73,7 +75,10 @@ class ReviewCalls:
             # to create another paid request under a retry parent's new ID.
             self.records[key]={'status':'submitting','fingerprint':fingerprint,'parent_job_id':self.context.job_id}
         self.checkpoint(stage)
-        request={'stage':stage,'snapshot':self.payload['snapshot'],'board':self.state.get('board'),
+        request={'stage':stage,'snapshot':self.payload['snapshot'],'board':self.board,
+                 'confirmed_pdf_checks':self.payload.get('confirmed_pdf_checks',[]),
+                 'suggest_pdf_quote':bool(self.payload.get('recommend_only')),
+                 'suggest_paper_id':self.payload.get('suggest_paper_id',''),
                  'standard':self.payload.get('standard',''),'guidance':self.payload.get('guidance',''),**extra,**response}
         one={**self.payload,'revision_mode':'dialogue','dialogue':{'review_revision':request}}
         try:

@@ -28,7 +28,10 @@ never delete core information, important counterexamples or necessary qualificat
 Separate lack of manuscript coverage from whether a scientific result is true. Missing retrieval is not absence in the paper.
 Resolve 'our report (ref. 6a)', earlier/later and cited work dates from full attribution context, not the citing paper's date.
 For references read the bound paper's actual header/title/journal/DOI. A mismatch alone does not identify which field is wrong.
-The evidence board is immutable. Passage refs identify actual original bytes; fact cards/metadata are navigation, not proof.
+The evidence board is immutable. Passage refs identify extracted bytes; fact cards/metadata are navigation, not proof.
+An author_pdf ref is a version-bound human transcription after directly inspecting the original PDF, NOT your own
+visual verification or a modification of the parsed source. Where it conflicts with the extracted passage, explicitly
+report the conflict; use the attested wording only for that exact located claim, not as a blanket replacement in the paper.
 Read and write scopes differ. Coordinate every affected supplied object (body/abstract/conclusion/figure caption/table/reference).
 Never invent IDs, change image URLs/rights, citation identities, paragraph markers or object order.
 No cosmetic quota, mandatory zero-findings gate, scores, invented verification or gratuitous changes.
@@ -95,10 +98,14 @@ def validate_group(value, task, markdown, blocks, sources):
     if set(p.get('block_id') for p in patches if isinstance(p,dict))-set(task['write_ids']):
         raise ValueError('候选超出修改组可写范围。')
     for patch in patches:
-        if not isinstance(patch,dict) or patch.get('basis') not in ('source','manuscript') or not isinstance(patch.get('source_refs'),list) or any(not isinstance(r,str) or r not in refs for r in patch['source_refs']):
+        if not isinstance(patch,dict) or patch.get('basis') not in ('source','manuscript','author_pdf') or not isinstance(patch.get('source_refs'),list) or any(not isinstance(r,str) or r not in refs for r in patch['source_refs']):
             raise ValueError('候选没有有效的证据依据。')
-        if patch['basis']=='source' and not patch['source_refs']:
-            raise ValueError('科学纠正必须关联实际原文片段。')
+        if patch['basis']=='source' and (not patch['source_refs'] or any(
+                s['origin']=='author_inspected_original_pdf' for s in sources if s['ref'] in patch['source_refs'] and 'origin' in s)):
+            raise ValueError('科学原文与作者 PDF 转录不可混称同一种证据。')
+        if patch['basis']=='author_pdf' and (not patch['source_refs'] or not any(
+                s.get('origin')=='author_inspected_original_pdf' for s in sources if s['ref'] in patch['source_refs'])):
+            raise ValueError('作者 PDF 核对必须关联已绑定原版文件的人工转录。')
         support=patch.get('support_ids',[])
         if not isinstance(support,list) or any(not isinstance(s,str) or s not in task['read_ids'] for s in support):
             raise ValueError('正文支撑必须来自本修改组实际读取的位置。')
@@ -116,6 +123,27 @@ def validate_group(value, task, markdown, blocks, sources):
     return group
 
 
+def tentative_group(value, task, markdown, blocks):
+    """A visible author-choice suggestion, NEVER AI-certified evidence."""
+    if (not isinstance(value,dict) or not isinstance(value.get('explanation'),str)
+            or not value['explanation'].strip() or not isinstance(value.get('patches'),list)
+            or not value['patches']):
+        raise ValueError('模型没有交付可对照的修改后文字。')
+    if any(not isinstance(p,dict) or p.get('block_id') not in task['write_ids']
+            or not isinstance(p.get('after'),str) or not isinstance(p.get('before_sha256'),str)
+            for p in value['patches']):
+        raise ValueError('候选缺少修改文字、原文版本或超出原审稿修改组。')
+    patches=[{**p,'basis':p.get('basis') or 'manuscript',
+              'source_refs':p.get('source_refs') if isinstance(p.get('source_refs'),list) else [],
+              'support_ids':p.get('support_ids') if isinstance(p.get('support_ids'),list) else [],
+              'operation':p.get('operation') or 'qualify'} for p in value['patches']]
+    group={'group_id':task['group_id'],'category':task['category'],'problem':task['problem'],
+           'explanation':value['explanation'],'read_ids':task['read_ids'],
+           'patches':patches,'sources':[],'unverified_tentative':True}
+    apply_groups(markdown,blocks,[group],human_approved=True)
+    return group
+
+
 def audit_passed(value, group):
     required=('problem_resolved','preserves_core_information','no_unsupported_claims','no_scope_expansion','no_direct_regressions')
     expected={p['block_id'] for p in group['patches']}
@@ -127,6 +155,8 @@ def audit_passed(value, group):
                 or any(not isinstance(i,str) for i in objects) or set(objects)!=set(group['read_ids'])
                 or group['sources'] and not refs):
             return False
+    if any(p['basis']=='author_pdf' for p in group['patches']) and value.get('author_pdf_acknowledged') is not True:
+        return False
     return (value.get('status')=='pass' and all(value.get(k) is True for k in required)
         and isinstance(checked,list) and all(isinstance(i,str) for i in checked) and len(checked)==len(expected) and set(checked)==expected
         and isinstance(refs,list) and all(isinstance(r,str) and r in {s['ref'] for s in group['sources']} for r in refs)
@@ -135,7 +165,8 @@ def audit_passed(value, group):
 
 def final_passed(value, groups):
     checked=value.get('checked_group_ids',[])
-    return (value.get('status')=='pass' and value.get('consistent') is True
+    return (value.get('status')=='pass' and (not any(p['basis']=='author_pdf' for g in groups for p in g['patches'])
+        or value.get('author_pdf_acknowledged') is True) and value.get('consistent') is True
         and value.get('preserves_core_information') is True and isinstance(checked,list)
         and all(isinstance(i,str) for i in checked) and len(checked)==len(groups) and set(checked)=={g['group_id'] for g in groups}
         and isinstance(value.get('reason'),str) and bool(value['reason'].strip()))

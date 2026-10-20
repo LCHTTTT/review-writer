@@ -9,7 +9,7 @@ DELEGATED_TEXT_PARENT_JOB_TYPES = frozenset({"sections.generate", "matrix.enrich
 
 def delegated_text_parent(job_type, payload):
     if job_type=='draft.optimize':
-        return payload.get('revision_mode')=='peer_review' and payload.get('flow_policy')=='review-revision/2'
+        return payload.get('revision_mode') in ('peer_review','peer_review_recommendation') and payload.get('flow_policy')=='review-revision/2'
     return job_type in DELEGATED_TEXT_PARENT_JOB_TYPES
 
 INTERACTIVE_JOB_TYPES = frozenset({

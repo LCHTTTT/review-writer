@@ -22,6 +22,8 @@
 !/review-library/.gitkeep
 !/examples/
 !/examples/**
+!/scripts/
+!/scripts/**
 !/review_writer_core/
 !/review_writer_core/**
 !/review_writer_pdf_renderer/

@@ -120,7 +120,7 @@ def validate_patch(block, patch, reference_numbers):
     return {'block_id':block['block_id'],'before_sha256':block['sha256'],'after':text}
 
 
-def apply_groups(markdown, blocks, groups):
+def apply_groups(markdown, blocks, groups, *, human_approved=False):
     indexed={b['block_id']:b for b in blocks}; changes={}
     refs={b['block_id'].split(':')[1] for b in blocks if b['kind']=='reference'}
     # A citation map can exist even when the manuscript references are not yet complete.
@@ -155,10 +155,13 @@ def apply_groups(markdown, blocks, groups):
             description=re.sub(r'(?:Reproduced|Adapted) from Ref\.\s*\d+[^*\n]*','',description,flags=re.I).strip('* .:;')
             if caption==previous or not description:
                 return match.group()
-            data['caption_quality']={**data.get('caption_quality',{}),'status':'ready','warnings':[],
-                'human_modified':False,'review_revision_verified':True}
-            data['caption_normalization_status']='cleaned'
-            data['caption_provenance']={'method':'review_revision','fingerprint':digest(body),
+            data['caption_quality']={**data.get('caption_quality',{}),
+                'human_modified':human_approved,'review_revision_verified':not human_approved}
+            if not human_approved:
+                data['caption_quality'].update(status='ready',warnings=[])
+                data['caption_normalization_status']='cleaned'
+            data['caption_provenance']={'method':'author_approved_review_candidate' if human_approved else 'review_revision',
+                'fingerprint':digest(body),
                 'previous':data.get('caption_provenance',{})}
             return '<!-- inserted_figure: '+json.dumps(data,ensure_ascii=False)+' -->'+body
         updated=re.sub(r'<!--\s*inserted_figure:\s*(\{[^\n]*\})\s*-->(\s*\n!\[[^\n]*\]\([^\n]+\)\r?\n\*(?:Figure|Scheme|图)\s+[^\n]*)',figure_metadata,updated,flags=re.I)

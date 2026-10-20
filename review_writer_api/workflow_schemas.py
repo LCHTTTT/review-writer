@@ -251,6 +251,24 @@ class DraftOptimizationRequest(DraftEvaluationRequest):
     auto_apply_safe: StrictBool = True
 
 
+class DraftReviewCandidateAcceptRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    expected_draft_artifact_id: StrictStr = Field(min_length=1,max_length=36)
+    candidate_sha256: StrictStr = Field(min_length=64,max_length=64,pattern=r'^[a-f0-9]{64}$')
+
+
+class DraftReviewCandidateSelection(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    group_id: StrictStr = Field(min_length=1,max_length=64)
+    candidate_sha256: StrictStr = Field(min_length=64,max_length=64,pattern=r'^[a-f0-9]{64}$')
+
+
+class DraftReviewCandidateBatchAcceptRequest(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    expected_draft_artifact_id: StrictStr = Field(min_length=1,max_length=36)
+    groups: list[DraftReviewCandidateSelection] = Field(min_length=1,max_length=16)
+
+
 class DraftPeerReviewRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     guidance: StrictStr = Field(default="", max_length=12000)

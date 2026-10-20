@@ -203,6 +203,27 @@ def test_table_alias_never_guesses_ambiguous_or_unrelated_marker(transform):
     assert plan_object_aliases(text,document_blocks(text))=={}
 
 
+def test_author_transcribed_pdf_is_not_laundered_into_independent_original_source():
+    blocks=document_blocks(TEXT);b=next(x for x in blocks if x['block_id']=='paragraph:abs')
+    task={'group_id':'g','category':'accuracy','problem':'Check salt','read_ids':[b['block_id']],
+        'write_ids':[b['block_id']]}
+    source={'ref':'author-pdf:check','paper_id':'P1','page':1,'text':'CuBr₂',
+        'source_hash':'a'*64,'origin':'author_inspected_original_pdf'}
+    candidate=patch(b,'The mechanism is proposed. [1]',basis='source',source_refs=[source['ref']])
+    with pytest.raises(ValueError,match='不可混称'):
+        validate_group({'explanation':'Human transcription','patches':[candidate]},task,TEXT,blocks,[source])
+    candidate['basis']='author_pdf'
+    group=validate_group({'explanation':'Human transcription','patches':[candidate]},task,TEXT,blocks,[source])
+    audit={'status':'pass','problem_resolved':True,'preserves_core_information':True,
+        'no_unsupported_claims':True,'no_scope_expansion':True,'no_direct_regressions':True,
+        'checked_patch_ids':[b['block_id']],'source_refs':[source['ref']],'reason':'Against human reading'}
+    assert not audit_passed(audit,group)
+    assert audit_passed({**audit,'author_pdf_acknowledged':True},group)
+    final={'status':'pass','consistent':True,'preserves_core_information':True,
+        'checked_group_ids':['g'],'reason':'Against the exact manuscript'}
+    assert not final_passed(final,[group]);assert final_passed({**final,'author_pdf_acknowledged':True},[group])
+
+
 def test_alt_only_edit_does_not_claim_a_missing_caption_is_fixed():
     blocks=document_blocks(TEXT);figure=next(b for b in blocks if b['kind']=='figure')
     after=figure['text'].replace('![Figure 1]','![Proposed coordination]')
